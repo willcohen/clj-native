@@ -1,0 +1,196 @@
+# CI for clj-native: three lanes (bb lint, bb test:clj, bb test:cljs) on
+# Linux and macOS.
+#
+# Lane requirements, all deliberate:
+# - lint needs a JDK + clojure CLI (lint:deps indexes two classpaths) AND
+#   node/npm (lint:js runs eslint over the hand-written .mjs).
+# - test:clj needs node too: it compiles test_runner.mjs (squint) and
+#   drives fixtures through it, and the wasm suite stands up a real
+#   GraalVM Polyglot Context. On a stock temurin JDK the polyglot engine
+#   warns about JVMCI and runs interpreted; that is expected, not a
+#   failure. This lane is the one most likely to behave differently on a
+#   CI runner. Watch it on the first green build.
+# - test:cljs is pure node once squint compiles.
+#
+# No Windows job: lazy_context_test shells `clojure` as a subprocess,
+# and ProcessBuilder does not resolve a bare `clojure` to clojure.cmd on
+# Windows. A Windows lane needs a wrapper script (or an explicit
+# clojure.cmd invocation) around that subprocess call.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (clj-kondo + eslint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Clojure and Babashka
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          bb: latest
+          cli: latest
+          clj-kondo: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Setup Clojure cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+            ~/.clojure/.cpcache
+          key: clojure-deps-lint-${{ hashFiles('deps.edn', 'bb.edn') }}
+          restore-keys: clojure-deps-lint-
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-lint-${{ hashFiles('package-lock.json') }}
+          restore-keys: node-modules-lint-
+
+      - name: Run lint
+        run: bb lint
+
+  test-linux:
+    name: Tests (Linux amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Clojure and Babashka
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          bb: latest
+          cli: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Setup Clojure cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+            ~/.clojure/.cpcache
+          key: clojure-deps-linux-${{ hashFiles('deps.edn', 'bb.edn') }}
+          restore-keys: clojure-deps-linux-
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-linux-${{ hashFiles('package-lock.json') }}
+          restore-keys: node-modules-linux-
+
+      - name: Run JVM tests
+        run: bb test:clj
+
+      - name: Run CLJS tests
+        run: bb test:cljs
+
+  test-macos:
+    name: Tests (macOS arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Clojure and Babashka
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          bb: latest
+          cli: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Setup Clojure cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+            ~/.clojure/.cpcache
+          key: clojure-deps-macos-${{ hashFiles('deps.edn', 'bb.edn') }}
+          restore-keys: clojure-deps-macos-
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-macos-${{ hashFiles('package-lock.json') }}
+          restore-keys: node-modules-macos-
+
+      - name: Run JVM tests
+        run: bb test:clj
+
+      - name: Run CLJS tests
+        run: bb test:cljs
+
+  ci-pass:
+    name: CI Pass
+    if: always()
+    needs:
+      - lint
+      - test-linux
+      - test-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          results=(
+            "${{ needs.lint.result }}"
+            "${{ needs.test-linux.result }}"
+            "${{ needs.test-macos.result }}"
+          )
+          names=("lint" "test-linux" "test-macos")
+          failed=false
+          for i in "${!results[@]}"; do
+            echo "  ${names[$i]}: ${results[$i]}"
+            if [ "${results[$i]}" != "success" ]; then
+              failed=true
+            fi
+          done
+          if [ "$failed" = "true" ]; then
+            echo "One or more required jobs failed."
+            exit 1
+          fi
+          echo "All required jobs passed."

@@ -1,0 +1,72 @@
+{
+  "name": "ffi-wasm",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Helper utilities for WASM libraries in the Squint (ClojureScript) ecosystem. The JavaScript half of clj-native (Clojars: net.willcohen/native).",
+  "main": "src/cljc/net/willcohen/native/handler_runtime.mjs",
+  "exports": {
+    ".": "./src/cljc/net/willcohen/native/handler_runtime.mjs",
+    "./handler-runtime": "./src/cljc/net/willcohen/native/handler_runtime.mjs",
+    "./handler-fs": "./src/cljc/net/willcohen/native/handler_fs.mjs",
+    "./handler-heap": "./src/cljc/net/willcohen/native/handler_heap.mjs",
+    "./handler-paths": "./src/cljc/net/willcohen/native/handler_paths.mjs",
+    "./handler-env": "./src/cljc/net/willcohen/native/handler_env.mjs",
+    "./pool": "./src/cljc/net/willcohen/native/pool.mjs",
+    "./workload-pool": "./src/cljc/net/willcohen/native/workload_pool.mjs",
+    "./platform-state": "./src/cljc/net/willcohen/native/platform_state.mjs",
+    "./dispatch": "./src/cljc/net/willcohen/native/dispatch.mjs",
+    "./macros": "./src/cljc/net/willcohen/native/macros.mjs",
+    "./test-runner": "./src/cljc/net/willcohen/native/test_runner.mjs",
+    "./http-bridge": "./src/cljc/net/willcohen/native/http_bridge.mjs",
+    "./fetch-worker": "./src/cljc/net/willcohen/native/fetch_worker.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/cljc/net/willcohen/native/handler_runtime.mjs",
+    "src/cljc/net/willcohen/native/handler_fs.mjs",
+    "src/cljc/net/willcohen/native/handler_heap.mjs",
+    "src/cljc/net/willcohen/native/handler_paths.mjs",
+    "src/cljc/net/willcohen/native/handler_env.mjs",
+    "src/cljc/net/willcohen/native/pool.mjs",
+    "src/cljc/net/willcohen/native/workload_pool.mjs",
+    "src/cljc/net/willcohen/native/platform_state.mjs",
+    "src/cljc/net/willcohen/native/dispatch.mjs",
+    "src/cljc/net/willcohen/native/macros.cljc",
+    "src/cljc/net/willcohen/native/macros.mjs",
+    "src/cljc/net/willcohen/native/test_runner.mjs",
+    "src/cljc/net/willcohen/native/http_bridge.mjs",
+    "src/cljc/net/willcohen/native/fetch_worker.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepack": "bb build:js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "resource-tracker": "^0.0.1",
+    "worker-router": "npm:@wcohen/worker-router@^0.0.1"
+  },
+  "peerDependencies": {
+    "squint-cljs": "^0.14.206"
+  },
+  "peerDependenciesMeta": {
+    "squint-cljs": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.8.0",
+    "globals": "^17.8.0",
+    "squint-cljs": "^0.14.206"
+  },
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "author": "Will Cohen",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/willcohen/clj-native.git"
+  }
+}

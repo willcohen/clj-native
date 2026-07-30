@@ -1,0 +1,537 @@
+;; Copyright (c) 2026 Will Cohen
+;;
+;; Part of clj-native, under the Apache License v2.0 with LLVM Exceptions.
+;; See LICENSE for license information.
+;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+(ns net.willcohen.native.graal-wasm-test
+  "Behavioral coverage for graal_wasm.clj against a real GraalVM Polyglot Context
+   and a real WebAssembly.Memory.
+
+   test/fixtures/wasm-heap-loader.mjs supplies the module: hand-written wasm
+   bytes (a memory plus a bump allocator) wrapped in the emscripten Module
+   shape graal_wasm.clj expects. It is loaded through bootstrap-graal-module!, the
+   same entry point consumers use, so the loader contract is under test too.
+   No emcc or wabt is involved, so the suite runs on a clean checkout.
+
+   read-heap-array gets all eight heap-type arms here, so the coverage does
+   not depend on any consumer's own dtype-to-heap-type mapping reaching them.
+
+   Tests bind *wasm-context* explicitly rather than leaning on the
+   sole-registered-context fallback, so they do not depend on what else is in
+   the registry. The fallback has its own test, which controls the registry."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing use-fixtures]]
+            [net.willcohen.native.dispatch :as dispatch]
+            [net.willcohen.native.graal-wasm :as w]
+            [net.willcohen.native.workload-pool :as wp])
+  (:import [java.util.concurrent Callable CyclicBarrier ExecutorService TimeUnit]))
+
+(def ^:private lib-key ::test-lib)
+
+(def ^:private ctx (atom nil))
+
+(defn- loader-url []
+  (-> (java.io.File. "test/fixtures/wasm-heap-loader.mjs") .toURI .toURL))
+
+(defn- with-module-fixture [f]
+  (let [c (w/create-wasm-context! lib-key)]
+    (w/bootstrap-graal-module! c {:loader-module-url (loader-url)})
+    (reset! ctx c)
+    (try
+      (f)
+      (finally
+        ;; Leave the global registry as it was found; other namespaces resolve
+        ;; through it, and the sole-context fallback is sensitive to its size.
+        (swap! w/contexts dissoc lib-key)
+        (reset! ctx nil)))))
+
+(use-fixtures :once with-module-fixture)
+
+(defmacro ^:private on-module [& body]
+  `(w/with-wasm-context @ctx ~@body))
+
+(defn- set-value!
+  "Write `v` at raw address `addr` through the module's own setValue, the same
+   interop path graal_wasm.clj uses. Lets a test seed the heap for a read."
+  [addr v type]
+  (let [m (w/get-module @ctx)]
+    (.execute (.getMember m "setValue") (object-array [addr v type]))))
+
+(deftest bootstrap-loads-the-module-and-is-idempotent
+  (testing "the fixture's initialize/onSuccess contract registers a module"
+    (is (some? (w/get-module @ctx))))
+  (testing "a second bootstrap returns the same module without re-initializing"
+    (let [again (w/bootstrap-graal-module! @ctx {:loader-module-url (loader-url)})]
+      (is (= (w/get-module @ctx) again))))
+  (testing "bootstrap without a loader URL throws"
+    (let [fresh (w/->WasmContext ::no-loader (atom nil))]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (w/bootstrap-graal-module! fresh {}))))))
+
+(deftest create-wasm-context!-is-idempotent-per-library-key
+  (let [a (w/create-wasm-context! ::idem)
+        b (w/create-wasm-context! ::idem)]
+    (try
+      (is (identical? a b) "same library-key returns the existing context")
+      (is (= a (w/lookup-wasm-context ::idem)))
+      (is (nil? (w/lookup-wasm-context ::never-registered)))
+      (finally (swap! w/contexts dissoc ::idem)))))
+
+(deftest malloc-hands-out-distinct-usable-addresses
+  (on-module
+   (let [a (w/malloc 16)
+         b (w/malloc 16)]
+     (is (pos? (w/address-as-int a)) "a live allocation is not the null pointer")
+     (is (not= (w/address-as-int a) (w/address-as-int b)))
+     (is (>= (- (w/address-as-int b) (w/address-as-int a)) 16)
+         "consecutive allocations do not overlap")
+     (testing "free-on-heap accepts a pointer and is nil-safe"
+       (is (nil? (w/free-on-heap nil)))
+       (w/free-on-heap a)))))
+
+(deftest string-round-trips-through-the-heap
+  (on-module
+   (testing "ascii"
+     (is (= "hello" (w/pointer->string (w/allocate-string-on-heap "hello")))))
+   (testing "multi-byte utf-8 survives the encode/decode pair"
+     (is (= "héllo wörld" (w/pointer->string (w/allocate-string-on-heap "héllo wörld")))))
+   (testing "the empty string"
+     (is (= "" (w/pointer->string (w/allocate-string-on-heap "")))))
+   (testing "nil in, nil out -- no allocation"
+     (is (nil? (w/allocate-string-on-heap nil))))))
+
+(deftest string-list-to-native-array-builds-a-walkable-char**
+  (on-module
+   (testing "the array walks to its NULL terminator"
+     (let [arr (w/string-list-to-native-array ["alpha" "beta" "gamma"])]
+       (is (= ["alpha" "beta" "gamma"] (w/string-array-pointer->strs arr)))))
+   (testing "an empty list is the null pointer, not an allocation"
+     (is (zero? (w/address-as-int (w/string-list-to-native-array [])))))
+   (testing "a nil element throws rather than writing an unrepresentable char*"
+     (is (thrown? clojure.lang.ExceptionInfo
+                  (w/string-list-to-native-array ["ok" nil "also ok"]))))))
+
+(deftest pointers->wasm-array-packs-4-byte-slots
+  (on-module
+   (let [p1   (w/malloc 8)
+         p2   (w/malloc 8)
+         p3   (w/malloc 8)
+         arr  (w/pointers->wasm-array [p1 p2 p3])
+         back (vec (w/read-heap-array arr 3 :i32))]
+     (is (= [(w/address-as-int p1) (w/address-as-int p2) (w/address-as-int p3)] back)
+         "each slot holds the wasm32 address of its pointer")
+     (testing "no trailing NULL, unlike string-list-to-native-array"
+       (is (= 3 (count back)))))))
+
+(deftest read-heap-array-covers-every-heap-type
+  (on-module
+   (let [p (w/malloc 64)
+         a (w/address-as-int p)]
+     (testing ":i8 and :u8 read the same bytes into byte[]"
+       (set-value! a 65 "i8")
+       (set-value! (+ a 1) 66 "i8")
+       (is (= [65 66] (vec (w/read-heap-array p 2 :i8))))
+       (is (= [65 66] (vec (w/read-heap-array p 2 :u8)))))
+     (testing ":i16 and :u16 index by 2 bytes into short[]"
+       (set-value! a 300 "i16")
+       (set-value! (+ a 2) 301 "i16")
+       (is (= [300 301] (vec (w/read-heap-array p 2 :i16))))
+       (is (= [300 301] (vec (w/read-heap-array p 2 :u16)))))
+     (testing ":i32 and :u32 index by 4 bytes into int[]"
+       (set-value! a 70000 "i32")
+       (set-value! (+ a 4) 70001 "i32")
+       (is (= [70000 70001] (vec (w/read-heap-array p 2 :i32))))
+       (is (= [70000 70001] (vec (w/read-heap-array p 2 :u32)))))
+     (testing ":f32 into float[]"
+       (set-value! a 1.5 "float")
+       (set-value! (+ a 4) 2.5 "float")
+       (is (= [1.5 2.5] (mapv double (w/read-heap-array p 2 :f32)))))
+     (testing ":f64 indexes by 8 bytes into double[]"
+       (set-value! a 1.25 "double")
+       (set-value! (+ a 8) 2.5 "double")
+       (is (= [1.25 2.5] (vec (w/read-heap-array p 2 :f64)))))
+     (testing "an unsupported heap-type throws instead of returning garbage"
+       (is (thrown? clojure.lang.ExceptionInfo (w/read-heap-array p 1 :i64)))))))
+
+(deftest read-heap-array-widens-unsigned-views-by-bit-pattern
+  ;; The JVM has no unsigned primitives, so :u16/:u32 keep the bit pattern and
+  ;; leave interpretation to the caller. Pinned because it is the surprising
+  ;; half of the docstring's promise.
+  (on-module
+   (let [p (w/malloc 16)
+         a (w/address-as-int p)]
+     (set-value! a -1 "i16")
+     (is (= -1 (first (w/read-heap-array p 1 :u16)))
+         ":u16 reads 65535 and narrows to short -1, same bits")
+     (set-value! a -1 "i32")
+     (is (= -1 (first (w/read-heap-array p 1 :u32)))
+         ":u32 reads 4294967295 and narrows to int -1, same bits"))))
+
+(deftest heapf64-returns-a-subarray-view
+  (on-module
+   (let [p (w/malloc 32)
+         a (w/address-as-int p)]
+     (set-value! a 3.5 "double")
+     (let [view (w/heapf64 (bit-shift-right a 3) 2)]
+       (is (some? view))
+       (is (= 2 (.getArraySize view)))
+       (is (= 3.5 (.asDouble (.getArrayElement view 0))))))))
+
+(deftest read-struct-reads-fields-by-offset
+  (on-module
+   (let [s   (w/malloc 32)
+         a   (w/address-as-int s)
+         txt (w/allocate-string-on-heap "field")]
+     (set-value! a 42 "i32")
+     (set-value! (+ a 4) 1 "i32")
+     (set-value! (+ a 8) 6.25 "double")
+     (set-value! (+ a 16) (w/address-as-int txt) "*")
+     (set-value! (+ a 20) 0 "*")
+     (let [m (w/read-struct a [[:n :int 0]
+                               [:flag :boolean 4]
+                               [:d :double 8]
+                               [:name :string 16]
+                               [:missing :string 20]])]
+       (is (= 42 (:n m)))
+       (is (true? (:flag m)))
+       (is (= 6.25 (:d m)))
+       (is (= "field" (:name m)))
+       (testing "a :string field at a null address is nil, not an empty string"
+         (is (nil? (:missing m))))))))
+
+(deftest with-wasm-context-selects-among-registered-contexts
+  (let [loaded (w/create-wasm-context! ::multi-loaded)
+        empty' (w/create-wasm-context! ::multi-empty)]
+    (try
+      (w/set-module! loaded (w/get-module @ctx))
+      (testing "the bound context supplies the module"
+        (is (pos? (w/address-as-int (w/with-wasm-context loaded (w/malloc 8))))))
+      (testing "binding a context whose bootstrap has not run throws"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no loaded module"
+                              (w/with-wasm-context empty' (w/malloc 8)))))
+      (finally
+        (swap! w/contexts dissoc ::multi-loaded ::multi-empty)))))
+
+(deftest current-module-refuses-to-guess-which-context-to-use
+  (testing "nothing registered and nothing bound"
+    (with-redefs [w/contexts (atom {})]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unbound and no single default"
+                            (w/malloc 8)))))
+  (testing "more than one registered and nothing bound -- no arbitrary pick"
+    (with-redefs [w/contexts (atom {})]
+      (w/create-wasm-context! ::a)
+      (w/create-wasm-context! ::b)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unbound and no single default"
+                            (w/malloc 8)))))
+  (testing "exactly one registered is the documented fallback -- no binding needed"
+    (with-redefs [w/contexts (atom {})]
+      (let [only (w/create-wasm-context! ::sole)]
+        (w/set-module! only (w/get-module @ctx))
+        (is (pos? (w/address-as-int (w/malloc 8))))))))
+
+;; The `load` loader contract, and the byte encoding a loader receives its
+;; binary resources through. test/fixtures/graal-load-loader.mjs reports what it
+;; got, so one fixture covers the promise bridge and the widening together.
+
+(defn- load-loader-url []
+  (-> (java.io.File. "test/fixtures/graal-load-loader.mjs") .toURI .toURL))
+
+(defn- boot-load-fixture
+  "Bootstrap the load-contract fixture under a throwaway library-key and return
+   the module it registered. Each call gets a fresh key, because bootstrap is
+   idempotent per context and would otherwise hand back the first module."
+  [lib init-opts]
+  (let [c (w/create-wasm-context! lib)]
+    (try
+      (w/bootstrap-graal-module! c {:loader-module-url (load-loader-url)
+                                   :init-opts init-opts})
+      (finally (swap! w/contexts dissoc lib)))))
+
+(defn- member [^org.graalvm.polyglot.Value v k]
+  (let [m (.getMember v k)]
+    (cond (.isBoolean m) (.asBoolean m)
+          (.isNumber m) (.asLong m)
+          (.isString m) (.asString m)
+          :else m)))
+
+(deftest bootstrap-accepts-a-load-contract-loader
+  (let [db (byte-array (map unchecked-byte [7 8 200 255]))
+        m (boot-load-fixture ::load-ok
+                             {"mode" "ok"
+                              "dbBytes" (w/js-bytes db)
+                              "grids" (w/js-bytes-map
+                                       {"a.gsb" (byte-array (map unchecked-byte [1]))
+                                        "b.gsb" (byte-array (map unchecked-byte [200 1]))})})]
+    (testing "the promise the loader returned settled onto the caller's future"
+      (is (= "load-contract" (member m "marker")))
+      (is (= "ok" (member m "mode"))))
+    (testing "js-bytes hands the loader a real Uint8Array, widened past 127"
+      (is (true? (member m "dbIsUint8Array")))
+      (is (= 4 (member m "dbLength")))
+      (is (= 200 (member m "dbSecondLast")))
+      (is (= 255 (member m "dbLast")))
+      (is (= 4 (member m "dbBufferBytes"))))
+    (testing "js-bytes-map keys each name to its own Uint8Array"
+      (is (= "a.gsb,b.gsb" (member m "gridNames")))
+      (is (= 200 (member m "gridFirstByte"))))))
+
+(deftest bootstrap-accepts-a-load-that-returns-the-module-directly
+  (let [m (boot-load-fixture ::load-sync {"mode" "sync"})]
+    (is (= "load-contract" (member m "marker")))
+    (is (= "sync" (member m "mode")))))
+
+(deftest bootstrap-surfaces-a-rejected-load
+  (is (thrown? java.util.concurrent.ExecutionException
+               (boot-load-fixture ::load-throw {"mode" "throw"}))))
+
+(deftest bootstrap-rejects-a-module-that-is-not-a-loader
+  (let [c (w/create-wasm-context! ::no-load-fn)
+        url (-> (java.io.File. "test/fixtures/graal-no-loader.mjs") .toURI .toURL)]
+    (try
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"neither load nor initialize"
+                            (w/bootstrap-graal-module! c {:loader-module-url url})))
+      (finally (swap! w/contexts dissoc ::no-load-fn)))))
+
+(deftest js-bytes-widens-every-signed-byte
+  (let [all (byte-array (map unchecked-byte (range 256)))
+        v (w/js-bytes all)]
+    (is (= 256 (.asInt (.getMember v "length"))))
+    (testing "each of the 256 byte patterns arrives as its unsigned value"
+      (is (= (range 256)
+             (map #(.asInt (.getArrayElement v %)) (range 256)))))))
+
+(defn- module [] (w/get-module @ctx))
+
+(defn- ccall-log
+  "The stand-in ccall's record of the call at `idx`, as a Clojure map. types
+   and vals are nil when the list did not arrive as a JS array."
+  [idx]
+  (let [entry (.getArrayElement (.getMember (module) "__ccalls") idx)
+        lst   (fn [k]
+                (let [v (.getMember entry k)]
+                  (when-not (.isNull v)
+                    (mapv #(let [e (.getArrayElement v %)]
+                             (if (.isString e) (.asString e) (.asInt e)))
+                          (range (.getArraySize v))))))]
+    {:name    (.asString (.getMember entry "name"))
+     :rettype (.asString (.getMember entry "rettype"))
+     :types   (lst "types")
+     :vals    (lst "vals")}))
+
+(defn- ccall-count [] (.getArraySize (.getMember (module) "__ccalls")))
+
+(deftest heap-write-bytes!-copies-at-the-given-address
+  (let [m    (module)
+        ptr  (long (w/address-as-int (on-module (w/malloc 8))))
+        src  (byte-array (map unchecked-byte [0 1 127 -128 -1 200 42 255]))
+        n    (w/heap-write-bytes! m ptr src)]
+    (testing "every byte lands, widened to its unsigned value"
+      (is (= 8 n))
+      (is (= [0 1 127 128 255 200 42 255]
+             (mapv #(bit-and % 0xff)
+                   (on-module (w/read-heap-array ptr 8 :u8))))))
+    (testing "a second write at an offset does not disturb the first"
+      (let [ptr2 (long (w/address-as-int (on-module (w/malloc 4))))]
+        (w/heap-write-bytes! m ptr2 (byte-array (map unchecked-byte [9 9 9 9])))
+        (is (= [0 1 127 128 255 200 42 255]
+               (mapv #(bit-and % 0xff)
+                     (on-module (w/read-heap-array ptr 8 :u8)))))))))
+
+(deftest value-execute-runs-a-free-standing-fn-with-coercion
+  (let [f (on-module (w/module-eval-js (module) "(a, b) => a - b" "vx.js"))]
+    (is (= 4 (w/value-execute f [7 3] :int)))))
+
+(deftest heap-write-doubles!-resolves-the-current-module
+  (let [ptr (long (w/address-as-int (on-module (w/malloc 16))))]
+    (on-module (w/heap-write-doubles! ptr (double-array [3.5 -4.5])))
+    (is (= [3.5 -4.5] (vec (on-module (w/read-heap-array ptr 2 :f64)))))))
+
+(deftest module-eval-js-targets-the-owning-context
+  (let [m (module)]
+    (w/module-eval-js m "globalThis.__mejs = 41 + 1" "mejs-probe.js")
+    (is (= 42 (.asInt (w/module-eval-js m "globalThis.__mejs" "mejs-read.js"))))
+    (testing "a pooled Context does not see the default-Context global"
+      (let [pctx (w/new-polyglot-context!)]
+        (try
+          (let [wc (w/->WasmContext ::mejs-pool (atom nil))]
+            (w/bootstrap-graal-module! wc {:loader-module-url (loader-url)
+                                           :polyglot-context pctx})
+            (is (.isNull (w/module-eval-js (w/get-module wc)
+                                           "globalThis.__mejs ?? null"
+                                           "mejs-read2.js"))))
+          (finally
+            (.close pctx)))))))
+
+(deftest heap-write-doubles!-copies-at-the-given-address
+  (let [m    (module)
+        ptr  (long (w/address-as-int (on-module (w/malloc 32))))
+        src  (double-array [1.25 -2.5 0.0 6.02e23])
+        n    (w/heap-write-doubles! m ptr src)]
+    (testing "every double lands at its slot"
+      (is (= 4 n))
+      (is (= [1.25 -2.5 0.0 6.02e23]
+             (vec (on-module (w/read-heap-array ptr 4 :f64))))))
+    (testing "a second write at an offset does not disturb the first"
+      (let [ptr2 (long (w/address-as-int (on-module (w/malloc 16))))]
+        (w/heap-write-doubles! m ptr2 (double-array [9.0 9.0]))
+        (is (= [1.25 -2.5 0.0 6.02e23]
+               (vec (on-module (w/read-heap-array ptr 4 :f64)))))))))
+
+(deftest value-coercers-read-numbers
+  (testing "value->long keeps i64-range numbers that an int read cannot"
+    (is (= 5000000000 (w/value->long (on-module (w/address-as-polyglot-value 5000000000))))))
+  (testing "value->int reads as an int"
+    (is (instance? Integer (w/value->int (on-module (w/address-as-polyglot-value 7)))))))
+
+(deftest utf8->string-reads-through-an-explicit-module
+  (testing "a string written to the heap reads back through the given module"
+    (let [written (on-module (w/allocate-string-on-heap "grüße/ünïcode"))]
+      (is (= "grüße/ünïcode" (w/utf8->string (module) (w/address-as-int written))))))
+  (testing "the protocol method resolves the module itself and agrees"
+    (let [written (on-module (w/allocate-string-on-heap "same text"))]
+      (is (= "same text" (on-module (w/pointer->string written)))))))
+
+(deftest ccall-hands-its-lists-across-as-js-arrays
+  ;; The defect this pins is silent: a host array reaches JS with no length,
+  ;; no index access and no array methods, so the C function receives nothing
+  ;; while the call still returns. The fixture answers -1 and records null
+  ;; lists in that state, which is what makes it visible.
+  (let [idx (ccall-count)
+        r   (w/ccall (module) "sum" :number [:number :number] [20 22])]
+    (testing "the arguments reach the C function"
+      (is (= 42 (.asInt r))))
+    (testing "both lists arrive as JS arrays, so neither reads as absent"
+      (is (= {:name "sum" :rettype "number"
+              :types ["number" "number"] :vals [20 22]}
+             (ccall-log idx)))))
+  (testing "a type named as a string is accepted alongside a keyword"
+    (let [idx (ccall-count)]
+      (w/ccall (module) "sum" "number" ["number" :number] [1 2])
+      (is (= ["number" "number"] (:types (ccall-log idx))))))
+  (testing "an empty argument list is still a JS array, not an absent one"
+    (let [idx (ccall-count)]
+      (is (= 0 (.asInt (w/ccall (module) "noop" :number [] []))))
+      (is (= {:name "noop" :rettype "number" :types [] :vals []}
+             (ccall-log idx))))))
+
+(deftest jvm-graal-call-respects-the-wasm-context-binding
+  ;; A pool worker binds its WasmContext; every dispatch ccall must land
+  ;; on that module, not on the registered default. A pointer is only
+  ;; meaningful inside the Context that created it.
+  (let [pctx (w/new-polyglot-context!)]
+    (try
+      (let [wc (w/->WasmContext ::dispatch-pool (atom nil))]
+        (w/bootstrap-graal-module! wc {:loader-module-url (loader-url)
+                                       :polyglot-context pctx})
+        (let [pm (w/get-module wc)
+              default-before (ccall-count)
+              pooled-count #(.getArraySize (.getMember pm "__ccalls"))
+              pooled-before (pooled-count)]
+          (w/with-wasm-context wc
+            (dispatch/jvm-graal-call lib-key "stub_fn" "number" ["number"] [7]))
+          (is (= default-before (ccall-count))
+              "the registered default module saw no ccall")
+          (is (= (inc pooled-before) (pooled-count))
+              "the ccall landed on the bound pooled module")))
+      (finally
+        (.close pctx)))))
+
+(deftest engine-is-shared-and-runtime-is-reportable
+  (testing "the default Context and a pooled Context share one Engine"
+    (let [pooled (w/new-polyglot-context!)]
+      (try
+        ;; (context) returns the current-API wrapper, whose .getEngine is
+        ;; also a current-API wrapper; the builder's Engine is a different
+        ;; object and .equals does not bridge the two (measured
+        ;; 2026-08-21). Compare current wrappers on both sides: identical
+        ;; exactly when the Contexts share one Engine.
+        (is (identical? (.getEngine (w/context))
+                        (.getEngine (.getContext (.asValue pooled 0)))))
+        (is (identical? (w/engine) (.getEngine pooled))
+            "the pooled creator instance reports the shared Engine")
+        (finally (.close pooled)))))
+  (testing "truffle-runtime-name reports a non-blank runtime"
+    (let [n (w/truffle-runtime-name)]
+      (is (string? n))
+      (is (not (str/blank? n))))))
+
+(deftest bootstrap-into-a-pooled-context-loads-an-independent-module
+  (let [pooled (w/new-polyglot-context!)
+        wc (w/->WasmContext ::pooled-lib (atom nil))]
+    (try
+      (w/bootstrap-graal-module! wc {:loader-module-url (loader-url)
+                                     :polyglot-context pooled})
+      (testing "the module lives in the pooled Context, not the default one"
+        (is (some? (w/get-module wc)))
+        (is (not (identical? (.getContext (w/get-module wc))
+                             (.getContext (w/get-module @ctx))))))
+      (testing "the registry does not know the pooled WasmContext"
+        (is (nil? (w/lookup-wasm-context ::pooled-lib))))
+      (testing "heap utilities and scalar Pointerlike ops stay in the pooled Context"
+        ;; allocate-string-on-heap wraps a host scalar through
+        ;; address-as-polyglot-value; a wrap through the default Context
+        ;; would throw a cross-context error here.
+        (w/with-wasm-context wc
+          (is (pos? (w/address-as-int (w/malloc 8))))
+          (is (= "pooled write" (w/pointer->string (w/allocate-string-on-heap "pooled write"))))
+          (is (= ["a" "b"] (w/string-array-pointer->strs
+                            (w/string-list-to-native-array ["a" "b"]))))))
+      (finally (.close pooled)))))
+
+(deftest pooled-contexts-serve-a-workload-pool-slot
+  ;; The integration recipe for a consumer: a graal Context worker is a
+  ;; plain workload-pool handler. :init builds a Context on the shared
+  ;; Engine and bootstraps the module into it; :destroy closes it. The
+  ;; barrier holds both workers in flight at once, which one shared
+  ;; Context under the global lock cannot do.
+  (let [registry (wp/init-workload-pool! {:size 2})
+        seen (atom #{})
+        _ (wp/register-handler!
+           registry :compute ::graal-pool
+           {:init (fn [_]
+                    (let [pctx (w/new-polyglot-context!)
+                          wc (w/->WasmContext ::graal-pool (atom nil))]
+                      (w/bootstrap-graal-module! wc {:loader-module-url (loader-url)
+                                                     :polyglot-context pctx})
+                      {:pctx pctx :wc wc}))
+            :destroy (fn [{:keys [^org.graalvm.polyglot.Context pctx]}]
+                       (.close pctx))})
+        ^ExecutorService exec (wp/as-executor-service registry :compute)
+        barrier (CyclicBarrier. 2)
+        task (fn []
+               (let [{:keys [wc]} (wp/current-context ::graal-pool)]
+                 (.await barrier 20 TimeUnit/SECONDS)
+                 (w/with-wasm-context wc
+                   (let [s (w/pointer->string (w/allocate-string-on-heap "pooled"))]
+                     (swap! seen conj (.getContext (w/get-module wc)))
+                     s))))
+        f1 (.submit exec ^Callable task)
+        f2 (.submit exec ^Callable task)]
+    (try
+      (testing "both workers transform concurrently, each in its own Context"
+        (is (= "pooled" (.get f1 30 TimeUnit/SECONDS)))
+        (is (= "pooled" (.get f2 30 TimeUnit/SECONDS)))
+        (is (= 2 (count @seen)) "each worker thread owns a distinct Context"))
+      (finally
+        (wp/shutdown-pool! registry)))))
+
+(deftest put-js-globals!-publishes-callbacks-a-c-stub-can-reach
+  (let [called (atom nil)
+        cb (reify org.graalvm.polyglot.proxy.ProxyExecutable
+             (execute [_ args]
+               (let [v (.asInt (aget args 0))]
+                 (reset! called v)
+                 (* 2 v))))]
+    (w/put-js-globals! {"__clj_native_test_cb" cb})
+    (testing "the C stub route reaches the published callback with its argument"
+      (is (= 42 (.asInt (w/ccall (module) "call_global" :number
+                                 ["string" "number"]
+                                 ["__clj_native_test_cb" 21]))))
+      (is (= 21 @called)))
+    (testing "a keyword key publishes under its name"
+      (w/put-js-globals! {:__clj_native_test_kw cb})
+      (is (= 20 (.asInt (w/ccall (module) "call_global" :number
+                                 ["string" "number"]
+                                 ["__clj_native_test_kw" 10])))))))

@@ -1,0 +1,10 @@
+;; clj-native lints itself through its own exported config, so a change to
+;; what consumers get is exercised here first. :config-paths are relative to
+;; this directory. clj-kondo does not read resources/clj-kondo.exports when
+;; linting the exporting project, only when a consumer has it on the
+;; classpath, so this entry point is required.
+{:config-paths ["../resources/clj-kondo.exports/net.willcohen/native"]
+ ;; with-current-module is (with-current-module [m] body...): the vector
+ ;; introduces one binding, the same shape fn gives its params.
+ :lint-as {net.willcohen.native.graal-wasm/with-current-module clojure.core/fn}
+ :output {:exclude-files ["node_modules/"]}}

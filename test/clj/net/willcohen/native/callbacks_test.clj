@@ -1,0 +1,33 @@
+;; Copyright (c) 2026 Will Cohen
+;;
+;; Part of clj-native, under the Apache License v2.0 with LLVM Exceptions.
+;; See LICENSE for license information.
+;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+(ns net.willcohen.native.callbacks-test
+  "JVM smoke tests for upcall registration. The end-to-end callback invocation is
+   exercised by the consumer suites (clj-proj network callbacks, clj-gdal
+   CPLHTTPFetch); here we verify the define -> instantiate -> ->c chain produces a
+   real, retained function pointer under the :jdk backend."
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [net.willcohen.native.platform :as platform]
+            [net.willcohen.native.callbacks :as cb]
+            [net.willcohen.native.ffi-mem :as m])
+  (:import [tech.v3.datatype.ffi Pointer]))
+
+(use-fixtures :once (fn [f] (platform/init-ffi! :jdk) (f)))
+
+(deftest register-callback-produces-retained-pointer
+  (let [iface (cb/define-callback-interface :int64 [:int64])
+        {:keys [ptr inst]} (cb/register-callback! iface (fn [x] (* 2 (long x))))]
+    (is (instance? Pointer ptr))
+    (is (pos? (m/ptr-addr ptr)) "upcall stub has a real native address")
+    (is (some? inst) "instance is retained so the caller can keep it GC-alive")))
+
+(deftest repeated-registration-yields-distinct-instances
+  (testing "a cached iface can back multiple independent callbacks"
+    (let [iface (cb/define-callback-interface :void [:pointer :int32 :pointer])
+          a (cb/register-callback! iface (fn [_ _ _] nil))
+          b (cb/register-callback! iface (fn [_ _ _] nil))]
+      (is (not (identical? (:inst a) (:inst b))))
+      (is (not= (m/ptr-addr (:ptr a)) (m/ptr-addr (:ptr b)))))))

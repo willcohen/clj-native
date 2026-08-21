@@ -1,11 +1,22 @@
 # clj-native
 
+[![CI](https://github.com/willcohen/clj-native/actions/workflows/ci.yml/badge.svg)](https://github.com/willcohen/clj-native/actions/workflows/ci.yml)
+[![Clojars](https://img.shields.io/clojars/v/net.willcohen/native.svg)](https://clojars.org/net.willcohen/native)
+[![npm](https://img.shields.io/npm/v/ffi-wasm.svg)](https://www.npmjs.com/package/ffi-wasm)
+
 Helper utilities for native libraries and FFI in the Clojure and Squint
 (ClojureScript) ecosystems.
 
 A library binds a C or WASM API one time, and then runs on three backends. On
 the JVM it uses FFI over a native shared library, or GraalVM polyglot WASM. On
 JavaScript it uses Node `worker_threads` or the browser.
+
+## Install
+
+npm: [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm). Clojars:
+[`net.willcohen/native`](https://clojars.org/net.willcohen/native), namespaces
+`net.willcohen.native.*`. The badges above show the current version. Pin the
+exact version: the API still moves.
 
 ## Three backends, on two axes
 
@@ -109,15 +120,17 @@ clj-native supplies the shared parts:
 
 There are two delivery surfaces.
 
-- npm (`ffi-wasm`): the hand-written `.mjs` runtime helpers, and the
-  squint-compiled `.cljc`. The `exports` map in `package.json` is the list.
+- npm ([`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm)): the hand-written
+  `.mjs` runtime helpers, and the squint-compiled `.cljc`. The `exports` map
+  in `package.json` is the list.
   Each hand-written helper starts with a header comment that states what the
   module does and what it assumes. A compiled module has only the license
   header, because squint emits no Clojure comment. Its description is
   the namespace docstring of the `.cljc` it came from, which the next bullet
   indexes.
-- Clojars (`net.willcohen/native`): the thirteen namespaces in the table below.
-  The docstring of each one is the description of record.
+- Clojars ([`net.willcohen/native`](https://clojars.org/net.willcohen/native)):
+  the thirteen namespaces in the table below. The docstring of each one is the
+  description of record.
 
 | Namespace | What it holds |
 |---|---|
@@ -189,7 +202,11 @@ They are in the jar, and not in the npm package.
 
 ## Nix flake
 
-The flake is an input for a build or a dev shell.
+The flake is an input for a build or a dev shell:
+
+```nix
+inputs.clj-native.url = "github:willcohen/clj-native";
+```
 
 The flake exposes `lib.<system>.mkCrossShells`, which builds a parameterized
 dev shell. On a Linux host it also builds four cross-compile shells:

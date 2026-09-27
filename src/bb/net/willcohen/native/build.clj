@@ -67,42 +67,78 @@
         cpus (.. Runtime getRuntime availableProcessors)]
     (min cpus (max 1 (int (/ available-gb 3))))))
 
+(defn- file-sha256 [path]
+  (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                        (fs/read-all-bytes path))]
+    (format "%064x" (BigInteger. 1 digest))))
+
+(defn- download-whole!
+  "Download url to dest-path through dest-path.part, so a failed download
+  leaves no dest-path."
+  [url dest-path]
+  (let [part (str dest-path ".part")]
+    (try
+      (with-open [in (:body (http/get url {:as :stream}))]
+        (io/copy in (fs/file part)))
+      (fs/move part dest-path {:replace-existing true})
+      (finally (fs/delete-if-exists part)))))
+
 (defn download-archive
-  "Download url to dest. This fn is idempotent, and it does nothing when
-  dest exists already."
-  [url dest]
-  (let [dest-path (str dest)]
-    (if (fs/exists? dest-path)
-      (println (fs/file-name dest-path) "already exists. Skipping.")
-      (do
-        (println "Downloading" (fs/file-name dest-path) "from" url "...")
-        (fs/create-dirs (fs/parent dest-path))
-        (io/copy (:body (http/get url {:as :stream})) (fs/file dest-path))))))
+  "Download url to dest, unless dest exists. A failed download leaves no
+  dest. With :sha256, check dest on each call, and delete it and throw on a
+  mismatch."
+  ([url dest] (download-archive url dest nil))
+  ([url dest {:keys [sha256]}]
+   (let [dest-path (str dest)]
+     (if (fs/exists? dest-path)
+       (println (fs/file-name dest-path) "already exists. Skipping.")
+       (do
+         (println "Downloading" (fs/file-name dest-path) "from" url "...")
+         (fs/create-dirs (fs/parent dest-path))
+         (download-whole! url dest-path)))
+     (when sha256
+       (let [actual (file-sha256 dest-path)]
+         (when (not= (str/lower-case sha256) actual)
+           (fs/delete dest-path)
+           (throw (ex-info (str (fs/file-name dest-path) " has sha256 " actual
+                                ", not " sha256 ". The file is deleted.")
+                           {:dest dest-path :expected sha256 :actual actual}))))))))
+
+(defn build-once!
+  "Call build!, unless output exists and its stamp file holds the same
+  args, the data that decides the build. Throws when args do not print as
+  EDN, or when build! makes no output."
+  [output args build!]
+  (let [stamp (str output ".build-args.edn")
+        edn   (pr-str args)]
+    ;; A Path or a fn prints its identity hash, so its stamp never matches.
+    (when (str/includes? edn "#object[")
+      (throw (ex-info (str "The args of build-once! do not print as EDN: " edn) {:args edn})))
+    (if (and (fs/exists? output)
+             (fs/exists? stamp)
+             (= edn (slurp stamp)))
+      (println (fs/file-name output) "is up to date")
+      (do (fs/delete-if-exists stamp)
+          (fs/delete-if-exists output)
+          (build!)
+          (when-not (fs/exists? output)
+            (throw (ex-info (str "The build made no " output) {:output (str output)})))
+          (spit stamp edn)))))
 
 (defn extract-archive
-  "Extract archive-file into base-dir. This fn is idempotent, and it does
-  nothing when extracted-dir exists already below base-dir. It dispatches on
-  the file extension."
+  "Extract the tar archive archive-file in base-dir, plain, gzip or bzip2,
+  unless the dir extracted-dir at its top exists there. A failed extraction
+  leaves no extracted-dir."
   [archive-file extracted-dir base-dir]
   (let [extracted-path (fs/path base-dir extracted-dir)]
     (if (fs/exists? extracted-path)
       (println "Directory" (str "'" extracted-dir "'") "already exists. Skipping extraction.")
-      (do
+      (let [tmp (fs/create-temp-dir {:dir base-dir :prefix (str extracted-dir ".part-")})]
         (println "Extracting" archive-file "to" (str extracted-path) "...")
-        (cond
-          (str/ends-with? archive-file ".zip")
-          (tasks/shell {:dir (str base-dir)} "unzip" "-q" archive-file)
-
-          (or (str/ends-with? archive-file ".tar.gz")
-              (str/ends-with? archive-file ".tgz"))
-          (tasks/shell {:dir (str base-dir)} "tar" "xzf" archive-file)
-
-          (or (str/ends-with? archive-file ".tar.bz2")
-              (str/ends-with? archive-file ".tbz2"))
-          (tasks/shell {:dir (str base-dir)} "tar" "xjf" archive-file)
-
-          :else
-          (throw (ex-info "Unknown archive format" {:file archive-file})))))))
+        (try
+          (tasks/shell {:dir (str tmp)} "tar" "xf" (str (fs/absolutize (fs/path base-dir archive-file))))
+          (fs/move (fs/path tmp extracted-dir) extracted-path)
+          (finally (fs/delete-tree tmp)))))))
 
 (defn- cmd-prefix
   "Return the emscripten wrapper prefix for a build type, or an empty vector.
@@ -118,6 +154,18 @@
       :configure []
       :make      ["make"]
       :cmake     ["cmake"])))
+
+(defn- check-cflags!
+  "Throw when CFLAGS or CXXFLAGS, from env else `inherited`, has no -O
+  level. An explicit CFLAGS replaces the -O2 of configure, so the library
+  would build at -O0."
+  [env inherited]
+  (doseq [k ["CFLAGS" "CXXFLAGS"]
+          :let [v (get env k (get inherited k))]
+          :when (and (some? v) (not (re-find #"(^|\s)-O([0-3sgz]|fast)?(\s|$)" v)))]
+    (throw (ex-info (str k " \"" v "\" has no -O level. An explicit " k
+                         " replaces the one of configure. Add -O2, or -O0 on purpose.")
+                    {:env-var k :value v}))))
 
 (defn build-autotools-library
   "Build a library with a configure, make and make install toolchain.
@@ -159,6 +207,7 @@
            configure-script in-tree? post-configure parallel-jobs skip-if-exists]
     :or {parallel-jobs (safe-parallel-jobs)
          env {}}}]
+  (check-cflags! env (System/getenv))
   (when (or (nil? skip-if-exists)
             (not (fs/exists? skip-if-exists)))
     (let [configure-script (or configure-script

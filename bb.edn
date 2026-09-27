@@ -68,11 +68,17 @@ runner would be false-greened by the very break it is looking for."
    :depends [squint:test-runner]
    :task (shell "clojure" "-M:test")}
 
+  test:bb
+  {:doc "Run the tests of the babashka build helpers in test/bb."
+   :extra-paths ["test/bb"]
+   :requires ([clojure.test :as t]
+              [net.willcohen.native.build-test])
+   :task (let [{:keys [fail error]} (t/run-tests 'net.willcohen.native.build-test)]
+           (when (pos? (+ fail error)) (System/exit 1)))}
+
   test
-  {:doc "Run all clj-native tests across two lanes: JVM clojure.test
-(test:clj -- dual-runtime + JVM-only) and squint cljs.test (test:cljs --
-dual-runtime + cljs-only)."
-   :depends [test:clj test:cljs]}
+  {:doc "Run every lane: test:clj, test:cljs and test:bb."
+   :depends [test:clj test:cljs test:bb]}
 
   npm:install
   {:doc "Install clj-native's npm dependencies. package.json pins the squint-cljs version."

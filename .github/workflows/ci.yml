@@ -1,5 +1,5 @@
-# CI for clj-native: three lanes (bb lint, bb test:clj, bb test:cljs) on
-# Linux and macOS.
+# CI for clj-native: bb lint, bb test:clj and bb test:cljs on Linux and
+# macOS, and bb test:bb (the babashka build helpers) on Linux.
 #
 # Lane requirements, all deliberate:
 # - lint needs a JDK + clojure CLI (lint:deps indexes two classpaths) AND
@@ -11,6 +11,7 @@
 #   failure. This lane is the one most likely to behave differently on a
 #   CI runner. Watch it on the first green build.
 # - test:cljs is pure node once squint compiles.
+# - test:bb needs only bb.
 #
 # No Windows job: lazy_context_test shells `clojure` as a subprocess,
 # and ProcessBuilder does not resolve a bare `clojure` to clojure.cmd on
@@ -118,6 +119,9 @@ jobs:
 
       - name: Run CLJS tests
         run: bb test:cljs
+
+      - name: Run build helper tests
+        run: bb test:bb
 
   test-macos:
     name: Tests (macOS arm64)

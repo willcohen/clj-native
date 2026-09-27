@@ -20,8 +20,10 @@
    Each library calls create-wasm-context! at boot. It then calls
    set-module! when its module loads. Protocol methods and heap utilities
    resolve the active module through *wasm-context*. Without a binding,
-   they use the one registered context instead. Polyglot access serializes
-   on the monitor of the Context that owns the touched module. Every
+   they use the one registered context instead. With more than one library
+   loaded, a library wraps its heap calls in with-library-context. Polyglot
+   access serializes on the monitor of the Context that owns the touched
+   module. Every
    Context shares one Engine, thus parsed sources and compiled code are
    shared. The default is one Context for the whole JVM, and
    with-graal-lock serializes it. A pool worker instead holds a Context
@@ -71,6 +73,34 @@
   ^String []
   (.getName (Truffle/getRuntime)))
 
+(defn- fill-random!
+  "Fill the bytes under the typed array `view` from `rng`. Returns `view`."
+  ^Value [^java.security.SecureRandom rng ^Value view]
+  (let [buf (.getMember view "buffer")
+        off (.asLong (.getMember view "byteOffset"))
+        n   (.asLong (.getMember view "byteLength"))]
+    (loop [i 0]
+      (cond
+        (<= (+ i 8) n) (do (.writeBufferLong buf java.nio.ByteOrder/LITTLE_ENDIAN (+ off i) (.nextLong rng))
+                           (recur (+ i 8)))
+        (< i n)        (do (.writeBufferByte buf (+ off i) (unchecked-byte (.nextInt rng)))
+                           (recur (inc i)))))
+    view))
+
+(defn- install-crypto!
+  "Give `ctx` a crypto.getRandomValues, which GraalJS lacks. An emscripten
+   module reads /dev/urandom through it."
+  ^Context [^Context ctx]
+  (let [bindings (.getBindings ctx "js")]
+    (when-not (.hasMember bindings "crypto")
+      (let [rng (java.security.SecureRandom.)
+            get-random-values (reify ProxyExecutable
+                                (execute [_ args]
+                                  (fill-random! rng (aget ^"[Lorg.graalvm.polyglot.Value;" args 0))))]
+        (.putMember bindings "crypto"
+                    (ProxyObject/fromMap {"getRandomValues" get-random-values}))))
+    ctx))
+
 (defn- build-context
   ^Context []
   (-> (Context/newBuilder (into-array String ["js" "wasm"]))
@@ -82,7 +112,8 @@
       (.out System/out)
       (.err System/err)
       (.allowIO true)
-      .build))
+      .build
+      install-crypto!))
 
 ;; Holds the builder's own Context instance for the life of the JVM. The
 ;; polyglot API warns on, and may clean up, a Context whose creator
@@ -168,11 +199,6 @@ Thus more than one consumer library can coexist in one JVM."}
         (swap! contexts assoc library-key ctx)
         ctx)))
 
-(defn lookup-wasm-context
-  "Return the WasmContext registered under library-key, or nil."
-  [library-key]
-  (get @contexts library-key))
-
 (defn set-module!
   "Register the loaded WASM module with a WasmContext. A second call
    overwrites the module, as in the force-graal! and force-ffi! flows."
@@ -201,6 +227,23 @@ Thus more than one consumer library can coexist in one JVM."}
   `(binding [*wasm-context* ~ctx]
      ~@body))
 
+(defn library-context
+  "The bound *wasm-context*, else the WasmContext of `library-key`. Throws
+   when neither exists."
+  [library-key]
+  (or *wasm-context*
+      (get @contexts library-key)
+      (throw (ex-info "No WasmContext is registered for this library"
+                      {:library-key library-key}))))
+
+(defmacro with-library-context
+  "Run body with *wasm-context* bound to (library-context library-key), so
+   heap calls reach the module of `library-key` when more than one library
+   is loaded."
+  [library-key & body]
+  `(binding [*wasm-context* (library-context ~library-key)]
+     ~@body))
+
 (defn- current-module
   "Resolve the active WASM module. Use *wasm-context* first, and the one
    registered context after that. Throws when neither resolves, and also
@@ -211,7 +254,8 @@ Thus more than one consumer library can coexist in one JVM."}
                   (when (= 1 (count cs))
                     (-> cs vals first))))]
     (when (nil? ctx)
-      (throw (ex-info "*wasm-context* is unbound and no single default registered context"
+      (throw (ex-info (str "*wasm-context* is unbound and no single default registered context. "
+                           "Wrap the heap call in with-library-context.")
                       {:registered-keys (keys @contexts)})))
     (or @(:module-ref ctx)
         (throw (ex-info "WasmContext has no loaded module"
@@ -226,7 +270,7 @@ Thus more than one consumer library can coexist in one JVM."}
   `(let [~binding (current-module)]
      (with-module-lock ~binding ~@body)))
 
-(declare address-as-trackable-pointer)
+(declare address-as-int address-as-trackable-pointer)
 
 (defn- member-fn
   "Reach the member at `path` of `module`. `path` is one member name, or
@@ -291,11 +335,46 @@ Thus more than one consumer library can coexist in one JVM."}
   [^Value v]
   (.asLong v))
 
+(defonce ^:private module-copy-dir
+  (delay (doto (.toFile (java.nio.file.Files/createTempDirectory
+                         "clj-native-modules"
+                         (make-array java.nio.file.attribute.FileAttribute 0)))
+           (.deleteOnExit))))
+
+(defn- module-file
+  "The file of the JS module at `url`. A Source needs a file to resolve
+   relative imports, so a jar: URL is copied once per JVM, into one temp
+   dir per URL directory."
+  ^java.io.File [^java.net.URL url]
+  (if (= "file" (.getProtocol url))
+    (java.io.File. (.toURI url))
+    (let [s   (str url)
+          i   (.lastIndexOf s "/")
+          dir (java.io.File. ^java.io.File @module-copy-dir
+                             (str (java.util.UUID/nameUUIDFromBytes (.getBytes (subs s 0 i) "UTF-8"))))
+          f   (java.io.File. dir (subs s (inc i)))]
+      ;; Pool workers bootstrap at once. A second copy would replace a file
+      ;; that another Context is importing.
+      (locking module-copy-dir
+        (when-not (.exists f)
+          (.mkdirs dir)
+          (.deleteOnExit dir)
+          ;; Each later bootstrap in this JVM would import a partial copy.
+          (try
+            (with-open [in (.openStream url)]
+              (java.nio.file.Files/copy in (.toPath f)
+                                        ^"[Ljava.nio.file.CopyOption;" (make-array java.nio.file.CopyOption 0)))
+            (catch Throwable t
+              (.delete f)
+              (throw t)))
+          (.deleteOnExit f)))
+      f)))
+
 (defn- build-js-module-source
   "Build a Polyglot Source from a JS module URL. The Source carries the
    ESM MIME type, thus GraalVM honors the import and export syntax."
   [^java.net.URL url]
-  (-> (Source/newBuilder "js" (java.io.File. (.toURI url)))
+  (-> (Source/newBuilder "js" (module-file url))
       (.mimeType "application/javascript+module")
       .build))
 
@@ -353,6 +432,8 @@ Thus more than one consumer library can coexist in one JVM."}
 
      No package resolution. The module loads as a bare ESM Source. Thus a
      relative import of a sibling resolves, and a bare specifier does not.
+     A jar: module loads from a temp copy, so list each sibling that it
+     imports in :preload-module-urls.
      A loader therefore cannot import the shipped .mjs helpers of this
      package. It keeps its own copy of each helper that it must have.
 
@@ -607,6 +688,16 @@ Thus more than one consumer library can coexist in one JVM."}
                    (name rettype)
                    (ProxyArray/fromArray (object-array (map name argtypes)))
                    (ProxyArray/fromArray (object-array args))]))
+
+(defn ccall-string
+  "ccall a C function that returns char *. Returns nil for NULL, where
+   rettype \"string\" gives \"\". The read holds the same lock as the call,
+   because another thread can free the string in between."
+  [^Value module c-fn-name argtypes args]
+  (with-module-lock module
+    (let [addr (address-as-int (ccall module c-fn-name :number argtypes args))]
+      (when-not (zero? addr)
+        (utf8->string module addr)))))
 
 (defn put-js-globals!
   "Publish every value of `m` on globalThis, under its key. The 1-arity

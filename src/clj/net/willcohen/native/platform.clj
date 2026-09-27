@@ -170,22 +170,26 @@
       (.replaceFirst "[.][^.]+$" "")
       (.replaceFirst "^lib" "")))
 
-(defn rehydrate-fn-defs
-  "Return `fndefs` with every argument name changed from a keyword to a symbol.
+(defn nullable-c-string
+  "A C string of `s` for a :string? argument, or nil (NULL) for nil. Call
+   it in a stack resource context, which frees the copy."
+  [s]
+  (some-> s dt-ffi/string->c))
 
-   dt-ffi reads the first element of each argtype pair as a defn parameter
-   name. It accepts a symbol only. A .cljc fndefs map holds those names as
-   keywords, because squint can also compile that shape. Thus each consumer
-   converts the map one time, on the JVM side, before it reaches dt-ffi."
+(defn- dt-ffi-argtype
+  [[arg-name t & more]]
+  (into [(symbol (name arg-name)) (if (= :string? t) :pointer? t)] more))
+
+(defn rehydrate-fn-defs
+  "Return `fndefs` as dt-ffi reads them. Argument names become symbols,
+   since a .cljc fndefs map holds keywords for squint. dt-ffi has no
+   :string?: an argument becomes :pointer?, which dispatch/call! fills
+   with nullable-c-string, and a return becomes :string."
   [fndefs]
-  (into {}
-        (map (fn [[fn-key fn-def]]
-               [fn-key (update fn-def :argtypes
-                               (fn [argtypes]
-                                 (mapv (fn [[arg-name & more]]
-                                         (into [(symbol (name arg-name))] more))
-                                       argtypes)))])
-             fndefs)))
+  (update-vals fndefs
+               (fn [fn-def]
+                 (cond-> (update fn-def :argtypes #(mapv dt-ffi-argtype %))
+                   (= :string? (:rettype fn-def)) (assoc :rettype :string)))))
 
 (def default-library-suffixes
   "The file extension of a shared library, for each OS keyword. A consumer can

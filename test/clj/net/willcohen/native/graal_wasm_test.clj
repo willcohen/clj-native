@@ -74,8 +74,8 @@
         b (w/create-wasm-context! ::idem)]
     (try
       (is (identical? a b) "same library-key returns the existing context")
-      (is (= a (w/lookup-wasm-context ::idem)))
-      (is (nil? (w/lookup-wasm-context ::never-registered)))
+      (is (= a (get @w/contexts ::idem)))
+      (is (nil? (get @w/contexts ::never-registered)))
       (finally (swap! w/contexts dissoc ::idem)))))
 
 (deftest malloc-hands-out-distinct-usable-addresses
@@ -468,7 +468,7 @@
         (is (not (identical? (.getContext (w/get-module wc))
                              (.getContext (w/get-module @ctx))))))
       (testing "the registry does not know the pooled WasmContext"
-        (is (nil? (w/lookup-wasm-context ::pooled-lib))))
+        (is (nil? (get @w/contexts ::pooled-lib))))
       (testing "heap utilities and scalar Pointerlike ops stay in the pooled Context"
         ;; allocate-string-on-heap wraps a host scalar through
         ;; address-as-polyglot-value; a wrap through the default Context
@@ -535,3 +535,189 @@
       (is (= 20 (.asInt (w/ccall (module) "call_global" :number
                                  ["string" "number"]
                                  ["__clj_native_test_kw" 10])))))))
+
+;; emscripten reads /dev/urandom through crypto.getRandomValues, which
+;; GraalJS lacks.
+(def ^:private random-probe
+  "(() => {
+     const a = new Uint8Array(64);
+     const b = new Uint32Array(16);
+     const r = crypto.getRandomValues(a);
+     crypto.getRandomValues(b);
+     return [typeof crypto.getRandomValues, r === a,
+             a.some((x) => x !== 0), b.some((x) => x > 255)].join(',');
+   })()")
+
+(def ^:private unaligned-probe
+  "(() => {
+     const buf = new ArrayBuffer(32);
+     const v = new Uint8Array(buf, 3, 13);
+     crypto.getRandomValues(v);
+     const all = new Uint8Array(buf);
+     return [all.slice(0, 3).every((x) => x === 0),
+             all.slice(16).every((x) => x === 0),
+             v.some((x) => x !== 0)].join(',');
+   })()")
+
+(deftest each-context-has-crypto-get-random-values
+  (testing "a view at an offset with a tail shorter than 8 bytes"
+    (is (= "true,true,true" (str (w/eval-js unaligned-probe "unaligned-probe.js")))))
+  (testing "the default Context"
+    (is (= "function,true,true,true"
+           (str (w/eval-js random-probe "random-probe.js")))))
+  (testing "a pooled Context"
+    (let [pooled (w/new-polyglot-context!)]
+      (try
+        (is (= "function,true,true,true"
+               (str (w/eval-js pooled random-probe "random-probe.js"))))
+        (finally (.close pooled))))))
+
+(deftest graal-leg-tells-a-null-string-from-an-empty-string
+  ;; ccall's "string" rettype gives "" for NULL. The FFI backend gives nil.
+  (let [lib (dispatch/library {:key lib-key
+                               :fndefs {:str_null  {:rettype :string :argtypes []}
+                                        :str_empty {:rettype :string :argtypes []}
+                                        :str_abc   {:rettype :string :argtypes []}}
+                               :impl-atom (atom :graal)})]
+    (on-module
+     (is (nil? (dispatch/call! lib :str_null [])) "a NULL char* reads as nil")
+     (is (= "" (dispatch/call! lib :str_empty [])) "an empty string stays \"\"")
+     (is (= "abc" (dispatch/call! lib :str_abc []))))))
+
+(deftest graal-leg-sends-a-nil-string?-argument-as-null
+  ;; emscripten ccall sends 0 for a "string" argument as NULL.
+  (let [lib (dispatch/library {:key lib-key
+                               :fndefs {:noop {:rettype :int32
+                                               :argtypes [[:key :string?]]}}
+                               :impl-atom (atom :graal)})
+        idx (ccall-count)]
+    (on-module (dispatch/call! lib :noop [nil]))
+    (is (= {:name "noop" :rettype "number" :types ["string"] :vals [0]}
+           (ccall-log idx)))))
+
+(deftest graal-leg-reads-an-int64-return-as-a-long
+  ;; A WASM_BIGINT module gives an i64 result as a BigInt.
+  (let [lib (dispatch/library {:key lib-key
+                               :fndefs {:i64_ret {:rettype :int64 :argtypes []}}
+                               :impl-atom (atom :graal)})
+        r   (on-module (dispatch/call! lib :i64_ret []))]
+    (is (instance? Long r))
+    (is (= 3000000000 r) "all 64 bits, above 2^31")))
+
+(deftest graal-leg-sends-an-int64-argument-as-a-bigint
+  ;; A WASM_BIGINT module rejects a JS number for an i64 parameter, and
+  ;; jvm-graal-call then logs the TypeError and gives nil.
+  (let [lib (dispatch/library {:key lib-key
+                               :fndefs {:i64_echo {:rettype :int64
+                                                   :argtypes [[:v :int64]]}}
+                               :impl-atom (atom :graal)})]
+    (is (= 3000000001 (on-module (dispatch/call! lib :i64_echo [3000000000])))
+        "all 64 bits go in and come back")
+    (is (= 9007199254740994 (on-module (dispatch/call! lib :i64_echo [9007199254740993])))
+        "above 2^53, where a double loses the low bit")
+    (is (= 1 (on-module (dispatch/call! lib :i64_echo [nil])))
+        "nil goes in as 0")))
+
+(defn- jar-with-modules
+  "A temp jar that holds the JS text of each entry of `entries`, a map of
+   {path text}."
+  ^java.io.File [entries]
+  (let [f (java.io.File/createTempFile "modules" ".jar")]
+    (.deleteOnExit f)
+    (with-open [out (java.util.jar.JarOutputStream. (java.io.FileOutputStream. f))]
+      (doseq [[^String path ^String text] entries]
+        (.putNextEntry out (java.util.jar.JarEntry. path))
+        (.write out (.getBytes text "UTF-8"))
+        (.closeEntry out)))
+    f))
+
+(deftest bootstrap-loads-modules-from-a-jar
+  ;; A consumer jar holds its loader and its emscripten module as jar:
+  ;; resources, and the loader imports the module by a relative path.
+  (let [jar (jar-with-modules
+             {"js/sibling.mjs" "export function marker() { return 'from-jar'; }"
+              "js/loader.mjs"  (str "import { marker } from './sibling.mjs';\n"
+                                    "export function load() { return { marker: marker() }; }")})
+        cl  (java.net.URLClassLoader. (into-array java.net.URL [(.toURL (.toURI jar))]) nil)
+        url #(.getResource cl %)
+        c   (w/create-wasm-context! ::from-jar)]
+    (try
+      (is (= "jar" (.getProtocol ^java.net.URL (url "js/loader.mjs"))))
+      (let [m (w/bootstrap-graal-module! c {:loader-module-url   (url "js/loader.mjs")
+                                            :preload-module-urls [(url "js/sibling.mjs")]})]
+        (is (= "from-jar" (member m "marker"))))
+      (finally (swap! w/contexts dissoc ::from-jar)))))
+
+(deftest module-file-of-a-jar-url-is-safe-across-threads
+  ;; Pool workers bootstrap their Contexts at the same time, and each one
+  ;; asks for the same jar: modules.
+  (let [text (apply str (repeat 20000 "x"))
+        jar  (jar-with-modules {"js/big.mjs" text})
+        url  (.getResource (java.net.URLClassLoader. (into-array java.net.URL [(.toURL (.toURI jar))]) nil)
+                           "js/big.mjs")
+        n    8
+        gate (CyclicBarrier. n)
+        pool (java.util.concurrent.Executors/newFixedThreadPool n)
+        read-copy (fn [] (.await gate) (slurp (#'w/module-file url)))]
+    (try
+      (let [results (->> (repeat (* 4 n) read-copy)
+                         (map #(.submit ^ExecutorService pool ^Callable (fn [] (try (%) (catch Throwable t t)))))
+                         doall
+                         (mapv #(.get ^java.util.concurrent.Future %)))]
+        (is (= #{(count text)} (set (map #(if (string? %) (count %) (class %)) results)))
+            "each thread reads the whole copy"))
+      (finally (.shutdownNow pool)))))
+
+(defn- url-with-streams
+  "A URL of a non-file scheme whose each open calls `open-stream`."
+  ^java.net.URL [path open-stream]
+  (java.net.URL. nil (str "test-stream:" path)
+                 (proxy [java.net.URLStreamHandler] []
+                   (openConnection [u]
+                     (proxy [java.net.URLConnection] [u]
+                       (connect [])
+                       (getInputStream [] (open-stream)))))))
+
+(defn- throwing-stream
+  ^java.io.InputStream []
+  (proxy [java.io.InputStream] []
+    (read
+      ([] (throw (java.io.IOException. "cut")))
+      ([_] (throw (java.io.IOException. "cut")))
+      ([_ _ _] (throw (java.io.IOException. "cut"))))))
+
+(deftest module-file-keeps-no-partial-copy
+  ;; A copy that fails partway must not stay, or each later bootstrap in the
+  ;; JVM imports the truncated module.
+  (let [text  (apply str (repeat 1000 "x"))
+        bs    (.getBytes text "UTF-8")
+        opens (atom 0)
+        url   (url-with-streams
+               (str "dir-" (random-uuid) "/m.mjs")
+               #(if (= 1 (swap! opens inc))
+                  (java.io.SequenceInputStream. (java.io.ByteArrayInputStream. bs 0 500)
+                                                (throwing-stream))
+                  (java.io.ByteArrayInputStream. bs)))]
+    (is (thrown? java.io.IOException (#'w/module-file url)))
+    (is (= text (slurp (#'w/module-file url))))))
+
+(deftest with-library-context-picks-the-module-of-a-library
+  ;; With two libraries registered, an unbound heap call cannot know which
+  ;; module to use. clj-gdal and clj-proj in one JVM hit this.
+  (let [_ (w/create-wasm-context! ::other-library)]
+    (try
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"with-library-context"
+                            (w/malloc 8))
+          "the error names the fix")
+      (is (pos? (w/address-as-int (w/with-library-context lib-key (w/malloc 8)))))
+      (testing "a bound context stays, as for a pool worker"
+        (let [pctx (w/new-polyglot-context!)
+              wc   (w/->WasmContext ::pooled-lc (atom nil))]
+          (try
+            (w/bootstrap-graal-module! wc {:loader-module-url (loader-url)
+                                           :polyglot-context pctx})
+            (is (identical? (w/get-module wc)
+                            (w/with-wasm-context wc
+                              (w/with-library-context lib-key (#'w/current-module)))))
+            (finally (.close pctx)))))
+      (finally (swap! w/contexts dissoc ::other-library)))))

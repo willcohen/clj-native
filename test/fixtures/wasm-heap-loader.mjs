@@ -197,6 +197,30 @@ function makeModule() {
         const fn = globalThis[vals[0]];
         return typeof fn === 'function' ? fn(vals[1]) : -1;
       }
+      // A char* result. As emscripten ccall does, rettype "string" gives
+      // UTF8ToString of the address, which is "" for NULL and for an empty
+      // string alike. Rettype "number" gives the address itself.
+      case 'str_null':
+      case 'str_empty':
+      case 'str_abc': {
+        let ptr = 0;
+        if (name !== 'str_null') {
+          const text = name === 'str_abc' ? 'abc' : '';
+          ptr = M._malloc(text.length + 1);
+          M.stringToUTF8(text, ptr, text.length + 1);
+        }
+        return rettype === 'string' ? M.UTF8ToString(ptr) : ptr;
+      }
+      // An i64 result, as a WASM_BIGINT module gives it: a BigInt.
+      case 'i64_ret':
+        return 3000000000n;
+      // An i64 parameter of a WASM_BIGINT module rejects a Number, as the
+      // wasm boundary does ("Cannot convert 1900 to a BigInt").
+      case 'i64_echo':
+        if (typeof vals[0] !== 'bigint') {
+          throw new TypeError(`Cannot convert ${vals[0]} to a BigInt`);
+        }
+        return vals[0] + 1n;
       default:
         return 0;
     }

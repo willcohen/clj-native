@@ -25,6 +25,7 @@
             #?(:clj  [net.willcohen.native.dispatch :as d]
                :cljs ["ffi-wasm/dispatch" :as d])
             #?(:clj [net.willcohen.native.platform])
+            #?(:clj [tech.v3.datatype.ffi :as dt-ffi])
             #?(:cljs ["ffi-wasm/test-runner" :as tr])))
 
 (def number-typed-argtypes
@@ -41,8 +42,9 @@
     (doseq [t number-typed-argtypes]
       (is (= :number (d/argtype->ccall-type t))
           (str t " -> :number"))))
-  (testing ":string maps to :string"
-    (is (= :string (d/argtype->ccall-type :string)))))
+  (testing ":string and :string? map to :string"
+    (is (= :string (d/argtype->ccall-type :string)))
+    (is (= :string (d/argtype->ccall-type :string?)))))
 
 (deftest library-validates-fndefs-types-at-build-time
   ;; An unknown type used to fall through argtype->ccall-type's default
@@ -59,14 +61,15 @@
                  (d/library {:key :bad-lib
                              :fndefs {:lib_bad {:rettype :void
                                                 :argtypes [[:x :quaternion]]}}}))))
-  (testing ":int64 passes in argument position only"
-    (is (some? (d/library {:key :i64-lib
-                           :fndefs {:lib_set64 {:rettype :void
-                                                :argtypes [[:v :int64]]}}})))
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
-                 (d/library {:key :i64-lib
-                             :fndefs {:lib_get64 {:rettype :int64
-                                                  :argtypes []}}})))))
+  (testing ":string? and :int64 arguments get their indexes precomputed"
+    (let [r (get-in (d/library {:key :idx-lib
+                                :fndefs {:lib_mix {:rettype :int64
+                                                   :argtypes [[:p :pointer] [:s :string?] [:v :int64]]}}})
+                    [:fns :lib_mix])]
+      (is (= :number (:ccall-rettype r)))
+      (is (= :string (nth (:ccall-argtypes r) 1)))
+      (is (and (= 1 (count (:string?-indexes r))) (contains? (:string?-indexes r) 1)))
+      (is (and (= 1 (count (:int64-indexes r))) (contains? (:int64-indexes r) 2))))))
 
 (deftest library-precomputes-one-record-per-fn-key
   (let [lib (d/library {:key :test-lib :fndefs sample-fndefs})]
@@ -126,9 +129,7 @@
       (is (contains? tokens ":pointer") "the token split has to produce bare types")
       (doseq [t d/supported-types]
         (is (contains? tokens (str ":" (name t)))
-            (str "the rejection message omits " (name t))))
-      (is (contains? tokens ":int64")
-          "the argument-position-only type is named too"))))
+            (str "the rejection message omits " (name t)))))))
 
 #?(:clj
    (deftest call!-selects-the-backend-from-the-impl-atom-per-call
@@ -151,6 +152,26 @@
            ;; hold for anything else that came back.
            (is (= 99 (d/call! lib :lib_count [7]))
                "same library value now routes to graal")))
+       (testing "the FFI leg gives a C string for a :string? argument, and nil for nil"
+         (reset! impl :ffi)
+         (reset! calls [])
+         (let [sq-lib (d/library {:key :sq-lib
+                                  :fndefs {:lib_opt {:rettype :void
+                                                     :argtypes [[:key :string?] [:n :int32]]}}
+                                  :impl-atom impl
+                                  :ffi-impl-ns 'net.willcohen.native.dispatch-test})]
+           ;; The C string lives until the call returns, thus the stub reads
+           ;; it during the call.
+           (with-redefs [net.willcohen.native.platform/call-native-fn
+                         (fn [_ns fn-key [s n]]
+                           (swap! calls conj [fn-key [(some-> s dt-ffi/c->string) n]])
+                           nil)]
+             (d/call! sq-lib :lib_opt ["abc" 1])
+             (d/call! sq-lib :lib_opt [nil 2]))
+           (let [[[_ [c-str n1]] [_ [nil-arg n2]]] @calls]
+             (is (= "abc" c-str))
+             (is (nil? nil-arg))
+             (is (= [1 2] [n1 n2]) "the other arguments pass unchanged"))))
        (testing "an unknown fn-key throws rather than deriving a record per call"
          (is (thrown? clojure.lang.ExceptionInfo
                       (d/call! lib :lib_nonexistent [])))))))
@@ -208,5 +229,23 @@
         r #?(:clj  (d/check-result lib :some-fn {} {} 21)
              :cljs (await (d/check-result lib :some-fn {} {} 21)))]
     (is (= 21 r) "no hook means the result passes through")))
+
+#?(:cljs
+   (deftest ^:async cljs-leg-sends-an-int64-argument-as-a-bigint
+     ;; A WASM_BIGINT module rejects a JS number for an i64 parameter. The
+     ;; fake pool records the arguments that reach the handler ccall.
+     (let [seen (atom nil)
+           fake #js {:worker (fn [_idx]
+                               (js-obj "i64-lib"
+                                       #js {:ccall (fn [_fn _ret _types args]
+                                                     (reset! seen args)
+                                                     7)}))}
+           lib  (d/library {:key :i64-lib
+                            :fndefs {:lib_set64 {:rettype :int32
+                                                 :argtypes [[:v :int64] [:n :int32]]}}})
+           r    (await (d/call! lib :lib_set64 [3000000000 1] #js {:pool fake}))]
+       (is (= 7 r))
+       (is (= (js/BigInt "3000000000") (aget @seen 0)) "the :int64 argument is a BigInt")
+       (is (= 1 (aget @seen 1)) "an :int32 argument stays a number"))))
 
 #?(:cljs (tr/run-tests-and-exit! "net.willcohen.native.dispatch-test"))

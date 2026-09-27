@@ -173,17 +173,14 @@ export const flushDebugRing = (reason) => {
   console.error('=== end CLJ-NATIVE ring (' + tag + ') ===');
 };
 
-// Register flush hooks unconditionally if the runtime exposes process.on.
-// The handlers themselves runtime-check via flushDebugRing, so registering
-// them when debug is off is harmless (flushDebugRing returns immediately).
+// The monitor keeps Node's default exit, so a crashed pool worker still ends,
+// and it also sees an unhandled rejection. An uncaughtException listener
+// would replace the exit.
 const registerFlushHandlers = () => {
   if (flushHandlersRegistered) return;
   if (typeof process !== 'undefined' && typeof process.on === 'function') {
-    process.on('uncaughtException', (e) => {
-      flushDebugRing('uncaughtException: ' + (e && e.message ? e.message : String(e)));
-    });
-    process.on('unhandledRejection', (e) => {
-      flushDebugRing('unhandledRejection: ' + (e && e.message ? e.message : String(e)));
+    process.on('uncaughtExceptionMonitor', (e, origin) => {
+      flushDebugRing(origin + ': ' + (e && e.message ? e.message : String(e)));
     });
     flushHandlersRegistered = true;
   }

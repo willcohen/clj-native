@@ -21,6 +21,7 @@
                      getLogConfig
                      dbg]]
             ["ffi-wasm/test-runner" :as tr]
+            ["node:child_process" :refer [spawnSync]]
             ["node:perf_hooks" :refer [performance]]))
 
 ;; Capture console.log output for substrate tests, restoring after each.
@@ -657,4 +658,15 @@
 ;; Run on module load: deftest forms above register at top level;
 ;; run-tests-and-exit! iterates the registry, awaits any Promise each
 ;; ^:async test returns, and process.exit-s 0 on green / 1 on failure.
+(deftest importing-the-runtime-keeps-the-default-exit
+  ;; A pool worker that crashes must exit nonzero, or worker-router cannot
+  ;; see it.
+  (doseq [src ["setTimeout(() => { throw new Error('boom'); }, 0);"
+               "Promise.reject(new Error('boom'));"]]
+    (let [r (spawnSync "node"
+                   #js ["--input-type=module" "-e"
+                        (str "await import('ffi-wasm/handler-runtime'); " src)]
+                   #js {:encoding "utf8"})]
+      (is (= 1 (.-status r)) src))))
+
 (tr/run-tests-and-exit! "net.willcohen.native.handler-runtime-test")

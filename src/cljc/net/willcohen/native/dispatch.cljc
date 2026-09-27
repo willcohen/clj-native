@@ -43,7 +43,8 @@
       :on-result, and then the result-wrapper."
      (:require [net.willcohen.native.graal-wasm :as nw]
                [net.willcohen.native.platform :as nplatform]
-               [clojure.tools.logging :as log]))
+               [clojure.tools.logging :as log]
+               [tech.v3.resource :as resource]))
    :cljs
    (ns net.willcohen.native.dispatch
      "Generic dispatch engine for one fn at a time, for wasm-backed C library
@@ -64,14 +65,14 @@
   [t]
   (case t
     (:pointer :pointer? :string-array :string-array? :int32 :int64 :float64 :size-t :void) :number
-    :string :string
+    (:string :string?) :string
     :number))
 
 (def supported-types
   "The fndefs type vocabulary that `library` accepts for :rettype and for
-   argtypes. :int64 is valid in argument position only. Refer to `library`."
-  #{:pointer :pointer? :string-array :string-array? :int32 :float64 :size-t
-    :void :string})
+   argtypes. Refer to `library`."
+  #{:pointer :pointer? :string-array :string-array? :int32 :int64 :float64
+    :size-t :void :string :string?})
 
 ;; This message is written out, and not derived from supported-types.
 ;; (str :pointer) gives ":pointer" on the JVM, and "pointer" under squint,
@@ -79,8 +80,8 @@
 ;; differently in the two lanes.
 ;; validate-fn-def!-names-every-supported-type pins this against the set.
 (def ^:private supported-types-msg
-  (str ":pointer :pointer? :string-array :string-array? :int32 :float64 "
-       ":size-t :void :string, plus :int64 in argument position only"))
+  (str ":pointer :pointer? :string-array :string-array? :int32 :int64 "
+       ":float64 :size-t :void :string :string?"))
 
 (defn- validate-fn-def!
   "Throw when a fn-def carries a type outside the supported vocabulary.
@@ -93,7 +94,7 @@
                            ". Supported: " supported-types-msg)
                       {:fn-key fn-key :rettype rettype})))
     (doseq [[arg-name t] (:argtypes fn-def)]
-      (when-not (or (contains? supported-types t) (= :int64 t))
+      (when-not (contains? supported-types t)
         (throw (ex-info (str "Unsupported argtype " t " for arg " arg-name
                              " in fn-def " fn-key ". Supported: " supported-types-msg)
                         {:fn-key fn-key :arg arg-name :argtype t}))))))
@@ -119,6 +120,11 @@
 ;; consumer gives that value to each call. No code finds a library by its name
 ;; at call time.
 
+(defn- type-indexes
+  "The set of indexes in `argtypes` whose type is `t`."
+  [t argtypes]
+  (set (keep-indexed (fn [i [_ at]] (when (= t at) i)) argtypes)))
+
 (defn- fn-record
   "Calculate the data that a call must have from the fn-def alone. `library`
    does this one time for each fn-key."
@@ -128,7 +134,16 @@
    :fn-def         fn-def
    :rettype        (:rettype fn-def)
    :ccall-rettype  (argtype->ccall-type (:rettype fn-def))
-   :ccall-argtypes (mapv (fn [[_ t]] (argtype->ccall-type t)) (:argtypes fn-def))})
+   :ccall-argtypes (mapv (fn [[_ t]] (argtype->ccall-type t)) (:argtypes fn-def))
+   :string?-indexes (type-indexes :string? (:argtypes fn-def))
+   :int64-indexes   (type-indexes :int64 (:argtypes fn-def))})
+
+(defn- update-at-indexes
+  "`args` with `f` applied at each index in the set `ix`."
+  [ix f args]
+  (if (empty? ix)
+    args
+    (vec (map-indexed (fn [i a] (if (contains? ix i) (f a) a)) args))))
 
 (defn library
   "Build a library value from the fndefs of a consumer. The consumer holds
@@ -156,13 +171,16 @@
    message.
 
    These types are valid in the two positions: :pointer :pointer?
-   :string-array :string-array? :int32 :float64 :size-t :void :string.
+   :string-array :string-array? :int32 :int64 :float64 :size-t :void
+   :string :string?.
 
-   :int64 is valid in argument position only. ccall passes it as :number,
-   thus the wasm path keeps 53 bits at most. The FFI path passes a true
-   64-bit integer. No rettype coercion exists for :int64. Thus a 64-bit
-   integral return stays unsupported, as with sqlite3_int64. Widen the table
-   when a consumer must have it.
+   :string? is a :string argument that can be nil (NULL), which dt-ffi's
+   :string rejects. A NULL string result is nil on the JVM and \"\" on
+   CLJS, where emscripten ccall gives \"\" for both.
+
+   :int64 is a Long on the JVM. The wasm legs send it as a BigInt, as a
+   WASM_BIGINT module (the emscripten default since 4.0.0) needs, and the
+   CLJS leg returns the BigInt.
 
    clj-native has two other type vocabularies. read-heap-array has its heap
    views (:u8 :i8 :u16 :i16 :u32 :i32 :f32 :f64). read-struct has its field
@@ -173,7 +191,7 @@
    :key, :impl-atom, :ffi-impl-ns and :hooks pass through unchanged.
    `library` replaces :fndefs with :fns. :fns maps each fn-key to a
    precomputed record of {:fn-key :c-name :fn-def :rettype :ccall-rettype
-   :ccall-argtypes}.
+   :ccall-argtypes :string?-indexes :int64-indexes}.
 
    The returned value does not carry the raw fndefs map. Reach one fn-def
    through (get-in lib [:fns fn-key :fn-def]). A rename of any of these keys
@@ -229,70 +247,76 @@
 
 #?(:clj
    (defn jvm-rettype-postprocess
-     "Generic JVM rettype postprocess. clj-native owns the shape:
-      :pointer  -> a TrackablePointer, or nil for a nil or null address
-      :pointer? -> the same as :pointer. The two differ only in the
-                   behavior of the dt-ffi wrapper on the FFI path, with a
-                   NULL argument.
-      :string   -> dereference UTF-8, or nil for a 0 or empty address
-      :int32    -> coerce from a Polyglot Value when necessary
-      :float64  -> .asDouble for a Polyglot Value
-      :size-t   -> .asLong for a Polyglot Value
-      :void     -> nil
-
-      A nil result gives nil from each case. One example of a nil result is
-      a caught ccall exception.
-
-      A null address gives nil. It does not give a zero-address
-      TrackablePointer, because such a pointer is true and thus defeats a
-      (nil? x) test.
-
-      :string-array and :string-array? have no arm on purpose. They return
-      the raw address on every backend, because the caller decides when to
-      walk the array. The JVM caller uses
-      graal-wasm/string-array-pointer->strs, or ffi-mem/read-string-array on
-      the FFI path. The CLJS caller uses the handler-heap read_string_array
-      through the handler."
+     "Coerce a GraalVM ccall result by rettype. A :pointer or :pointer?
+      result becomes a TrackablePointer, or nil for a null address, which
+      would defeat a (nil? x) test. :int32, :float64, :int64 and :size-t read
+      a Polyglot Value as a number. :void gives nil. Any other result passes
+      through: a string from nw/ccall-string, or a :string-array address for
+      the caller to walk. nil stays nil."
      [rettype result]
      (case rettype
        (:pointer :pointer?) (when (some? result)
                               (let [tp (nw/address-as-trackable-pointer result)]
                                 (when-not (zero? (nw/address-as-int tp)) tp)))
-       :string  (let [s (if (instance? org.graalvm.polyglot.Value result)
-                          (nw/address-as-string result)
-                          result)]
-                  (if (= "" s) nil s))
        :int32   (if (instance? org.graalvm.polyglot.Value result)
                   (nw/address-as-int result)
                   result)
        :float64 (if (instance? org.graalvm.polyglot.Value result)
                   (.asDouble ^org.graalvm.polyglot.Value result)
                   result)
-       :size-t  (if (instance? org.graalvm.polyglot.Value result)
-                  (.asLong ^org.graalvm.polyglot.Value result)
-                  result)
+       (:int64 :size-t) (if (instance? org.graalvm.polyglot.Value result)
+                          (.asLong ^org.graalvm.polyglot.Value result)
+                          result)
        :void    nil
        result)))
 
 #?(:clj
+   (defn- graal-module
+     "The module of (nw/library-context library-key). Throws when it is not
+      loaded."
+     ^org.graalvm.polyglot.Value [library-key]
+     (or (nw/get-module (nw/library-context library-key))
+         (throw (ex-info "WasmContext has no loaded module"
+                         {:library-key library-key})))))
+
+#?(:clj
    (defn jvm-graal-call
-     "Invoke ccall on the WASM module in scope, through nw/ccall: the
-      module of a bound *wasm-context* when one is set (a pool worker
-      scoped onto its own Context), else the registered module of
-      library-key. The binding wins unconditionally, the same rule the
-      heap utilities follow through current-module. nw/ccall holds the
-      polyglot lock. It also supplies the ProxyArray type list and
-      argument list. Catches exceptions and returns nil. The downstream
-      jvm-rettype-postprocess handles nil for each rettype."
+     "ccall `c-fn-name` on the module of a bound *wasm-context*, else of
+      `library-key`. A \"string\" rettype reads through nw/ccall-string.
+      Logs an exception and returns nil."
      [library-key c-fn-name ccall-rettype ccall-argtypes converted-args]
-     (let [ctx (or nw/*wasm-context* (nw/lookup-wasm-context library-key))
-           module-ref (:module-ref ctx)
-           module @module-ref]
+     (let [module (graal-module library-key)]
        (try
-         (nw/ccall module c-fn-name ccall-rettype ccall-argtypes converted-args)
+         (if (= "string" (name ccall-rettype))
+           (nw/ccall-string module c-fn-name ccall-argtypes converted-args)
+           (nw/ccall module c-fn-name ccall-rettype ccall-argtypes converted-args))
          (catch Exception e
            (log/warn (str "Graal ccall exception for " c-fn-name ": " (.getMessage e)))
            nil)))))
+
+#?(:clj
+   (defn- ffi-leg
+     "The FFI backend of call!. Each :string? argument becomes a C string
+      that lives until the call returns."
+     [lib rec fn-key args]
+     (let [ix (:string?-indexes rec)]
+       (if (empty? ix)
+         (nplatform/call-native-fn (:ffi-impl-ns lib) fn-key args)
+         (resource/stack-resource-context
+          (nplatform/call-native-fn (:ffi-impl-ns lib) fn-key
+                                    (update-at-indexes ix nplatform/nullable-c-string args)))))))
+
+#?(:clj
+   (defn- graal-int64-args
+     "`args` with each :int64 argument as a BigInt of the module's Context,
+      since a WASM_BIGINT module takes nothing else for an i64. The decimal
+      string keeps all 64 bits."
+     [library-key rec args]
+     (let [ix (:int64-indexes rec)]
+       (if (empty? ix)
+         args
+         (let [big-int (nw/module-eval-js (graal-module library-key) "BigInt" "bigint.js")]
+           (update-at-indexes ix #(nw/value-execute big-int [(str (long %))]) args))))))
 
 #?(:clj
    (defn- graal-leg
@@ -304,7 +328,7 @@
                                (:c-name rec)
                                (:ccall-rettype rec)
                                (:ccall-argtypes rec)
-                               (mapv convert-arg-jvm args))
+                               (graal-int64-args (:key lib) rec (mapv convert-arg-jvm args)))
            postprocessed (jvm-rettype-postprocess rettype raw)]
        (if-let [result-wrapper (:result-wrapper (:hooks lib))]
          (result-wrapper {:rettype rettype
@@ -331,6 +355,12 @@
        (and (map? arg) (:ptr arg)) (:ptr arg)
        (nil? arg) 0
        :else arg)))
+
+#?(:cljs
+   (defn- int64-args->bigint
+     "`args` with each :int64 argument as a BigInt, for a WASM_BIGINT module."
+     [rec args]
+     (update-at-indexes (:int64-indexes rec) js/BigInt args)))
 
 #?(:cljs
    (defn ^:async cljs-leg
@@ -405,7 +435,7 @@
                                             :library lib
                                             :pool pool-ref}))))
            isolator-args (get isolator-result :args (or builder-args args))
-           converted (mapv convert-arg-cljs isolator-args)
+           converted (int64-args->bigint rec (mapv convert-arg-cljs isolator-args))
            ccall-cmd (cond-> {:cmd "ccall"
                               :fn c-fn-name
                               :returnType (str ccall-rettype)
@@ -486,7 +516,7 @@
     #?(:clj
        (if (= :graal @(:impl-atom lib))
          (graal-leg lib rec args)
-         (nplatform/call-native-fn (:ffi-impl-ns lib) fn-key args))
+         (ffi-leg lib rec fn-key args))
        :cljs
        (await (cljs-leg lib rec args opts)))))
 

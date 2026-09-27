@@ -131,6 +131,12 @@
       (is (= "kept" (get-in rehydrated [:one_arg :doc]))))
     (testing "an empty argtypes vector survives"
       (is (= [] (get-in rehydrated [:no_args :argtypes]))))
+    (testing ":string? becomes a type that dt-ffi knows"
+      (let [r (platform/rehydrate-fn-defs
+               {:opt {:rettype :string? :argtypes [[:key :string?]]}})]
+        (is (= '[[key :pointer?]] (get-in r [:opt :argtypes]))
+            "an argument is a nullable pointer; dispatch gives it a C string")
+        (is (= :string (get-in r [:opt :rettype])))))
     (testing "the fn-def keys themselves are untouched"
       (is (= #{:one_arg :no_args} (set (keys rehydrated)))))))
 

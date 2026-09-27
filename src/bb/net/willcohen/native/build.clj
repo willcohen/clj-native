@@ -309,6 +309,210 @@
    "preInit" "preRun" "print" "printErr" "setStatus" "statusMessage"
    "stderr" "stdin" "stdout" "thisProgram" "wasm" "websocket"])
 
+(def ^:private max-glibc
+  "A glibc lib loads on this glibc and later."
+  "2.28")
+
+(def ^:private zig-targets
+  "The zig target of each resource dir that zig builds."
+  {"linux-amd64"        (str "x86_64-linux-gnu." max-glibc)
+   "linux-aarch64"      (str "aarch64-linux-gnu." max-glibc)
+   "linux-amd64-musl"   "x86_64-linux-musl"
+   "linux-aarch64-musl" "aarch64-linux-musl"
+   "windows-amd64"      "x86_64-windows-gnu"})
+
+(defn- write-tool-wrapper!
+  "Write an sh script at `path` that runs zig with `args`, then its own
+  arguments. configure and CMake take one executable."
+  [path args]
+  (spit (str path) (str "#!/bin/sh\nexec zig " (str/join " " args) " \"$@\"\n"))
+  (fs/set-posix-file-permissions path "rwxr-xr-x"))
+
+(defn- zig-host
+  "The configure --host of a zig target: no glibc version, and for Windows
+  the mingw name, since config.sub does not know the zig one."
+  [target]
+  (-> target
+      (str/replace #"\.[0-9.]+$" "")
+      (str/replace #"-windows-gnu$" "-w64-mingw32")))
+
+(defn zig-toolchain!
+  "Write the tool wrappers for the zig target of `dir` into bin-dir.
+  Returns :env (CC, CXX, AR, RANLIB, and LD for Windows), :host (for
+  configure --host) and :cmake-args. The CMake args find nothing on the
+  build machine, so give CMake each dependency by its path.
+
+  zig links libc++, libc++abi, libunwind and compiler-rt (Apache-2.0 WITH
+  LLVM-exception) into the lib and libc dynamically, so the lib holds no
+  libstdc++ or libgcc. A Windows lib imports the UCRT of Windows 10 and
+  later."
+  [dir bin-dir]
+  (let [target   (or (zig-targets dir)
+                     (throw (ex-info (str "No zig target for " dir)
+                                     {:dir dir :known (keys zig-targets)})))
+        windows? (str/includes? target "windows")
+        host   (zig-host target)
+        tool   #(str (fs/absolutize (fs/path bin-dir (str host "-" %))))
+        tools  (cond-> {"CC" "cc" "CXX" "c++" "AR" "ar" "RANLIB" "ranlib"}
+                 ;; libtool takes a non-GNU LD, such as ld64, for MSVC and
+                 ;; archives with lib.exe. zig's lld passes as a GNU ld.
+                 windows? (assoc "LD" "ld.lld"))]
+    (fs/create-dirs bin-dir)
+    (doseq [[_ t] tools]
+      (write-tool-wrapper! (tool t) (if (#{"cc" "c++"} t) [t "-target" target] [t])))
+    ;; An empty pkg-config search, as the CMake root below: a .pc file of
+    ;; the build machine would link its libs, whatever their license. The
+    ;; nixpkgs wrapper replaces PKG_CONFIG_PATH with a _FOR_TARGET or
+    ;; _FOR_BUILD path.
+    {:env        (assoc (update-vals tools tool)
+                        "PKG_CONFIG_LIBDIR" ""
+                        "PKG_CONFIG_PATH" ""
+                        "PKG_CONFIG_PATH_FOR_BUILD" ""
+                        "PKG_CONFIG_PATH_FOR_TARGET" "")
+     :host       host
+     :cmake-args [(str "-DCMAKE_SYSTEM_NAME=" (if windows? "Windows" "Linux"))
+                  (str "-DCMAKE_SYSTEM_PROCESSOR=" (first (str/split host #"-")))
+                  (str "-DCMAKE_C_COMPILER=" (tool "cc"))
+                  (str "-DCMAKE_CXX_COMPILER=" (tool "c++"))
+                  (str "-DCMAKE_AR=" (tool "ar"))
+                  (str "-DCMAKE_RANLIB=" (tool "ranlib"))
+                  ;; ONLY searches nothing but the root. With no root, CMake
+                  ;; searches the build machine. bin-dir holds only the
+                  ;; wrappers.
+                  (str "-DCMAKE_FIND_ROOT_PATH=" (fs/absolutize bin-dir))
+                  "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER"
+                  "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY"
+                  "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY"
+                  "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY"
+                  ;; FindPkgConfig adds the .pc dir of each CMAKE_PREFIX_PATH
+                  ;; entry, with no root.
+                  "-DPKG_CONFIG_USE_CMAKE_PREFIX_PATH=OFF"]}))
+
+(def ^:private glibc-libs
+  "The glibc libraries, from the host, that a lib for a glibc dir may need."
+  #{"libc.so.6" "libm.so.6" "libpthread.so.0" "libdl.so.2" "librt.so.1"
+    "libutil.so.1" "libresolv.so.2" "ld-linux-x86-64.so.2" "ld-linux-aarch64.so.1"})
+
+(def ^:private elf-machines
+  "The `readelf -h` Machine of each arch of the Linux resource dirs."
+  {"amd64" "Advanced Micro Devices X86-64" "aarch64" "AArch64"})
+
+(defn- version<=
+  "True when the dotted version `a` is at most `b`."
+  [a b]
+  (let [parse #(mapv parse-long (str/split % #"\."))
+        [va vb] [(parse a) (parse b)]
+        n (max (count va) (count vb))
+        pad #(into % (repeat (- n (count %)) 0))]
+    (<= (compare (pad va) (pad vb)) 0)))
+
+(defn- readelf-errors
+  "The errors in the `readelf -h`, `-d` and `-V` output of a lib for the
+  Linux resource `dir`. A glibc lib may need only glibc up to max-glibc, a
+  musl lib only libc.so. Neither may need libstdc++ or libgcc, or have a
+  run path."
+  [dir header dynamic-section version-info]
+  (let [musl?   (str/ends-with? dir "-musl")
+        ok-lib? (if musl? #{"libc.so"} glibc-libs)
+        want    (elf-machines (second (str/split dir #"-")))
+        type    (second (re-find #"(?m)^\s*Type:\s+(\S+)" header))
+        machine (second (re-find #"(?m)^\s*Machine:\s+(.+?)\s*$" header))]
+    (concat
+     (when (not= "DYN" type) [(str "Type " type ", not DYN")])
+     (when (not= want machine) [(str "Machine " machine ", not " want)])
+     (for [[_ lib] (re-seq #"\(NEEDED\)\s+Shared library: \[([^\]]+)\]" dynamic-section)
+           :when (not (ok-lib? lib))]
+       (str "NEEDED " lib))
+     (for [[_ tag path] (re-seq #"\((RUNPATH|RPATH)\)\s+Library r\w*path: \[([^\]]*)\]" dynamic-section)]
+       (str tag " " path))
+     (for [[v n] (distinct (re-seq #"\bGLIBC_([A-Za-z0-9_.]+)" version-info))
+           :when (or musl? (not (re-matches #"[0-9.]+" n)) (not (version<= n max-glibc)))]
+       (str "needs " v))
+     (for [v (distinct (re-seq #"\b(?:GLIBCXX|CXXABI|GCC)_[0-9.]+" version-info))]
+       (str "needs " v)))))
+
+(defn check-linux-lib!
+  "Throw when readelf-errors finds an error in `lib` for the Linux resource
+  `dir`. Needs readelf on the PATH."
+  [dir lib]
+  (let [readelf #(:out (tasks/shell {:out :string} "readelf" % (str lib)))]
+    (when-let [errors (seq (readelf-errors dir (readelf "-h") (readelf "-d") (readelf "-V")))]
+      (throw (ex-info (str lib " does not fit " dir " (" (str/join ", " errors) "). "
+                           "Build it with zig-toolchain!.")
+                      {:lib (str lib) :dir dir :errors errors})))
+    (println "OK" (str lib) "fits" dir)))
+
+(defn- system-dll?
+  "True for a DLL of each Windows 10 and later: KERNEL32, SHELL32 and the
+  api-ms-win-crt sets of the UCRT. DLL names ignore case."
+  [dll]
+  (let [dll (str/lower-case dll)]
+    (boolean (or (#{"kernel32.dll" "shell32.dll"} dll)
+                 (re-matches #"api-ms-win-crt-[a-z0-9-]+\.dll" dll)))))
+
+(defn- readobj-errors
+  "The errors in the `llvm-readobj --file-headers --coff-imports` output of
+  a DLL for windows-amd64: not a DLL, another machine, or an import that is
+  not a system-dll?, such as a mingw runtime."
+  [readobj]
+  (let [want    "IMAGE_FILE_MACHINE_AMD64"
+        machine (second (re-find #"(?m)^\s*Machine: (\S+)" readobj))]
+    (concat
+     (when-not (re-find #"\bIMAGE_FILE_DLL\b" readobj) ["not a DLL"])
+     (when (not= want machine) [(str "Machine " machine ", not " want)])
+     (for [dll (distinct (map second (re-seq #"(?m)^\s*Name: (\S+)" readobj)))
+           :when (not (system-dll? dll))]
+       (str "imports " dll)))))
+
+(defn check-windows-lib!
+  "Throw when readobj-errors finds an error in the DLL `lib` for the
+  Windows resource `dir`. Needs llvm-readobj on the PATH."
+  [dir lib]
+  (let [readobj (:out (tasks/shell {:out :string} "llvm-readobj"
+                                   "--file-headers" "--coff-imports" (str lib)))]
+    (when-let [errors (seq (readobj-errors readobj))]
+      (throw (ex-info (str lib " does not fit " dir " (" (str/join ", " errors) "). "
+                           "Build it with zig-toolchain!.")
+                      {:lib (str lib) :dir dir :errors errors})))
+    (println "OK" (str lib) "fits" dir)))
+
+(defn- otool-errors
+  "The errors in the `otool -L` and `otool -l` output of the dylib with
+  install name `id`: a non-system library, or a run path, which names a dir
+  of the build machine."
+  [id deps-output load-commands]
+  (concat
+   (for [[_ dep] (re-seq #"(?m)^\s+(.+?) \(compatibility" deps-output)
+         :when (not (or (= dep id)
+                        (str/starts-with? dep "/usr/lib/")
+                        (str/starts-with? dep "/System/Library/")))]
+     (str "loads " dep))
+   (for [[_ path] (re-seq #"(?m)^\s+path (.+?) \(offset" load-commands)]
+     (str "LC_RPATH " path))))
+
+(defn- universal-binary?
+  "True when the file at `lib` starts with the magic of a universal Mach-O."
+  [lib]
+  (with-open [in (io/input-stream (fs/file lib))]
+    (let [b (byte-array 4)]
+      (and (= 4 (.read in b))
+           (contains? #{0xCAFEBABE 0xCAFEBABF}
+                      (reduce #(+ (* %1 256) (bit-and %2 0xff)) 0 b))))))
+
+(defn check-darwin-lib!
+  "Throw when the dylib `lib` is universal, or otool-errors finds an error
+  in it."
+  [lib]
+  (when (universal-binary? lib)
+    (throw (ex-info (str lib " is a universal binary. Each resource dir takes a thin dylib.")
+                    {:lib (str lib)})))
+  (let [otool #(:out (tasks/shell {:out :string} "otool" % (str lib)))
+        id    (last (str/split-lines (otool "-D")))]
+    (when-let [errors (seq (otool-errors id (otool "-L") (otool "-l")))]
+      (throw (ex-info (str lib " does not load the same on each Mac (" (str/join ", " errors) ").")
+                      {:lib (str lib) :errors errors})))
+    (println "OK" (str lib) "loads only system libraries and has no run path")))
+
 (defn- js-string-list
   "Render a seq of names as the bracketed, double-quoted list that the emcc
   -s flags expect, for example [\"ccall\",\"getValue\"]."
@@ -535,219 +739,6 @@
                          extra-flags))]
     (apply tasks/shell cmd)))
 
-(defn- extract-resource!
-  "Copy a classpath resource to dest, and create the parent directories.
-  Returns dest as a string. Returns nil when the resource is not on the
-  classpath. The behavior is the same for a clj-native source checkout and
-  for a jar."
-  [resource-path dest]
-  (when-let [resource (io/resource resource-path)]
-    (fs/create-dirs (fs/parent dest))
-    (with-open [in (io/input-stream resource)]
-      (io/copy in (fs/file (str dest))))
-    (str dest)))
-
-(defn- resolve-containerfile
-  "Return the path to a Containerfile. A local Containerfile in the current
-  working directory comes first, as a consumer override. Without one, this fn
-  extracts the shipped Containerfile from the clj-native classpath to a temp
-  file, and returns that path."
-  []
-  (let [cwd (System/getProperty "user.dir")
-        local (fs/path cwd "Containerfile")]
-    (if (fs/exists? local)
-      (str local)
-      (let [tmp (fs/create-temp-file {:prefix "clj-native-Containerfile-"})]
-        (or (extract-resource! "net/willcohen/native/Containerfile" tmp)
-            (throw (ex-info "Containerfile not found on classpath or in cwd"
-                            {:cwd cwd})))))))
-
-(defn- clj-native-root
-  "Find the clj-native repo root on the host. Returns nil when there is no
-  checkout.
-
-  Only a :local/root consumer gets a path. The classpath URL is then a plain
-  file:, and the repo root sits five parents above the Containerfile
-  resource. A published jar gives jar:file:, and this fn returns nil. Then
-  vendor-clj-native extracts the flake from the jar instead."
-  []
-  (when-let [resource (io/resource "net/willcohen/native/Containerfile")]
-    (let [url-str (str resource)]
-      (when (str/starts-with? url-str "file:")
-        ;; file:/.../clj-native/resources/net/willcohen/native/Containerfile
-        ;; -> clj-native
-        (let [p (-> resource .toURI fs/path)]
-          (-> p fs/parent fs/parent fs/parent fs/parent fs/parent str))))))
-
-(defn- vendor-from-checkout
-  "Copy a clj-native checkout into dest. This serves the two uses of the
-  vendor directory."
-  [src dest]
-  (doseq [entry ["flake.nix" "flake.lock" "deps.edn" "bb.edn"
-                 "src" "resources"]]
-    (let [from (fs/path src entry)
-          to (fs/path dest entry)]
-      (when (fs/exists? from)
-        (if (fs/directory? from)
-          (fs/copy-tree from to {:replace-existing true})
-          (fs/copy from to {:replace-existing true})))))
-  (str dest))
-
-(defn- vendor-from-jar
-  "Extract the flake only, from the jar into dest. Returns dest. Returns nil
-  when either file is missing, and then this fn removes dest. That prevents a
-  half-populated flake, which would fail in nix later."
-  [dest]
-  (let [extracted (doall (for [f ["flake.nix" "flake.lock"]]
-                           (extract-resource! (str "net/willcohen/native/" f)
-                                              (fs/path dest f))))]
-    (if (every? some? extracted)
-      (str dest)
-      (do (fs/delete-tree dest) nil))))
-
-(defn- vendor-clj-native
-  "Materialize clj-native at <cwd>/<vendor-name>/ for a container build.
-  Returns the absolute path. Returns nil when neither source is available.
-
-  Two things consume the vendor directory:
-    * --override-input clj-native path:./<vendor-name>, for the flake
-    * a /clj-native symlink -> /build/<vendor-name>, for the bb classpath.
-      This serves a consumer with :local/root \"../clj-native\" in its bb.edn.
-
-  A checkout serves the two. A published jar gives the flake only, and
-  --override-input needs nothing more. The flake outputs are pure nix, and
-  they never reference self or the source tree. Such a consumer resolves the
-  Clojure side from Maven, thus it has no use for the symlink. The vendor step
-  out of the jar keeps the flake at the same version as the code, and it needs
-  no network."
-  [vendor-name]
-  (let [dest (fs/path (System/getProperty "user.dir") vendor-name)]
-    (fs/delete-tree dest)
-    (fs/create-dirs dest)
-    (if-let [src (clj-native-root)]
-      (vendor-from-checkout src dest)
-      (vendor-from-jar dest))))
-
-(defn- platform-tag
-  "Convert a platform such as 'linux/amd64' to a filesystem-safe tag such as
-  'linux-amd64'."
-  [platform]
-  (str/replace platform "/" "-"))
-
-(defn- expand-path
-  "Replace $PLATFORM_TAG in a path string with the given tag."
-  [path tag]
-  (str/replace (str path) "$PLATFORM_TAG" tag))
-
-(defn cross-compile-in-container
-  "Cross-compile artifacts with podman or docker. This fn uses the clj-native
-  Containerfile, or the local Containerfile of the consumer when one is
-  present.
-
-  Config keys:
-    :platforms      A list of platform strings, for example
-                    [\"linux/amd64\" \"linux/aarch64\" \"windows/amd64\"].
-    :image-tag      The base image tag. This fn appends the platform tag to
-                    it.
-    :target         The Containerfile target stage. The default is
-                    \"native-build\".
-    :extract-paths  A list of container paths to copy out. Each one is a
-                    string path, or a map {:from <container-path>}. This fn
-                    expands $PLATFORM_TAG. Every path lands in
-                    artifacts-<platform-tag>/ on the host.
-                    Example: [\"/build/resources/$PLATFORM_TAG/.\"
-                              \"/build/resources/mylib.dat\"
-                              \"/build/resources/mylib.ini\"]
-    :build-args     A map of more --build-arg values.
-    :mounts         A list of {:host-path :container-path :read-only?} for
-                    the --volume mounts, such as a local source tree.
-    :on-artifacts   (fn [platform-tag artifacts-dir]). This fn calls it after
-                    the extraction. The consumer does its project-specific
-                    routing there, such as a DLL rename or a move of
-                    resources. This fn cleans up the artifacts-dir after
-                    :on-artifacts returns.
-
-  Returns nil. Throws when it finds neither podman nor docker."
-  [{:keys [platforms image-tag target extract-paths build-args mounts
-           on-artifacts vendor-clj-native? vendor-name]
-    :or {target "native-build"
-         build-args {}
-         mounts []
-         on-artifacts (fn [_ _] nil)
-         vendor-clj-native? true
-         vendor-name "clj-native-vendor"}}]
-  (let [container-cmd (or (fs/which "podman") (fs/which "docker"))
-        _ (when-not container-cmd
-            (throw (ex-info "Neither podman nor docker found on PATH" {})))
-        containerfile (resolve-containerfile)
-        current-arch (str/trim (:out (tasks/shell {:out :string} "uname" "-m")))
-        vendor-dir (when vendor-clj-native?
-                     (vendor-clj-native vendor-name))
-        extra-nix-flags (when vendor-dir
-                          (str "--override-input clj-native path:./" vendor-name))
-        effective-build-args (cond-> build-args
-                               extra-nix-flags
-                               (assoc "EXTRA_NIX_FLAGS" extra-nix-flags))]
-    (println "--> Using" (str container-cmd) "for cross-platform builds.")
-    (println "    Using Containerfile:" containerfile)
-    (when vendor-dir
-      (println "    Vendored clj-native into" vendor-dir))
-    (try
-      (doseq [platform platforms]
-        (let [tag (platform-tag platform)
-              image (str image-tag ":" tag)
-              artifacts-dir (str "artifacts-" tag)
-              is-cross-compile? (not (or (and (= platform "linux/amd64")
-                                              (contains? #{"x86_64" "amd64"} current-arch))
-                                         (and (= platform "linux/aarch64")
-                                              (contains? #{"aarch64" "arm64"} current-arch))))]
-          (println "--> Starting cross-platform build for" platform)
-          (when is-cross-compile?
-            (println "    (Cross-compiling from" current-arch "to" platform ")"))
-          (let [host-linux-platform (str "linux/" (case current-arch
-                                                    ("x86_64" "amd64") "amd64"
-                                                    ("aarch64" "arm64") "aarch64"
-                                                    "amd64"))
-                container-platform (if (or (str/starts-with? platform "windows/")
-                                           is-cross-compile?)
-                                     host-linux-platform
-                                     platform)
-                base-cmd [(str container-cmd) "build"
-                          "-f" containerfile
-                          "--platform" container-platform
-                          "--target" target
-                          "-t" image
-                          "--build-arg" (str "TARGET_PLATFORM=" platform)]
-                user-args (mapcat (fn [[k v]] ["--build-arg" (str k "=" v)])
-                                  effective-build-args)
-                mount-args (mapcat (fn [{:keys [host-path container-path read-only?]}]
-                                     ["--volume"
-                                      (str host-path ":" container-path
-                                           (when read-only? ":ro"))])
-                                   mounts)
-                final-args (concat base-cmd user-args mount-args ["."])]
-            (apply tasks/shell final-args))
-          (println "Extracting artifacts from container...")
-          (fs/delete-tree artifacts-dir)
-          (fs/create-dirs artifacts-dir)
-          (let [container-id (str/trim (:out (tasks/shell {:out :string}
-                                                          container-cmd "create" image)))]
-            (try
-              (doseq [path-or-map extract-paths]
-                (let [from (expand-path (if (map? path-or-map) (:from path-or-map) path-or-map)
-                                        tag)]
-                  (tasks/shell {:continue true} container-cmd "cp"
-                               (str container-id ":" from)
-                               artifacts-dir)))
-              (on-artifacts tag (fs/file artifacts-dir))
-              (finally
-                (tasks/shell container-cmd "rm" container-id)
-                (fs/delete-tree artifacts-dir))))
-          (println "--> Completed build for" platform)))
-      (finally
-        (when vendor-dir
-          (fs/delete-tree vendor-dir))))))
-
 (defn- leading-comment-block
   "Return the unbroken run of `;;` lines at the top of `source`, rendered as
   `//` lines. Returns nil when the file opens with anything else.
@@ -804,6 +795,14 @@
                        {:exit (:exit result) :err (:err result)})))
      (carry-header! (fs/path dir file) (fs/path dir out))
      (println out "ready at" (str dir "/" out)))))
+
+(defn- clj-native-root
+  "The clj-native checkout root, or nil when clj-native loads from a jar."
+  []
+  (let [resource (io/resource "net/willcohen/native/build.clj")]
+    (when (= "file" (some-> resource .getProtocol))
+      ;; <root>/src/bb/net/willcohen/native/build.clj
+      (str (nth (iterate fs/parent (fs/path (.toURI resource))) 6)))))
 
 (defn stage-test-deps!
   "Copy the shipped clj-native helper .mjs files into the test dist

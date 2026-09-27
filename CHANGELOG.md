@@ -6,11 +6,18 @@
 
 - `:int64` returns, `:string?` args, and `with-library-context` for two
   libraries in one GraalVM process.
+- `zig-toolchain!` builds Linux (glibc 2.28, musl) and Windows libs from any
+  host. `check-linux-lib!`, `check-windows-lib!` and `check-darwin-lib!`
+  check a lib before it ships.
 - `build-once!`, and `:sha256` for `download-archive`.
 
 ### Changed
 
 - GraalVM reads a NULL string as nil.
+
+### Removed
+
+- The cross shells and `cross-compile-in-container`. zig builds each lib.
 
 ### Fixed
 

@@ -143,10 +143,51 @@
 (defn- extract-fixture-library!
   "Run extract-and-bind-library! with host detection pinned to the platform the
    committed fixtures use."
-  [opts]
-  (with-redefs [platform/get-os   (constantly :linux)
-                platform/get-arch (constantly :amd64)]
-    (platform/extract-and-bind-library! opts)))
+  ([opts] (extract-fixture-library! opts false))
+  ([opts musl?]
+   (let [dirs (#'platform/library-dirs :linux :amd64 musl?)]
+     (with-redefs [platform/get-os       (constantly :linux)
+                   platform/get-arch     (constantly :amd64)
+                   platform/library-dirs (constantly dirs)]
+       (platform/extract-and-bind-library! opts)))))
+
+(deftest musl-maps-names-the-musl-loader
+  (is (#'platform/musl-maps?
+       "7f3a1c000000-7f3a1c05e000 r-xp 00000000 fd:01 1234 /lib/ld-musl-x86_64.so.1\n"))
+  (is (not (#'platform/musl-maps?
+            "7f3a1c000000-7f3a1c05e000 r-xp 00000000 fd:01 1234 /usr/lib/x86_64-linux-gnu/libc.so.6\n"))))
+
+(deftest library-dirs-of-this-process
+  (testing "a musl process tries the -musl dir first"
+    (with-redefs [platform/get-os   (constantly :linux)
+                  platform/get-arch (constantly :amd64)]
+      (with-redefs-fn {#'platform/musl-process? (delay true)}
+        #(is (= ["linux-amd64-musl" "linux-amd64"] (#'platform/library-dirs))))))
+  (testing "off Linux, the maps file is never read"
+    (with-redefs [platform/get-os   (constantly :darwin)
+                  platform/get-arch (constantly :aarch64)]
+      (with-redefs-fn {#'platform/musl-process? (delay (throw (ex-info "read" {})))}
+        #(is (= ["darwin-aarch64"] (#'platform/library-dirs)))))))
+
+(deftest process-maps-reads-on-linux
+  ;; The unit test above cannot see a failed read: the delay turns one into
+  ;; "not musl".
+  (if (= :linux (platform/get-os))
+    (is (re-find #"(?m)^[0-9a-f]+-[0-9a-f]+ " (#'platform/process-maps)))
+    (println "SKIP process-maps-reads-on-linux: not on Linux")))
+
+(deftest extract-and-bind-library-takes-the-musl-dir-on-musl
+  (testing "the -musl dir wins on musl"
+    (is (= "fake musl shared object payload\n"
+           (slurp (:file (extract-fixture-library! {:lib-basename "libextracttest"
+                                                    :fn-defs-var  #'platform/default-library-suffixes}
+                                                   true))))))
+  (testing "a lib with no -musl copy falls back to <os>-<arch>"
+    (is (= "fake custom-suffix payload\n"
+           (slurp (:file (extract-fixture-library! {:lib-basename "libextracttest"
+                                                    :suffixes     {:linux ".custom"}
+                                                    :fn-defs-var  #'platform/default-library-suffixes}
+                                                   true)))))))
 
 (deftest extract-and-bind-library-copies-the-platform-library
   (let [{:keys [file path libname singleton] :as state}

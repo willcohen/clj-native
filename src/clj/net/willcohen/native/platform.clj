@@ -57,6 +57,30 @@
       "aarch64" :aarch64
       (keyword (string/replace arch #"[_-]" "")))))
 
+(defn- musl-maps?
+  "True when `maps`, the text of /proc/<pid>/maps, maps the musl loader."
+  [maps]
+  (boolean (re-find #"/ld-musl-[^/\s]+\.so" maps)))
+
+(defn- process-maps
+  "The text of /proc/self/maps. slurp fails on some kernels, where
+   available() on a proc file gives EINVAL."
+  ^String []
+  (String. (Files/readAllBytes (.toPath (File. "/proc/self/maps")))))
+
+(def ^:private musl-process?
+  ;; A file test is not enough: a glibc distribution can install musl too.
+  (delay (try (musl-maps? (process-maps))
+              (catch Exception _ false))))
+
+(defn- library-dirs
+  "The resource dirs to try for a packaged library: <os>-<arch>, after
+   <os>-<arch>-musl on musl Linux."
+  ([] (library-dirs (get-os) (get-arch) (and (= :linux (get-os)) @musl-process?)))
+  ([os arch musl?]
+   (let [dir (str (name os) "-" (name arch))]
+     (if musl? [(str dir "-musl") dir] [dir]))))
+
 (defn init-ffi!
   "Select the dt-ffi backend. The default is :jdk, which is Panama and
    java.lang.foreign. It is the only backend at this time, because JNA is
@@ -262,13 +286,12 @@
             (into-array java.nio.file.attribute.FileAttribute []))))
 
 (defn- extract-library-file!
-  "Copy the packaged library for the current platform into `dir`. Returns the
-   destination File. The resource path convention is
-   `<os>-<arch>/<lib-basename><suffix>`."
+  "Copy the packaged library, from the first of library-dirs that has it,
+   into `dir`. Returns the destination File."
   ^File [^File dir lib-basename suffixes]
-  (let [os        (get-os)
-        file-name (str lib-basename (get (merge default-library-suffixes suffixes) os))
-        resource  (str (name os) "-" (name (get-arch)) "/" file-name)
+  (let [file-name (str lib-basename (get (merge default-library-suffixes suffixes) (get-os)))
+        resources (map #(str % "/" file-name) (library-dirs))
+        resource  (or (first (filter io/resource resources)) (first resources))
         dest      (File. dir file-name)]
     (doto dest .deleteOnExit)
     (copy-resource! resource dest)
@@ -310,7 +333,8 @@
    Options:
      :lib-basename     The library file name without the extension, such as
                        \"libproj\". The resource path is
-                       `<os>-<arch>/<lib-basename><suffix>`.
+                       `<os>-<arch>/<lib-basename><suffix>`. A process on
+                       musl Linux takes `<os>-<arch>-musl/` first.
      :fn-defs-var      The Var that holds the fndefs map, in the form that
                        rehydrate-fn-defs returns. The dt-ffi library singleton
                        reads the Var late. Thus this key takes a Var, and a

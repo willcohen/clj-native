@@ -56,12 +56,5 @@
   (b/copy-dir {:src-dirs ["src/clj" "src/cljc" "src/bb" "resources"]
                :target-dir class-dir
                :ignores jar-ignores})
-  ;; The flake rides along as a resource so a consumer of the published jar can
-  ;; vendor a flake input pinned to this exact version into a container build.
-  ;; It cannot live under resources/ instead: nix requires a flake at the root
-  ;; of its tree, and this repo's own flake is that root.
-  (doseq [f ["flake.nix" "flake.lock"]]
-    (b/copy-file {:src f
-                  :target (format "%s/net/willcohen/native/%s" class-dir f)}))
   (b/jar {:class-dir class-dir
           :jar-file jar-file}))

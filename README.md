@@ -44,11 +44,10 @@ docstring of `graal-wasm` gives the procedure.
 
 ### The build layer sits below all three
 
-`net.willcohen.native.build`, `gen-handler`, `flake.nix` and the Containerfile
-are not a fourth backend. They produce what the three backends consume:
+`net.willcohen.native.build`, `gen-handler` and `flake.nix` are not a fourth
+backend. They produce what the three backends consume:
 
-- the native shared library that the FFI backend binds, through the four
-  cross-compile shells
+- the native shared library that the FFI backend binds, which zig builds
 - the emscripten `.wasm` and its loader, which both WASM backends load. The
   namespace docstring of `graal-wasm` lists the exact module members that the
   emcc link must export
@@ -209,17 +208,36 @@ inputs.clj-native.url = "github:willcohen/clj-native";
 ```
 
 The flake exposes `lib.<system>.mkCrossShells`, which builds a parameterized
-dev shell. On a Linux host it also builds four cross-compile shells:
-`linuxAmd64Cross`, `linuxAarch64Cross`, `windowsAmd64Cross` and
-`windowsArm64Cross`. It also exposes `baseBuildInputs`,
-`crossPkgs`, `buildPkgs` and `actualSystem`. `devShells.default` is the shell
-for clj-native itself: the Clojure toolchain, and Node for the CLJS test lane.
+dev shell. It also exposes `actualSystem`.
+`devShells.default` is the shell for clj-native itself: the Clojure
+toolchain, and Node for the CLJS test lane.
 
-`flake.nix` and `flake.lock` are also in the jar, under
-`net/willcohen/native/`. `cross-compile-in-container` extracts the two files.
-A container build can then vendor a flake input that is pinned to the same
-version as the code, with no network and no checkout. The flake outputs are
-pure nix and never refer to `self`, so the two files stand alone.
+The dev shells have zig, which builds the Linux and Windows libs from any
+host. `net.willcohen.native.build/zig-toolchain!` writes the compiler wrappers
+for one of five resource dirs:
+
+| Dir | zig target | Loads on |
+|---|---|---|
+| `linux-amd64`, `linux-aarch64` | `<arch>-linux-gnu.2.28` | glibc 2.28 and later |
+| `linux-amd64-musl`, `linux-aarch64-musl` | `<arch>-linux-musl` | musl |
+| `windows-amd64` | `x86_64-windows-gnu` | Windows 10 and later |
+
+zig links libc++, libc++abi, libunwind and compiler-rt into the lib, under
+Apache-2.0 WITH LLVM-exception. It links libc dynamically, thus the lib
+holds no glibc, libstdc++ or libgcc code. After the build, call
+`net.willcohen.native.build/check-linux-lib!` on the lib. It throws when the
+lib needs a library or a glibc version that its dir does not allow.
+`check-windows-lib!` throws when a DLL imports a DLL other than KERNEL32,
+SHELL32 and the UCRT (`api-ms-win-crt-*`), which each Windows 10 has.
+On macOS, `check-darwin-lib!` throws when a dylib loads a library outside the
+system, or has a run path, which names a dir of the build machine.
+
+With the env and the CMake args of `zig-toolchain!`, a build finds no
+library, header or pkg-config file on the build machine. Give each
+dependency to CMake by its path, for example `-DZLIB_LIBRARY`.
+
+On Linux, `extract-and-bind-library!` looks in `<os>-<arch>-musl/` first when
+the process runs on musl, and then in `<os>-<arch>/`.
 
 ## License
 

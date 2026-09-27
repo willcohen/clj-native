@@ -47,10 +47,10 @@
   },
   "dependencies": {
     "resource-tracker": "^0.0.1",
-    "worker-router": "npm:@wcohen/worker-router@^0.0.1"
+    "worker-router": "npm:@wcohen/worker-router@^0.0.2"
   },
   "peerDependencies": {
-    "squint-cljs": "^0.14.206"
+    "squint-cljs": "^0.14.210"
   },
   "peerDependenciesMeta": {
     "squint-cljs": {
@@ -59,9 +59,12 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "eslint": "^10.8.0",
-    "globals": "^17.8.0",
-    "squint-cljs": "^0.14.206"
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0",
+    "squint-cljs": "^0.14.210"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "license": "Apache-2.0 WITH LLVM-exception",
   "author": "Will Cohen",

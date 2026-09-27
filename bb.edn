@@ -1,5 +1,5 @@
 {:paths ["src/bb" "src/clj" "src/cljc" "resources"]
- :deps {org.babashka/http-client {:mvn/version "0.4.22"}}
+ :deps {org.babashka/http-client {:mvn/version "0.4.25"}}
  :tasks
  {:requires ([babashka.fs :as fs]
              [clojure.string :as str]

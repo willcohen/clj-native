@@ -301,7 +301,7 @@
 ;; live here, not in resource-tracker, to keep that close to tech.resource.
 
 #?(:cljs
-   (defonce ^:private pending-disposes (atom #js [])))
+   (defonce ^:private pending-disposes (js/Set.)))
 
 #?(:cljs
    (defonce ^:private pending-disposes-by-parent (atom {})))
@@ -360,7 +360,10 @@
      ([result] (capture-pending-dispose! result nil))
      ([result parent-ctx-id]
       (when (instance? js/Promise result)
-        (.push @pending-disposes result)
+        (.add pending-disposes result)
+        ;; A fulfilled dispose leaves at once, since a page may flush only at
+        ;; shutdown. A rejected one stays, so the flush reports it.
+        (.then result (fn [_] (.delete pending-disposes result)) (fn [_] nil))
         (when (some? parent-ctx-id)
           (let [bucket (or (get @pending-disposes-by-parent parent-ctx-id)
                            (let [b #js []]
@@ -389,13 +392,13 @@
 
 #?(:cljs
    (defn flush-pending-disposes!
-     "Promise.allSettled over the disposer Promises captured since the last
-      flush. Clears the list first, so a concurrent dispose goes to the next
-      flush. Await it before you terminate the workers, or an async destroy
-      can fail to reach them."
+     "Promise.allSettled over the captured disposer Promises that are
+      pending, or that rejected since the last flush. Clears the list first,
+      so a concurrent dispose goes to the next flush. Await it before you
+      terminate the workers, or an async destroy can fail to reach them."
      []
-     (let [pending @pending-disposes]
-       (reset! pending-disposes #js [])
+     (let [pending (.from js/Array pending-disposes)]
+       (.clear pending-disposes)
        (.allSettled js/Promise pending))))
 
 #?(:cljs

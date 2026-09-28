@@ -23,7 +23,9 @@
                      evicted_QMARK_
                      ref_handle_BANG_
                      unref_handle_BANG_
-                     get_pool_stats]]
+                     get_pool_stats
+                     fire_and_capture_dispose_BANG_
+                     flush_pending_disposes_BANG_]]
             ["ffi-wasm/test-runner" :as tr]))
 
 (defn ^:async gc-until
@@ -220,5 +222,16 @@
     (register_handle_BANG_ lib "x" 0 (fn [] nil) #js {})
     (is (false? (evicted_QMARK_ lib "x")) "fresh registration clears the tombstone")
     (reset_library_context_BANG_ lib)))
+
+(deftest ^:async a-flush-holds-only-pending-and-failed-disposes
+  ;; A page flushes only at shutdown, so a fulfilled dispose must leave the list.
+  (await (flush_pending_disposes_BANG_))
+  (dotimes [_ 3]
+    (fire_and_capture_dispose_BANG_ (fn [] (js/Promise.resolve nil)) nil))
+  (fire_and_capture_dispose_BANG_ (fn [] (js/Promise.reject (js/Error. "destroy failed"))) nil)
+  (await (js/Promise. (fn [resolve _reject] (js/setImmediate resolve))))
+  (let [settled (await (flush_pending_disposes_BANG_))]
+    (is (= 1 (.-length settled)))
+    (is (= "rejected" (.-status (aget settled 0))))))
 
 (tr/run-tests-and-exit! "net.willcohen.native.pool-test")

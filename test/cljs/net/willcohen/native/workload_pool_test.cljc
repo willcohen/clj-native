@@ -309,4 +309,98 @@
     (is (wp/live-pool? wiring fake) "the same pool object is live again")
     (await (wp/shutdown-wiring! wiring))))
 
+(defn ^:async ping-error
+  "The rejection of a ping on `p`, or nil when it answers."
+  [p]
+  (await (-> (pool/worker-call p :lib-a "ping" [] 0)
+             (.then (fn [_] nil))
+             (.catch (fn [e] e)))))
+
+(deftest ^:async shutdown-pool!-during-a-spawn-stops-the-spawned-pool
+  (let [reg (wp/init-workload-pool! {:size 1})]
+    (wp/register-handler! reg :compute :lib-a {:module handler-url :args {:tag "a"}})
+    (let [pending (wp/ensure-pool! reg)]
+      (await (wp/shutdown-pool! reg))
+      (let [p (await pending)]
+        (is (nil? (wp/current-pool reg)))
+        (is (some? (await (ping-error p))) "the spawned pool is terminated")))))
+
+(deftest ^:async shutdown-wiring!-during-a-pass-stops-the-wired-pool
+  (let [w       (wp/make-wiring!)
+        pending (wp/ensure-wired! w {:registry-opts {:size 1}
+                                     :register! (fn [r]
+                                                  (wp/register-handler! r :compute :lib-a
+                                                                        {:module handler-url
+                                                                         :args {:tag "w"}}))})
+        reg     (await (wp/shutdown-wiring! w))
+        p       (await pending)]
+    (is (some? reg) "the shutdown saw the pass")
+    (is (nil? (wp/wiring-pool w)))
+    (is (some? (await (ping-error p))) "the wired pool is terminated")))
+
+(deftest ^:async ensure-pool!-after-a-shutdown-starts-keeps-its-pool
+  (let [reg (wp/init-workload-pool! {:size 1})]
+    (wp/register-handler! reg :compute :lib-a {:module handler-url :args {:tag "a"}})
+    (let [stopping (wp/shutdown-pool! reg)
+          starting (wp/ensure-pool! reg)]
+      (await stopping)
+      (let [p (await starting)]
+        (is (identical? p (await (wp/ensure-pool! reg)))
+            "the shutdown left the pool that started after it, so no second pool spawns")
+        (await (wp/shutdown-pool! reg))))))
+
+(deftest ^:async shutdown-wiring!-leaves-a-pass-that-started-after-it
+  (let [w        (wp/make-wiring!)
+        fake     (resolved-fake-pool (atom []))
+        stopping (wp/shutdown-wiring! w)
+        starting (wp/ensure-wired! w {:pool fake})]
+    (is (nil? (await stopping)) "no pass was running when the shutdown began")
+    (is (identical? fake (await starting)))
+    (is (wp/live-pool? w fake) "the later pass stays wired")
+    (await (wp/shutdown-wiring! w))))
+
+(deftest ^:async ensure-pool!-during-a-shutdown-of-a-live-pool-gets-a-live-pool
+  (let [reg (wp/init-workload-pool! {:size 1})]
+    (wp/register-handler! reg :compute :lib-a {:module handler-url :args {:tag "a"}})
+    (let [p1       (await (wp/ensure-pool! reg))
+          stopping (wp/shutdown-pool! reg)
+          starting (wp/ensure-pool! reg)]
+      (await stopping)
+      (let [p2 (await starting)]
+        (is (not (identical? p1 p2)))
+        (is (nil? (await (ping-error p2))))
+        (await (wp/shutdown-pool! reg))))))
+
+(deftest ^:async ensure-wired!-during-a-shutdown-of-a-live-wiring-gets-a-live-pool
+  (let [w  (wp/make-wiring!)
+        p2 (resolved-fake-pool (atom []))]
+    (await (wp/ensure-wired! w {:pool (resolved-fake-pool (atom []))}))
+    (let [stopping (wp/shutdown-wiring! w)
+          starting (wp/ensure-wired! w {:pool p2})]
+      (await stopping)
+      (is (identical? p2 (await starting)))
+      (is (wp/live-pool? w p2))
+      (await (wp/shutdown-wiring! w)))))
+
+(defn- next-turn []
+  (js/Promise. (fn [resolve _reject] (js/setImmediate resolve))))
+
+(deftest ^:async a-second-shutdown-wiring!-keeps-a-later-pass
+  (let [w         (wp/make-wiring!)
+        hook-done (js/Promise.withResolvers)
+        p2        (resolved-fake-pool (atom []))]
+    (await (wp/ensure-wired! w {:pool (resolved-fake-pool (atom []))
+                                :register! (fn [r]
+                                             (wp/register-handler! r :compute :hook
+                                                                   {:pre-terminate (fn [] (.-promise hook-done))}))}))
+    (let [first-stop (wp/shutdown-wiring! w)
+          restarted  (.then (wp/shutdown-wiring! w)
+                            (fn [_] (wp/ensure-wired! w {:pool p2})))]
+      ;; A second shutdown that does not wait for the first ends in this turn.
+      (await (next-turn))
+      ((.-resolve hook-done))
+      (await first-stop)
+      (await restarted)
+      (is (wp/live-pool? w p2)))))
+
 (tr/run-tests-and-exit! "net.willcohen.native.workload-pool-test")

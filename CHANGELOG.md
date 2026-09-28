@@ -25,6 +25,8 @@
 - GraalVM starts from a jar and reads `/dev/urandom`.
 - `extract-archive` leaves no partial dir when tar fails. It reads tar only.
 - A host with no packaged native lib falls back to GraalVM.
+- A handler init that throws fails its task. A shutdown and a start wait for
+  each other.
 - A crashed Node worker exits 1.
 
 ## [0.0.1] - 2026-07-30

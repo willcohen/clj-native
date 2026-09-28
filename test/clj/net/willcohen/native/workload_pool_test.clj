@@ -170,3 +170,55 @@
         (is (= 2 (count @destroy-calls)) "destroy fired on both threads")
         (is (every? (fn [s] (= :init-state (:tag s))) @destroy-calls)
             "destroy received the init state")))))
+
+(deftest a-handler-init-error-fails-its-task-and-not-the-pool
+  (let [calls    (atom 0)
+        registry (wp/init-workload-pool! {:size 1})]
+    (wp/register-handler! registry :compute :probe
+                          {:init (fn [_]
+                                   (if (= 1 (swap! calls inc))
+                                     (throw (ex-info "init failed" {}))
+                                     {:ok true}))})
+    (let [^ExecutorService exec (wp/as-executor-service registry :compute)
+          task ^Callable #(wp/current-context :probe)]
+      (try
+        (let [cause (try (.get (.submit exec task) 5 TimeUnit/SECONDS)
+                         (catch java.util.concurrent.ExecutionException e (.getCause e)))]
+          (is (= "init failed" (ex-message cause))))
+        (is (= {:ok true} (.get (.submit exec task) 5 TimeUnit/SECONDS))
+            "the next task on the same thread tries the init again")
+        (finally (wp/shutdown-pool! registry))))))
+
+(deftest a-futuretask-passed-to-execute-runs-the-handler-init
+  ;; core.async.flow futurize wraps each step in its own FutureTask and calls .execute.
+  (let [registry (wp/init-workload-pool! {:size 1})]
+    (wp/register-handler! registry :compute :probe {:init (fn [_] :state)})
+    (let [^ExecutorService exec (wp/as-executor-service registry :compute)
+          task (java.util.concurrent.FutureTask. ^Callable #(wp/current-context :probe))]
+      (try
+        (.execute exec task)
+        (is (= :state (.get task 5 TimeUnit/SECONDS)))
+        (finally (wp/shutdown-pool! registry))))))
+
+(deftest shutdown-starts-no-thread-and-waits-for-each-destroy
+  (let [log      (atom [])
+        registry (wp/init-workload-pool! {:size 4})]
+    (wp/register-handler! registry :compute :probe
+                          {:init    (fn [_] (swap! log conj :init) :state)
+                           :destroy (fn [_] (Thread/sleep 200) (swap! log conj :destroy))})
+    (let [^ExecutorService exec (wp/as-executor-service registry :compute)]
+      (.get (.submit exec ^Callable #(wp/current-context :probe)) 5 TimeUnit/SECONDS)
+      (wp/shutdown-pool! registry)
+      (is (= [:init :destroy] @log)))))
+
+(deftest a-second-registration-of-a-lib-key-replaces-the-first
+  (let [log      (atom [])
+        registry (wp/init-workload-pool! {:size 1})
+        spec     (fn [tag] {:init    (fn [_] (swap! log conj [:init tag]) tag)
+                            :destroy (fn [s] (swap! log conj [:destroy tag s]))})]
+    (wp/register-handler! registry :compute :lib (spec :first))
+    (wp/register-handler! registry :compute :lib (spec :second))
+    (let [^ExecutorService exec (wp/as-executor-service registry :compute)]
+      (.get (.submit exec ^Callable #(wp/current-context :lib)) 5 TimeUnit/SECONDS)
+      (wp/shutdown-pool! registry)
+      (is (= [[:init :second] [:destroy :second :second]] @log)))))

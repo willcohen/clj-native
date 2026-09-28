@@ -19,6 +19,7 @@
 ### Removed
 
 - The cross shells and `cross-compile-in-container`. zig builds each lib.
+- The `decorate` option of `createSyncFetch` in a browser.
 
 ### Fixed
 
@@ -27,6 +28,8 @@
 - A host with no packaged native lib falls back to GraalVM.
 - A handler init that throws fails its task. A shutdown and a start wait for
   each other.
+- HTTP bridge: a late response no longer loses the next request, and a
+  crashed fetch worker keeps the count of its users.
 - A crashed Node worker exits 1.
 
 ## [0.0.1] - 2026-07-30

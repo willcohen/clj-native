@@ -32,6 +32,13 @@ const server = http.createServer((req, res) => {
       res.end();
       return;
     }
+    if (req.url.startsWith('/empty')) {
+      const pad = Number(new URL(req.url, 'http://x').searchParams.get('pad')) || 0;
+      res.setHeader('x-pad', 'p'.repeat(pad));
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
     if (req.url.startsWith('/large')) {
       const n = Number(new URL(req.url, 'http://x').searchParams.get('bytes')) || 0;
       res.setHeader('content-type', 'application/octet-stream');
@@ -39,18 +46,19 @@ const server = http.createServer((req, res) => {
       res.end(Buffer.alloc(n, 0x78));  // 0x78 = 'x'
       return;
     }
-    // N 10-byte chunks M ms apart: each gap stays under requestTimeoutMs while
-    // the total goes over it.
+    // `chunks` chunks of `size` bytes, `delay` ms apart: each gap stays under
+    // requestTimeoutMs while the total goes over it.
     if (req.url.startsWith('/slow')) {
       const u = new URL(req.url, 'http://x');
       const chunks = Number(u.searchParams.get('chunks')) || 3;
+      const size = Number(u.searchParams.get('size')) || 10;
       const delay = Number(u.searchParams.get('delay')) || 50;
       res.setHeader('content-type', 'application/octet-stream');
       res.statusCode = 200;
       let i = 0;
       const tick = () => {
         if (i >= chunks) { res.end(); return; }
-        res.write(Buffer.alloc(10, 0x79));  // 0x79 = 'y'
+        res.write(Buffer.alloc(size, 0x79));  // 0x79 = 'y'
         i += 1;
         setTimeout(tick, delay);
       };

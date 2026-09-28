@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // HTTP transport for a wasm library whose C runtime issues blocking XHR, such
-// as emscripten FETCH. There is one bridge per thread.
+// as emscripten FETCH.
 //
 // createSyncFetch(opts) resolves to syncFetch(url, reqOpts), which returns
 // {status, headers, bodyBytes}. On Node, syncFetch blocks on Atomics while a
@@ -15,41 +15,44 @@
 // Contracts:
 //   - On Node, createSyncFetch rejects if the worker cannot become ready, for
 //     example when the decorator import fails. A later call reuses the
-//     running worker and ignores its own decorateUrl, dataBufferSize and
+//     running worker and ignores its own workerUrl, dataBufferSize and
 //     requestTimeoutMs.
+//     It rejects when its decorateUrl differs, since one worker applies one
+//     decorator.
 //   - A response larger than dataBufferSize gives {status: 0, overflow: true}.
 //   - A worker that stops answering gives status 0 after requestTimeoutMs plus
-//     slack.
+//     slack. A worker that ended gives status 0 at once, after this thread
+//     handles its exit event.
 //   - A response that the caller gave up on never answers the next request.
 //
-// The auth decorator runs in the worker on Node and inline in a browser, never
-// in the blocked caller. installXhrPolyfill sends the synchronous path of a
-// global XHR through syncFetch.
+// The auth decorator runs in the fetch worker, never in the blocked caller.
+// installXhrPolyfill sends the synchronous path of a global XHR through
+// syncFetch.
 
 import { isNode } from './handler_env.mjs';
 
-const CONTROL_BUFFER_SIZE = 12;
-const META_BUFFER_SIZE = 20;
+const CONTROL_BUFFER_SIZE = 8;
+const META_BUFFER_SIZE = 16;
 const DEFAULT_DATA_BUFFER_SIZE = 50 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
 // The caller waits past the worker's idle timeout, so a stall comes back as
-// the worker's status 0. A slow transfer can still outlast this fixed cap, and
-// the request generation keeps its late response off the next request.
+// the worker's status 0.
 const WAIT_SLACK_MS = 5000;
 const WORKER_READY_TIMEOUT_MS = 10000;
 // metaBuffer[3] bit 0: the response did not fit dataBuffer.
 const OVERFLOW_FLAG = 1;
-// Never returns 0, so a generation cannot match a zeroed metaBuffer.
+// Skips 0, which marks no pending request.
 function nextGeneration(state) {
   const next = (state.generation + 1) | 0;
   state.generation = next === 0 ? 1 : next;
   return state.generation;
 }
 
-// One fetch worker per thread, shared and reference-counted, because a joint
-// pool loads the handlers of several libraries into one worker thread. Each
-// createSyncFetch on Node takes a reference, and shutdown() releases one.
+// One fetch worker per thread, shared and reference-counted, because one pool
+// worker can load the handlers of several libraries. Each createSyncFetch on
+// Node takes a reference, and shutdown() releases one.
 let workerState = null;
+let workerStart = null;
 let refCount = 0;
 
 function parseHeaders(str) {
@@ -64,8 +67,21 @@ function parseHeaders(str) {
   return headers;
 }
 
-async function ensureWorker(workerUrl, decorateUrl, opts) {
-  if (workerState) return workerState;
+async function ensureWorker(opts) {
+  const decorateUrl = opts.decorateUrl ? String(opts.decorateUrl) : null;
+  let state = workerState;
+  if (!state) {
+    workerStart ??= startWorker(opts.workerUrl, decorateUrl, opts)
+      .finally(() => { workerStart = null; });
+    state = await workerStart;
+  }
+  if (state.decorateUrl !== decorateUrl) {
+    throw new Error(`createSyncFetch: the fetch worker of this thread has decorateUrl ${state.decorateUrl}, not ${decorateUrl}`);
+  }
+  return state;
+}
+
+async function startWorker(workerUrl, decorateUrl, opts) {
   if (!workerUrl) throw new Error('createSyncFetch: workerUrl is required on Node');
   const { Worker } = await import('worker_threads');
 
@@ -83,25 +99,34 @@ async function ensureWorker(workerUrl, decorateUrl, opts) {
     controlBuffer: controlSAB,
     metaBuffer: metaSAB,
     dataBuffer: dataSAB,
-    decorateUrl: decorateUrl ? String(decorateUrl) : null,
+    decorateUrl,
     requestTimeoutMs,
   });
 
-  workerState = {
+  const state = {
     worker,
+    decorateUrl,
     control: new Int32Array(controlSAB),
     meta: new Int32Array(metaSAB),
     data: new Uint8Array(dataSAB),
     view: new DataView(dataSAB),
     waitTimeoutMs: requestTimeoutMs + WAIT_SLACK_MS,
     generation: 0,
+    dead: false,
   };
-  return workerState;
+  // Without an error listener, an error in the worker, such as a decorator
+  // rejection, throws in this thread.
+  worker.on('error', (err) => console.error(`http-bridge: fetch worker error: ${err.message}`));
+  // refCount stays, since each consumer of the dead worker still releases once.
+  worker.on('exit', () => {
+    state.dead = true;
+    if (workerState === state) workerState = null;
+  });
+  workerState = state;
+  return state;
 }
 
-// Resolves when the worker reports ready. Rejects on an init error, a worker
-// 'error', a nonzero exit, or a timeout. A rejection terminates the worker and
-// leaves workerState null, and a later createSyncFetch starts clean.
+// A rejection terminates the worker, so a later createSyncFetch starts clean.
 function waitForWorkerReady(worker, initMsg) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -118,11 +143,8 @@ function waitForWorkerReady(worker, initMsg) {
     };
     const onError = (err) =>
       finishReject(new Error(`createSyncFetch: fetch worker error during init: ${err.message}`));
-    const onExit = (code) => {
-      if (code !== 0) {
-        finishReject(new Error(`createSyncFetch: fetch worker exited (code ${code}) during init`));
-      }
-    };
+    const onExit = (code) =>
+      finishReject(new Error(`createSyncFetch: fetch worker exited (code ${code}) during init`));
     function cleanup() {
       clearTimeout(timer);
       worker.off('message', onMessage);
@@ -149,41 +171,54 @@ function waitForWorkerReady(worker, initMsg) {
   });
 }
 
-function nodeSyncFetch(state, url, reqOpts) {
-  const { control, meta, data, view, waitTimeoutMs } = state;
-  const request = {
+function toRequest(url, reqOpts) {
+  return {
     url,
     method: reqOpts.method || 'GET',
     headers: reqOpts.headers || {},
     body: reqOpts.body ?? null,
   };
+}
+
+const failedResponse = () => ({ status: 0, headers: {}, bodyBytes: new Uint8Array(0) });
+
+// True if the worker answers `generation` before the deadline.
+function responseArrived(control, generation, deadline) {
+  for (;;) {
+    const answered = Atomics.load(control, 1);
+    if (answered === generation) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    Atomics.wait(control, 1, answered, remaining);
+  }
+}
+
+function nodeSyncFetch(state, url, reqOpts) {
+  if (state.dead) return failedResponse();
+  const { control, meta, data, view, waitTimeoutMs } = state;
+  const request = toRequest(url, reqOpts);
+  if (request.body != null && typeof request.body !== 'string') {
+    throw new TypeError('http-bridge: on Node, a request body must be a string');
+  }
   const jsonBytes = new TextEncoder().encode(JSON.stringify(request));
   view.setInt32(0, jsonBytes.length, true);
   data.set(jsonBytes, 4);
 
   const generation = nextGeneration(state);
-  Atomics.store(control, 2, generation);
-  Atomics.store(control, 1, 0);
-  Atomics.store(control, 0, 1);
+  Atomics.store(control, 0, generation);
   Atomics.notify(control, 0, 1);
 
-  // One budget covers any number of stale responses.
-  const deadline = Date.now() + waitTimeoutMs;
-  for (;;) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0 || Atomics.wait(control, 1, 0, remaining) === 'timed-out') {
-      // The worker crashed, stalled, or still streams a transfer that outlived
-      // this budget. writeResponse drops that late response.
-      console.error(
-        `http-bridge: fetch worker did not answer within ${waitTimeoutMs}ms for ${url}. ` +
-        'Returning a transport failure.');
-      return { status: 0, headers: {}, bodyBytes: new Uint8Array(0) };
-    }
-    if (Atomics.load(meta, 4) === generation) break;
-    // A stale response. writeResponse drops these, but its generation check is
-    // not atomic with its write, and the gap holds two dataBuffer copies. No
-    // test can force this interleaving.
-    Atomics.store(control, 1, 0);
+  // At the deadline, take the request back: a compareExchange of control[0]
+  // from generation to 0. The worker makes the same exchange before it writes,
+  // so when the worker took it first, its response is on the way.
+  const answered = responseArrived(control, generation, Date.now() + waitTimeoutMs)
+    || (Atomics.compareExchange(control, 0, generation, 0) !== generation
+        && responseArrived(control, generation, Date.now() + WAIT_SLACK_MS));
+  if (!answered) {
+    console.error(
+      `http-bridge: fetch worker did not answer within ${waitTimeoutMs}ms for ${url}. ` +
+      'Returning status 0.');
+    return failedResponse();
   }
 
   const flags = Atomics.load(meta, 3);
@@ -192,8 +227,8 @@ function nodeSyncFetch(state, url, reqOpts) {
     // `overflow` tells this apart from a network error.
     console.error(
       `http-bridge: the response for ${url} is larger than the ${data.length}-byte transport ` +
-      `buffer. Upstream status ${status}. Returning a transport failure.`);
-    return { status: 0, headers: {}, bodyBytes: new Uint8Array(0), overflow: true };
+      `buffer. Upstream status ${status}. Returning status 0.`);
+    return { ...failedResponse(), overflow: true };
   }
 
   const bodyLength = Atomics.load(meta, 1);
@@ -203,46 +238,33 @@ function nodeSyncFetch(state, url, reqOpts) {
   return { status, headers: parseHeaders(headersStr), bodyBytes };
 }
 
-function browserSyncFetch(decorate, url, reqOpts) {
-  let request = {
-    url,
-    method: reqOpts.method || 'GET',
-    headers: reqOpts.headers || {},
-    body: reqOpts.body ?? null,
-  };
-  if (decorate) request = decorate(request);  // A browser decorator must be synchronous.
-
+// A synchronous XHR takes a responseType only in a Web Worker.
+function browserSyncFetch(url, reqOpts) {
+  const request = toRequest(url, reqOpts);
   const xhr = new XMLHttpRequest();
   xhr.open(request.method, request.url, false);
-  try { xhr.responseType = 'arraybuffer'; } catch (_) {}
+  xhr.responseType = 'arraybuffer';
   for (const [k, v] of Object.entries(request.headers)) xhr.setRequestHeader(k, v);
   xhr.send(request.body);
-
-  let bodyBytes = new Uint8Array(0);
-  if (xhr.response instanceof ArrayBuffer) {
-    bodyBytes = new Uint8Array(xhr.response);
-  } else if (typeof xhr.responseText === 'string' && xhr.responseText.length > 0) {
-    bodyBytes = new TextEncoder().encode(xhr.responseText);
-  }
-  const all = xhr.getAllResponseHeaders ? xhr.getAllResponseHeaders() : '';
-  return { status: xhr.status, headers: parseHeaders(all), bodyBytes };
+  return {
+    status: xhr.status,
+    headers: parseHeaders(xhr.getAllResponseHeaders()),
+    bodyBytes: new Uint8Array(xhr.response ?? 0),
+  };
 }
 
 export async function createSyncFetch(opts = {}) {
-  const { workerUrl, decorate, decorateUrl } = opts;
   if (isNode) {
-    const state = await ensureWorker(workerUrl, decorateUrl, opts);
+    const state = await ensureWorker(opts);
     refCount++;
     return (url, reqOpts = {}) => nodeSyncFetch(state, url, reqOpts);
   }
-  return (url, reqOpts = {}) => browserSyncFetch(decorate, url, reqOpts);
+  return (url, reqOpts = {}) => browserSyncFetch(url, reqOpts);
 }
 
 function makeXhrClass(syncFetch, XHR2) {
-  let xhrIdCounter = 0;
   return class XMLHttpRequest {
     constructor() {
-      this._id = ++xhrIdCounter;
       this._xhr2 = null;  // Only the async path needs xhr2.
       this._async = true;
       this._method = 'GET';
@@ -345,18 +367,15 @@ export async function installXhrPolyfill(opts = {}) {
 }
 
 // Releases one consumer reference and terminates the worker at the last one.
-// Returns true if this call terminated the worker. An extra call is safe.
+// Returns true if this call terminated the worker. Call it once for each
+// createSyncFetch: an extra call releases a reference of another consumer.
 export async function shutdown() {
-  if (!workerState) {
-    refCount = 0;
-    return false;
-  }
   refCount = Math.max(0, refCount - 1);
-  if (refCount > 0) return false;
-  const { worker } = workerState;
-  worker.postMessage({ cmd: 'shutdown' });
-  await worker.terminate();
+  if (refCount > 0 || !workerState) return false;
+  const state = workerState;
+  state.dead = true;
   workerState = null;
+  await state.worker.terminate();
   return true;
 }
 

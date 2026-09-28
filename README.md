@@ -4,111 +4,113 @@
 [![Clojars](https://img.shields.io/clojars/v/net.willcohen/native.svg)](https://clojars.org/net.willcohen/native)
 [![npm](https://img.shields.io/npm/v/ffi-wasm.svg)](https://www.npmjs.com/package/ffi-wasm)
 
-clj-native has helper utilities for native libraries and FFI in Clojure and
-Squint (ClojureScript). A library that uses clj-native binds a C or WASM API
-one time. The library can then run on three backends.
+clj-native helps a Clojure or Squint (ClojureScript) library bind a C library.
+The library declares each C function one time. It can then call the function
+on each of the three backends below.
 
 ## Install
 
 npm: [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm). Clojars:
 [`net.willcohen/native`](https://clojars.org/net.willcohen/native), with the
-namespaces `net.willcohen.native.*`. The badges show the version. Do not use a
-version range, because the API can change.
+namespaces `net.willcohen.native.*`. The badges show the current version. Do
+not use a version range, because the API can change.
+
+## Use
+
+Make one library value with `dispatch/library`. Call each C function with
+`dispatch/call!`. Register one handler spec for each library with
+`workload-pool/register-handler!`. The docstrings of these functions give
+their options.
 
 ## Backends
 
-Two properties select the backend. The first is the host, the JVM or
-JavaScript. The second is the compiled artifact, a native shared library or an
-emscripten `.wasm`.
+The host and the build of the C library select the backend.
 
-|              | native `.so`/`.dylib`  | emscripten `.wasm`         |
-|--------------|------------------------|----------------------------|
-| **JVM host** | Panama, through dt-ffi | GraalWasm, through ccall   |
-| **JS host**  | not possible           | worker pool, through ccall |
+|                | native `.so`, `.dylib`, `.dll`    | emscripten `.wasm`                   |
+|----------------|-----------------------------------|--------------------------------------|
+| **JVM**        | Panama, through dt-ffi (`:ffi`)   | GraalWasm, through `ccall` (`:graal`) |
+| **JavaScript** | not possible                      | worker pool, through `ccall`         |
 
-Because a JavaScript host cannot load a native shared library, the fourth cell
-has no backend. The JS worker pool runs on Node `worker_threads` or in a
-browser.
+A JavaScript host cannot load a native library. The worker pool uses
+[worker-router](https://github.com/willcohen/worker-router), which runs on
+Node `worker_threads` and in browser Web Workers.
 
-The two WASM backends call C functions through the emscripten `ccall`, because
-they use the same artifact. The FFI backend binds each symbol directly. It does
-not use a type list at call time.
+The two WASM backends load the same emscripten build and call C through its
+`ccall`. `dispatch/library` computes the `ccall` types of each function one
+time. The FFI backend binds each C symbol directly and ignores these types.
 
-On the JVM, `try-init!` in `platform-state` runs the FFI bootstrap and records
-`:ffi`. If the bootstrap throws, `try-init!` runs the GraalVM bootstrap and
-records `:graal`. The GraalVM backend has a different memory model and a
-polyglot lock. The namespace docstring of `graal-wasm` gives the lock rules.
-The docstring of `bootstrap-graal-module!` gives the loader contract.
+On the JVM, `platform-state/try-init!` runs the FFI bootstrap and records
+`:ffi`. If the FFI bootstrap throws, `try-init!` runs the GraalVM bootstrap
+and records `:graal`. After `platform-state/force-graal!`, the next init runs
+only the GraalVM bootstrap.
 
-### The build layer
+The GraalVM backend has a different memory model and a polyglot lock. The
+`graal-wasm` namespace docstring gives the lock rules. It also gives the
+exports that the emscripten module must have. The `bootstrap-graal-module!`
+docstring gives the loader options.
 
-The build layer makes the artifacts that the three backends load. It has
-`net.willcohen.native.build` (in `src/bb`), `gen-handler` and `flake.nix`. It
-makes these artifacts:
+## Build helpers
 
-- the native shared library for the FFI backend
-- the emscripten `.wasm` and its loader, for the two WASM backends
-- the handler module for the JS worker pool, with `gen-handler`
+These parts make the files that the backends load:
 
-The namespace docstring of `graal-wasm` gives the exports that the emscripten
-module must have. The `build.clj` at the repository root is a different file.
-It is the tools.build script for the jar of clj-native.
+- `net.willcohen.native.build`, in `src/bb`, makes the native library and the
+  emscripten `.wasm` with its loader. It runs on babashka only.
+- `gen-handler` makes the handler module for the JavaScript worker pool.
+- `flake.nix` supplies the toolchain. Refer to [Nix flake](#nix-flake).
 
-## Two hosts, one artifact
+The `build.clj` at the repository root is only the tools.build script for the
+clj-native jar.
 
-Because the two WASM backends read the same heap through different hosts, each
-capability has one implementation for each host.
+## Heap helpers
 
-| Capability | JVM (`graal-wasm`) | JS (npm) |
+Because the JVM and JavaScript get access to the emscripten heap through
+different APIs, clj-native has one implementation of each helper for each
+host.
+
+| Helper | JVM | JavaScript (npm) |
 |---|---|---|
-| ccall | `ccall` | `handler-heap/ccallMethod` |
-| heap read and write | `read-heap-array`, `heap-write-bytes!` | `heapHelpers` `heap*_get`, `heap*_set` |
-| malloc, free, UTF-8 | `malloc`, `free-on-heap`, `utf8->string` | `heapHelpers` `malloc`, `free`, `utf8_to_string` |
-| synchronous host HTTP | `net.willcohen.native.http` | `http-bridge` plus `fetch-worker` |
-| host callback into C | `callbacks` (Panama upcall), `graal-wasm/put-js-globals!` | a consumer handler method |
-| string-array walk | `string-array-pointer->strs` | none. The consumer writes it. |
-| struct read | `read-struct` | none. The consumer writes it. |
+| ccall | `graal-wasm/ccall` | `handler-heap/ccallMethod` |
+| heap read and write | `graal-wasm/read-heap-array`, `heap-write-bytes!` | `heapHelpers` `heap*_get`, `heap*_set` |
+| malloc, free, UTF-8 | `graal-wasm/malloc`, `free-on-heap`, `utf8->string` | `heapHelpers` `malloc`, `free`, `utf8_to_string` |
+| blocking HTTP for C | `net.willcohen.native.http` | `http-bridge`, with `fetch-worker` on Node |
+| callback from C to the host | `callbacks` (Panama upcall), `graal-wasm/put-js-globals!` | a method of the consumer handler |
+| C string array to strings | `graal-wasm/string-array-pointer->strs` | none |
+| C struct to map | `graal-wasm/read-struct` | none |
 
-Each `heapHelpers` entry is a key of the object that
-`heapHelpers(getModule)` returns. Spread that object into the methods map of
-the consumer, before the keys of the consumer. A subsequent key with the same
-name replaces the entry.
+`heapHelpers(getModule)` returns an object of methods. Spread it into the
+handler's `methods` map, before the consumer's own keys. A consumer key with
+the same name replaces the helper.
 
-The JS side has no struct read. A JS consumer writes the walk in its own
-overrides module, where the field layout of its library already is. On the
-JVM, `read-struct` takes the layout as an argument.
+On JavaScript, a consumer writes its string-array and struct reads in its own
+overrides module, which knows the struct layouts of its library. On the JVM,
+`read-struct` takes the layout as an argument.
 
-## Contents
+## Packages
 
-The npm package [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm) contains
-the hand-written `.mjs` runtime helpers and the squint-compiled `.cljc`
-modules. The `exports` map in `package.json` is the list. The package also
-contains `macros.cljc`, because squint expands the macros at compile time.
-Only the jar contains the other `.cljc` files.
+The npm package [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm) holds the
+hand-written `.mjs` runtime helpers and the squint output of the `.cljc` and
+`.cljs` modules. The `exports` map in `package.json` lists them. The package
+also holds `macros.cljc`, because squint expands the macros at compile time.
 
 The jar [`net.willcohen/native`](https://clojars.org/net.willcohen/native)
-contains these thirteen namespaces. The docstring of each namespace is its
-reference.
+holds the source of these 13 namespaces, and a clj-kondo config export. It
+holds no `.mjs` file. Each namespace docstring is the reference.
 
-| Namespace | What it holds |
+| Namespace | Contents |
 |---|---|
-| `dispatch` | The per-function call engine, and the entry point |
-| `macros` | Surface-generation helpers, for a consumer macro |
-| `workload-pool` | The registry above `pool`, and the JVM executor slots |
+| `dispatch` | `library` and `call!`, the call path for each C function |
+| `macros` | Helpers for a consumer's wrapper macro |
+| `workload-pool` | The handler registry above `pool`, and the JVM executor slots |
 | `pool` | The worker-router wrapper, on CLJS |
-| `platform-state` | Impl selection, and the init flow |
+| `platform-state` | Backend selection and init |
 | `platform` | JVM platform detection, and the FFI bootstrap |
 | `graal-wasm` | The JVM WASM backend, on GraalVM polyglot |
-| `ffi-mem` | JVM native-memory primitives, for the Panama backend |
+| `ffi-mem` | JVM native-memory reads and writes, for the FFI backend |
 | `callbacks` | JVM dt-ffi upcall registration |
-| `http` | The host HTTP transport that a wasm or native library calls |
-| `gen-handler` | The build-time handler-module generator |
-| `build` | The consumer-facing build primitives, in `src/bb` |
-| `test-runner` | The `cljs.test` runner footer |
-
-To use clj-native, make one library value with `dispatch/library`. Then use
-`dispatch/call!` for each C function. Register one handler spec for each
-library with `workload-pool/register-handler!`.
+| `http` | The blocking host HTTP transport for a WASM or native library |
+| `gen-handler` | The build-time generator of the handler module |
+| `build` | Build helpers for a consumer's bb tasks, in `src/bb` |
+| `test-runner` | A `cljs.test` runner that always exits the Node process |
 
 ## Build, test and deploy
 
@@ -120,11 +122,11 @@ bb deploy:npm        # publish ffi-wasm to npm
 bb deploy:clojars    # publish net.willcohen/native to Clojars
 ```
 
-The test directories divide the suites by runtime:
+Each test directory holds the suites of one runtime:
 
 - `test/clj/`: JVM suites (`clojure.test`), for `bb test:clj`.
-- `test/cljc/`: suites for the two runtimes. `test:clj` and `test:cljs` run
-  the same body.
+- `test/cljc/`: suites for both runtimes. `test:clj` and `test:cljs` run the
+  same body.
 - `test/cljs/`: CLJS suites (`cljs.test`), for `bb test:cljs`. squint compiles
   them, and Node runs them.
 - `test/bb/`: tests of the babashka build helpers, for `bb test:bb`.
@@ -137,51 +139,65 @@ Add the flake as an input to a build or a dev shell:
 inputs.clj-native.url = "github:willcohen/clj-native";
 ```
 
-`devShells.default` is the dev shell of clj-native. It has the Clojure
-toolchain and Node for the tests.
+`devShells.default` is the clj-native dev shell. It has the Clojure toolchain,
+zig, and Node for the tests.
 
-`lib.<system>.mkCrossShells` makes a dev shell for a library that binds a C
-dependency. `lib.<system>` also has `actualSystem`.
+`lib.<system>.mkCrossShells` returns the `devShells` set (`default`) for a
+library that binds a C library. Its arguments are `jdk`, `extraBuildInputs`
+and `extraDevInputs`. `lib.<system>.actualSystem` is the real system in a
+NixOS container, where `system` can name the host.
 
-### Linux and Windows libs with zig
+### Linux and Windows libraries with zig
 
-The dev shell has zig, `readelf` and `llvm-readobj`. zig builds the Linux
-and Windows libs on a Linux or a macOS host.
+The dev shell has zig, `readelf` and `llvm-readobj`. zig builds the Linux and
+Windows libraries on a Linux or macOS host.
 `net.willcohen.native.build/zig-toolchain!` writes the compiler wrappers for
-one of five resource dirs:
+one of five resource directories. It returns the env, the configure `--host`
+and the CMake args.
 
-| Dir | zig target | Loads on |
+| Directory | zig target | Loads on |
 |---|---|---|
 | `linux-amd64`, `linux-aarch64` | `<arch>-linux-gnu.2.28` | glibc 2.28 and later |
 | `linux-amd64-musl`, `linux-aarch64-musl` | `<arch>-linux-musl` | musl |
 | `windows-amd64` | `x86_64-windows-gnu` | Windows 10 and later |
 
-zig links libc++, libc++abi, libunwind and compiler-rt into the lib, in
-place of libstdc++ and libgcc. Their license is Apache-2.0 WITH
-LLVM-exception. zig links libc dynamically. Of glibc, a `linux-<arch>` lib
-holds only the libc_nonshared wrappers (such as stat and atexit), which
-glibc's link exception covers. A `windows-amd64` lib holds mingw-w64 runtime
-code, under the ZPL 2.1 and permissive licenses. Ship their notices with the
-lib.
+On musl Linux, `platform/extract-and-bind-library!` tries `<os>-<arch>-musl/`
+first, and then `<os>-<arch>/`.
 
-With the env and the CMake args of `zig-toolchain!`, a build finds no
-library, header or pkg-config file on the build machine. Give each
-dependency to CMake by its path, for example `-DZLIB_LIBRARY`.
+zig links compiler-rt into each library. For C++ code, zig also links libc++,
+libc++abi and libunwind into the library, in place of libstdc++ and libgcc.
+These LLVM runtimes are under Apache-2.0 WITH LLVM-exception.
 
-After the build, call `net.willcohen.native.build/check-linux-lib!` on the
-lib. It throws when the lib has a run path. It also throws when the lib loads a
-library or a glibc version that is not permitted for its dir.
+zig links libc dynamically. From glibc, a `linux-<arch>` library holds only
+the libc_nonshared wrappers, for example `stat` and `atexit`. The glibc link
+exception covers these wrappers. A `windows-amd64` library holds mingw-w64
+runtime code, under the ZPL 2.1 and permissive licenses. Ship their notices
+with the library.
 
-On Windows, call `check-windows-lib!` on the DLL. It throws when the DLL
-imports a DLL other than KERNEL32, SHELL32 or the UCRT (`api-ms-win-crt-*`),
-such as a mingw runtime DLL.
+With the env and the CMake args of `zig-toolchain!`, a build finds no library,
+header or pkg-config file on the build machine. Give each dependency to CMake
+by its path, for example `-DZLIB_LIBRARY`.
 
-On macOS, call `check-darwin-lib!` on the dylib. It throws when the dylib
-loads a library that is not a system library, or has a run path. A run path
-names a dir of the build machine.
+### Library checks
 
-On musl Linux, `extract-and-bind-library!` tries `<os>-<arch>-musl/` first,
-and then `<os>-<arch>/`.
+After the build, check each library before it ships. Each check prints `OK`,
+or throws with a list of the errors.
+
+`check-linux-lib!` reads the library with `readelf`. It throws when the
+library is not a shared object for the arch of its directory. It also throws
+when the library has a run path, or needs libstdc++ or libgcc. A glibc library
+can load only glibc libraries, up to glibc 2.28. A musl library can load only
+`libc.so`.
+
+`check-windows-lib!` reads the DLL with `llvm-readobj`. It throws when the
+file is not an AMD64 DLL. It also throws when the DLL imports a DLL other than
+KERNEL32, SHELL32 or the UCRT (`api-ms-win-crt-*`), for example a mingw
+runtime DLL.
+
+`check-darwin-lib!` reads the dylib with `otool`. It throws for a universal
+binary, because each resource directory takes a thin dylib. It also throws
+when the dylib loads a library outside `/usr/lib` and `/System/Library`, or
+has a run path. A run path names a directory on the build machine.
 
 ## License
 

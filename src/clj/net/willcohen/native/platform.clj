@@ -119,13 +119,16 @@
 
 (defn init-jdk-library!
   "Select the :jdk backend and bind `singleton` to the canonical path of
-   `file`, since SymbolLookup.libraryLookup needs an absolute path. A nil
-   `singleton` (a failed extraction) skips the bind, and the failure comes
-   at the first native call."
+   `file`, since SymbolLookup.libraryLookup needs an absolute path. Throws
+   when `singleton` is nil, a failed extraction, so that try-init! falls
+   back to GraalVM."
   [singleton ^File file]
+  (when-not singleton
+    (throw (ex-info (str "No packaged native library was extracted for "
+                         (name (get-os)) "-" (name (get-arch)))
+                    {:os (get-os) :arch (get-arch)})))
   (init-ffi! :jdk)
-  (when singleton
-    (dt-ffi/library-singleton-set! singleton (.getCanonicalPath file))))
+  (dt-ffi/library-singleton-set! singleton (.getCanonicalPath file)))
 
 (defn reset-library!
   "Reset dt-ffi library `singleton`, so the next init binds it again. nil
@@ -225,12 +228,21 @@
   [path]
   (-> path (string/replace #"/$" "") (string/split #"/") last))
 
+(defn- delete-tree!
+  "Delete `dir` and everything below it, each child before its dir."
+  [^File dir]
+  (doseq [^File f (reverse (file-seq dir))]
+    (.delete f)))
+
 (defn- make-temp-dir
-  "Create a temporary directory and return its File."
+  "Create a temporary directory that a shutdown hook deletes, and return its
+   File."
   ^File [prefix]
-  (.toFile (Files/createTempDirectory
-            prefix
-            (into-array java.nio.file.attribute.FileAttribute []))))
+  (let [dir (.toFile (Files/createTempDirectory
+                      prefix
+                      (into-array java.nio.file.attribute.FileAttribute [])))]
+    (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable #(delete-tree! dir)))
+    dir))
 
 (defn- extract-library-file!
   "Copy the packaged library, from the first of library-dirs that has it,
@@ -240,7 +252,6 @@
         resources (map #(str % "/" file-name) (library-dirs))
         resource  (or (first (filter io/resource resources)) (first resources))
         dest      (File. dir file-name)]
-    (doto dest .deleteOnExit)
     (copy-resource! resource dest)
     dest))
 
@@ -251,7 +262,6 @@
     resource
     (let [f (File. dir ^String (or dest (last-path-segment resource)))]
       (io/make-parents f)
-      (doto f .deleteOnExit)
       (copy-resource! resource f))
 
     resource-dir
@@ -263,7 +273,6 @@
       (doseq [rel (resource-dir-files base)]
         (let [f (File. sub ^String rel)]
           (io/make-parents f)
-          (doto f .deleteOnExit)
           (copy-resource! (str base rel) f))))
 
     :else
@@ -289,11 +298,10 @@
                        with an optional :dest name.
 
    On failure, usually a missing resource for this platform, logs a warning
-   and returns {}. The namespace stays loadable, and the first native call
-   fails. The warning names the file, which that failure does not.
+   that names the file and returns {}. The namespace stays loadable, and
+   init-jdk-library! throws, so try-init! falls back to GraalVM.
 
-   Every extracted file is delete-on-exit. The directory is not, because the
-   JVM deletes only an empty directory."
+   A shutdown hook deletes the directory."
   [{:keys [lib-basename fn-defs-var tmp-prefix suffixes extra-resources]}]
   (try
     (let [dir      (make-temp-dir (or tmp-prefix lib-basename))
@@ -306,7 +314,7 @@
     (catch Exception e
       (log/warn e (str "Could not extract packaged library " lib-basename
                        " for " (name (get-os)) "-" (name (get-arch))
-                       "; deferring to the first native call"))
+                       "; init-jdk-library! will throw"))
       {})))
 
 (defn library-fn-finder

@@ -8,8 +8,10 @@
   "Tests of the library-agnostic platform helpers. The resolvers run against
    clojure.core. Extraction runs against test/resources with the host pinned
    to linux/amd64, so one fixture path works on every machine."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.shell :as sh]
+            [clojure.test :refer [deftest is testing]]
             [net.willcohen.native.platform :as platform]
+            [net.willcohen.native.platform-state :as nps]
             [tech.v3.datatype.ffi :as dt-ffi])
   (:import [java.io File]))
 
@@ -95,9 +97,7 @@
     (is (= "glib-2.0" (platform/libname-from-file (File. "/tmp/x/glib-2.0.so"))))))
 
 (deftest library-lifecycle-nil-singleton-no-op
-  (testing "a nil singleton makes init/reset no-ops (no throw)"
-    (is (nil? (platform/init-jdk-library! nil (File. "/tmp/x/libproj.dylib"))))
-    (is (nil? (platform/reset-library! nil)))))
+  (is (nil? (platform/reset-library! nil))))
 
 (deftest rehydrate-fn-defs-turns-argument-names-into-symbols
   (let [rehydrated (platform/rehydrate-fn-defs
@@ -250,6 +250,40 @@
                {:lib-basename    "libextracttest"
                 :fn-defs-var     #'platform/default-library-suffixes
                 :extra-resources [{:dest "nowhere"}]})))))
+
+(deftest try-init-falls-back-to-graal-when-no-lib-was-extracted
+  ;; A host with no packaged lib: without the throw, init records :ffi and
+  ;; each call fails.
+  (let [{:keys [singleton file]} (extract-fixture-library!
+                                  {:lib-basename "libnosuchlibrary"
+                                   :fn-defs-var  #'platform/default-library-suffixes})
+        impl  (atom nil)
+        saved System/err]
+    (try
+      (System/setErr (java.io.PrintStream. (java.io.ByteArrayOutputStream.)))
+      (with-out-str
+        (nps/try-init! impl (atom false) false
+                       #(platform/init-jdk-library! singleton file)
+                       (constantly nil)))
+      (finally (System/setErr saved)))
+    (is (= :graal @impl))))
+
+(def ^:private cleanup-probe
+  (str "(require '[net.willcohen.native.platform :as p])"
+       "(with-redefs [p/get-os (constantly :linux) p/get-arch (constantly :amd64)"
+       "              p/library-dirs (constantly [\"linux-amd64\"])]"
+       "  (print (:path (p/extract-and-bind-library!"
+       "                 {:lib-basename \"libextracttest\""
+       "                  :fn-defs-var #'p/default-library-suffixes"
+       "                  :extra-resources [{:resource-dir \"extract-test/\"}]}))))"
+       "(flush)"))
+
+(deftest extracted-files-and-dirs-go-at-exit
+  (let [{:keys [exit out err]} (sh/sh "clojure" "-Sdeps" "{:paths [\"src/clj\" \"src/cljc\" \"test/resources\"]}"
+                                      "-M" "-e" cleanup-probe)]
+    (is (= 0 exit) err)
+    (is (seq out) "the probe printed the dir")
+    (is (not (.exists (File. ^String out))) out)))
 
 (def ^:private demo-fn-defs
   (platform/rehydrate-fn-defs

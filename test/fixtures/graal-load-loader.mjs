@@ -6,7 +6,8 @@
 
 // Test fixture for the `load` loader contract. The module reports what the
 // options carried. `load` is not async, so 'sync' mode can return the module
-// itself. 'ok' resolves after an await, and 'throw' rejects.
+// itself. 'ok' resolves after an await, 'throw' rejects, 'undefined'
+// resolves to no module, and 'never' does not settle.
 
 function describe(options) {
   const db = options.dbBytes;
@@ -27,8 +28,10 @@ function describe(options) {
 
 export function load(options) {
   if (options.mode === 'sync') return describe(options);
+  if (options.mode === 'never') return new Promise(() => {});
   return (async () => {
     await Promise.resolve();
+    if (options.mode === 'undefined') return undefined;
     if (options.mode === 'throw') {
       throw new Error('graal-load-loader: refusing on purpose');
     }

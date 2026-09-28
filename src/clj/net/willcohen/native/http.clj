@@ -67,6 +67,10 @@
           (.method builder m (body-publisher body)))]
     (.build built)))
 
+(defn- transport-failure [url e]
+  (log/warn e (str "HTTP request failed, returning status 0: " url))
+  {:status 0 :headers {} :body-bytes nil})
+
 (defn fetch
   "Send an HTTP request. Keys:
      :url         Required.
@@ -89,9 +93,14 @@
       {:status (.statusCode response)
        :headers (parse-headers (.headers response))
        :body-bytes (.body response)})
+    (catch InterruptedException e
+      ;; send clears the flag when it throws. Set it again for the caller,
+      ;; after the log write, which an interrupted NIO channel would fail.
+      (let [failure (transport-failure url e)]
+        (.interrupt (Thread/currentThread))
+        failure))
     (catch Exception e
-      (log/warn e (str "HTTP request failed, returning status 0: " url))
-      {:status 0 :headers {} :body-bytes nil})))
+      (transport-failure url e))))
 
 (defn range-request
   "fetch :size bytes of :url from :offset with a Range GET. Takes the fetch
@@ -106,5 +115,5 @@
       (dissoc :offset :size)
       (assoc :method :get
              :headers (assoc (or headers {})
-                             "Range" (format "bytes=%d-%d" offset (+ (long offset) (long size) -1))))
+                             "Range" (format "bytes=%d-%d" (long offset) (+ (long offset) (long size) -1))))
       fetch))

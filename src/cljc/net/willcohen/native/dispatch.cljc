@@ -19,7 +19,6 @@
       ignores them."
      (:require [net.willcohen.native.graal-wasm :as nw]
                [net.willcohen.native.platform :as nplatform]
-               [clojure.tools.logging :as log]
                [tech.v3.resource :as resource]))
    :cljs
    (ns net.willcohen.native.dispatch
@@ -205,7 +204,7 @@
    (defn jvm-graal-call
      "ccall `c-fn-name` on the module of a bound *wasm-context*, else of
       `library-key`. A \"string\" rettype reads through nw/ccall-string.
-      Logs an exception and returns nil."
+      Throws an ex-info that names `c-fn-name` when the ccall throws."
      [library-key c-fn-name ccall-rettype ccall-argtypes converted-args]
      (let [module (graal-module library-key)]
        (try
@@ -213,8 +212,8 @@
            (nw/ccall-string module c-fn-name ccall-argtypes converted-args)
            (nw/ccall module c-fn-name ccall-rettype ccall-argtypes converted-args))
          (catch Exception e
-           (log/warn (str "Graal ccall exception for " c-fn-name ": " (.getMessage e)))
-           nil)))))
+           (throw (ex-info (str "ccall " c-fn-name " failed: " (ex-message e))
+                           {:library-key library-key :c-fn-name c-fn-name} e)))))))
 
 #?(:clj
    (defn- ffi-leg
@@ -380,8 +379,7 @@
 
    Hooks: :extras-builder and :context-isolator run on CLJS only,
    :result-wrapper on :graal and CLJS. call! never runs :result-check; call
-   check-result. A ccall exception gives nil on :graal (logged) and rejects
-   on CLJS.
+   check-result. A ccall exception throws on :graal and rejects on CLJS.
 
    opts (CLJS only): :pool, the worker-router ref (required);
    :force-worker-idx, which overrides affinity; :primary-handle, a trace

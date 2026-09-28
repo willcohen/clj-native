@@ -135,15 +135,8 @@
   "The WasmContext of `library-key`. The first call creates and registers
    it."
   [library-key]
-  (or (get @contexts library-key)
-      (let [ctx (->WasmContext library-key (atom nil))]
-        (swap! contexts assoc library-key ctx)
-        ctx)))
-
-(defn set-module!
-  "Register module `m` on `ctx`. A second call replaces it."
-  [ctx m]
-  (reset! (:module-ref ctx) m))
+  (get (swap! contexts update library-key #(or % (->WasmContext library-key (atom nil))))
+       library-key))
 
 (defn get-module
   "The module registered on `ctx`, or nil before bootstrap."
@@ -291,10 +284,62 @@
       (.mimeType "application/javascript+module")
       .build))
 
+(defn- eval-module!
+  "Evaluate the ESM module at `url` in `pctx`."
+  ^Value [^Context pctx url]
+  (locking pctx
+    (.eval pctx ^Source (build-js-module-source url))))
+
+(defn- run-loader!
+  "Call the load or initialize export of `loader`. The caller holds the
+   monitor of its Context. Returns a CompletableFuture of the module, which
+   fails when the loader gives none or does not settle."
+  ^CompletableFuture [^Value loader init-opts library-key]
+  (let [result     (CompletableFuture.)
+        fail!      #(.completeExceptionally result (ex-info "Module init failed"
+                                                            {:library-key library-key :error %}))
+        done!      (fn [^Value m]
+                     (if (or (nil? m) (.isNull m))
+                       (fail! "the loader gave no module")
+                       (.complete result m)))
+        on-success (reify ProxyExecutable
+                     (execute [_ args]
+                       (done! (when (pos? (alength args)) (aget args 0)))
+                       nil))
+        on-error   (reify ProxyExecutable
+                     (execute [_ args]
+                       (fail! (if (pos? (alength args)) (aget args 0) "Unknown error"))
+                       nil))
+        load-fn    (.getMember loader "load")
+        init-fn    (.getMember loader "initialize")]
+    (cond
+      (and load-fn (.canExecute load-fn))
+      ;; A loader that is not async returns the module, which has no `then`.
+      (let [returned (.execute load-fn (into-array Object [(ProxyObject/fromMap (or init-opts {}))]))]
+        (if (.canInvokeMember returned "then")
+          (.invokeMember returned "then" (into-array Object [on-success on-error]))
+          (done! returned)))
+
+      (and init-fn (.canExecute init-fn))
+      (.execute init-fn (into-array Object
+                                    [(ProxyObject/fromMap
+                                      (assoc (or init-opts {})
+                                             "onSuccess" on-success
+                                             "onError"   on-error))]))
+
+      :else
+      (throw (ex-info "Loader module exports neither load nor initialize"
+                      {:library-key library-key})))
+    ;; GraalJS runs promise jobs before JS returns to the host, so a load
+    ;; that is still pending waits on a timer or I/O that never comes.
+    (when-not (.isDone result)
+      (fail! "the loader did not settle"))
+    result))
+
 (defn bootstrap-graal-module!
-  "Load the wasm module of `ctx`, a WasmContext, call set-module! on it,
-   and return the module Value. Blocks until the load settles. When `ctx`
-   has a module already, returns it and calls no loader.
+  "Load the wasm module of `ctx`, a WasmContext, store it on `ctx`, and
+   return the module Value. Blocks until the load settles. When `ctx` has
+   a module already, returns it and calls no loader.
 
    opts:
      :loader-module-url    Required. The loader ESM module.
@@ -320,79 +365,27 @@
        does not call new URL.
      - No setTimeout. Leave Module.setStatus unset, so run() calls doRun()
        with no timer. GraalJS settles promises only when JS returns to the
-       host, so a load that waits on a timer or real I/O never settles."
+       host, so a load that waits on a timer or real I/O fails."
   [ctx {:keys [loader-module-url preload-module-urls init-opts polyglot-context]}]
-  ;; kondo cannot see that the :module-ref atom is shared per WasmContext.
-  #_{:clj-kondo/ignore [:locking-suspicious-lock]}
-  (locking (:module-ref ctx)
-    (or @(:module-ref ctx)
-        (let [^Context pctx (or polyglot-context (context))]
-          (when (nil? loader-module-url)
-            (throw (ex-info "bootstrap-graal-module! requires :loader-module-url"
-                            {:ctx (:library-key ctx)})))
-          (doseq [url preload-module-urls]
-            (when url
-              (locking pctx
-                (let [src (build-js-module-source url)]
-                  (log/info "Pre-loading JS module" (str url))
-                  (.eval pctx src)))))
-          (let [loader-module (locking pctx
-                                (let [src (build-js-module-source loader-module-url)]
-                                  (log/info "Loading JS loader module" (str loader-module-url))
-                                  (.eval pctx src)))
-                init-future (CompletableFuture.)
-                settle! (fn [m]
-                          (log/info "Module init success callback fired for"
-                                    (:library-key ctx))
-                          (when m
-                            (set-module! ctx m)
-                            (.complete init-future m)))
-                on-success (reify ProxyExecutable
-                             (execute [_ args]
-                               (settle! (when (pos? (alength args)) (aget args 0)))
-                               nil))
-                on-error (reify ProxyExecutable
-                           (execute [_ args]
-                             (let [err (if (pos? (alength args)) (aget args 0) "Unknown error")]
-                               (log/error err "Module init error callback fired for"
-                                          (:library-key ctx))
-                               (.completeExceptionally init-future
-                                                       (ex-info "Module init failed"
-                                                                {:library-key (:library-key ctx)
-                                                                 :error       err}))
-                               nil)))
-                ^org.graalvm.polyglot.Value loader loader-module
-                load-fn (.getMember loader "load")
-                init-fn (.getMember loader "initialize")]
-            (cond
-              (and load-fn (.canExecute load-fn))
-              ;; A loader that is not async returns the module, which has
-              ;; no `then`.
-              (let [^Value returned (locking pctx
-                                      (log/info "Executing 'load' for" (:library-key ctx))
-                                      (.execute load-fn (into-array Object [(ProxyObject/fromMap (or init-opts {}))])))]
-                (if (.canInvokeMember returned "then")
-                  (locking pctx
-                    (.invokeMember returned "then" (into-array Object [on-success on-error])))
-                  (settle! returned)))
-
-              (and init-fn (.canExecute init-fn))
-              (locking pctx
-                (log/info "Executing 'initialize' for" (:library-key ctx))
-                (.execute init-fn (into-array Object
-                                              [(ProxyObject/fromMap
-                                                (assoc (or init-opts {})
-                                                       "onSuccess" on-success
-                                                       "onError"   on-error))])))
-
-              :else
-              (throw (ex-info "Loader module exports neither load nor initialize"
-                              {:library-key       (:library-key ctx)
-                               :loader-module-url (str loader-module-url)})))
-            (log/info "Awaiting initialization completion for" (:library-key ctx))
-            (.get init-future)
-            (log/info "Module ready for" (:library-key ctx))
-            @(:module-ref ctx))))))
+  (let [^Context pctx (or polyglot-context (context))]
+    ;; The Context monitor first: a caller under with-graal-lock holds it
+    ;; when it reaches here. kondo cannot see that the :module-ref atom is
+    ;; shared per WasmContext.
+    #_{:clj-kondo/ignore [:locking-suspicious-lock]}
+    (locking pctx
+      (locking (:module-ref ctx)
+        (or @(:module-ref ctx)
+            (do
+              (when (nil? loader-module-url)
+                (throw (ex-info "bootstrap-graal-module! requires :loader-module-url"
+                                {:ctx (:library-key ctx)})))
+              (doseq [url preload-module-urls :when url]
+                (eval-module! pctx url))
+              (let [m (.get (run-loader! (eval-module! pctx loader-module-url)
+                                         init-opts (:library-key ctx)))]
+                (reset! (:module-ref ctx) m)
+                (log/info "Module ready for" (:library-key ctx))
+                m)))))))
 
 (defn eval-js
   "Evaluate JS `source` under the monitor of `ctx`, by default the shared
@@ -550,14 +543,15 @@
   (get-value [this type]
     (graal-execute "getValue" [this type]))
   (pointer->string [this]
-    (utf8->string (current-module) this))
+    (when-not (zero? (address-as-int this))
+      (utf8->string (current-module) this)))
   (string-array-pointer->strs [this]
     (loop [addr this
            result-strings []
            idx 0]
       (when *runtime-log-level*
         (log/log *runtime-log-level* (str "Graal: string-array-pointer->strs - Loop iteration " idx ", reading from address: " (address-as-int addr))))
-      (let [string-addr-polyglot (get-value (address-as-int addr) "*")
+      (let [string-addr-polyglot (if (zero? (address-as-int addr)) 0 (get-value (address-as-int addr) "*"))
             string-addr-int (address-as-int string-addr-polyglot)]
         (when *runtime-log-level*
           (log/log *runtime-log-level* (str "Graal: string-array-pointer->strs - Pointer at " (address-as-int addr) " points to string at: " string-addr-int)))
@@ -605,9 +599,15 @@
 
 (defn malloc
   "Allocate `b` bytes on the wasm heap. Returns a TrackablePointer that the
-   caller frees with free-on-heap."
+   caller frees with free-on-heap. Throws when `b` does not fit an i32 or
+   the allocation fails."
   [b]
-  (graal-execute "_malloc" [b] :trackable-pointer))
+  (when-not (<= 0 b Integer/MAX_VALUE)
+    (throw (ex-info (str "malloc size out of range: " b) {:size b})))
+  (let [p (graal-execute "_malloc" [(int b)] :trackable-pointer)]
+    (when (and (pos? b) (zero? (address-as-int p)))
+      (throw (ex-info (str "malloc of " b " bytes failed") {:size b})))
+    p))
 
 (defn heapf64
   "A HEAPF64 subarray of `n` doubles from `offset`, in 8-byte units."
@@ -639,25 +639,24 @@
     base))
 
 (defn string-list-to-native-array
-  "Allocate a NULL-terminated char** of `s-list` on the wasm heap. Returns
-   its address as a Value, 0 for an empty list. The caller frees the array
-   and each string. Throws on a nil element."
+  "Allocate a NULL-terminated char** of `s-list` on the wasm heap, in one
+   block: the pointer slots, then the strings. An empty list gives the NULL
+   slot alone, as on FFI. Returns its address as a Value, which the caller
+   frees with free-on-heap. Throws on a nil element."
   [s-list]
-  (if (empty? s-list)
-    (with-current-module [m] (.asValue (.getContext m) 0))
-    (let [_ (when (some nil? s-list)
-              (throw (ex-info "string-list-to-native-array: nil element in s-list (char** cannot represent a null string); validate before calling"
-                              {:s-list s-list})))
-          string-pointers (mapv allocate-string-on-heap s-list)
-          num-strings (count string-pointers)
-          array-of-pointers-size (* (inc num-strings) 4)
-          array-of-pointers-addr (address-as-polyglot-value (malloc array-of-pointers-size))
-          base (long (address-as-int array-of-pointers-addr))]
-      (with-current-module [m]
-        (write-pointer-slots! m base string-pointers)
-        (.execute (.getMember m "setValue")
-                  (into-array Object [(+ base (* num-strings 4)) 0 "*"]))
-        array-of-pointers-addr))))
+  (when (some nil? s-list)
+    (throw (ex-info "string-list-to-native-array: nil element in s-list (char** cannot represent a null string); validate before calling"
+                    {:s-list s-list})))
+  (let [sizes (mapv #(inc (alength (.getBytes ^String % "UTF-8"))) s-list)
+        slots (* 4 (inc (count s-list)))
+        base  (long (address-as-int (malloc (+ slots (reduce + sizes)))))
+        addrs (vec (butlast (reductions + (+ base slots) sizes)))]
+    (with-current-module [m]
+      (let [to-utf8 (.getMember m "stringToUTF8")]
+        (dotimes [i (count s-list)]
+          (.execute to-utf8 (object-array [(nth s-list i) (nth addrs i) (nth sizes i)]))))
+      (write-pointer-slots! m base (conj addrs 0))
+      (.asValue (.getContext m) base))))
 
 (defn free-on-heap
   "Free wasm heap pointer `ptr`. A nil `ptr` does nothing."

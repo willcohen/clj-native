@@ -8,6 +8,7 @@
   "JVM tests for the platform HTTP transport, against a local HttpServer that
    echoes request headers back and honors Range requests."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.tools.logging.test :as lt]
             [net.willcohen.native.http :as http])
   (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
            [java.net InetSocketAddress]
@@ -71,27 +72,31 @@
     (testing "Set-Cookie keeps the first value rather than a corrupt comma join"
       (is (= "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT" (get h "set-cookie"))))))
 
-(deftest range-request-sends-range-and-returns-slice
-  (let [res (http/range-request {:url (str *base* "/range") :offset 2 :size 3})]
-    (is (= 206 (:status res)))
-    (is (= "CDE" (String. ^bytes (:body-bytes res))))))
+(deftest range-request-returns-the-slice
+  ;; Size 1 is the smallest range; a double offset once threw in format.
+  (doseq [[offset size want] [[2 3 "CDE"] [2 1 "C"] [2.0 3 "CDE"]]]
+    (let [res (http/range-request {:url (str *base* "/range") :offset offset :size size})]
+      (is (= 206 (:status res)))
+      (is (= want (String. ^bytes (:body-bytes res)))))))
 
-(deftest range-request-rejects-a-size-below-one
+(deftest range-request-rejects-a-bad-range
   ;; A server may answer the reversed range bytes=2-1 with 200 and the whole
   ;; body, which the clj-proj PROJ callbacks accept as a range read.
-  (testing "a zero size throws rather than emitting a reversed range"
+  (doseq [[offset size] [[2 0] [2 -3] [-1 3]]]
     (is (thrown? clojure.lang.ExceptionInfo
-                 (http/range-request {:url (str *base* "/range") :offset 2 :size 0}))))
-  (testing "a negative size throws"
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (http/range-request {:url (str *base* "/range") :offset 2 :size -3}))))
-  (testing "a negative offset throws"
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (http/range-request {:url (str *base* "/range") :offset -1 :size 3}))))
-  (testing "a size of exactly one is the smallest legal request"
-    (let [res (http/range-request {:url (str *base* "/range") :offset 2 :size 1})]
-      (is (= 206 (:status res)))
-      (is (= "C" (String. ^bytes (:body-bytes res)))))))
+                 (http/range-request {:url (str *base* "/range") :offset offset :size size}))
+        (str "offset " offset ", size " size))))
+
+(deftest fetch-keeps-the-interrupt-of-the-caller
+  (lt/with-log
+    ;; Read the flag before `is`, whose STM report counter clears it.
+    (let [res  (do (.interrupt (Thread/currentThread))
+                   (http/fetch {:url (str *base* "/plain")}))
+          flag (Thread/interrupted)]
+      (is (= 0 (:status res)))
+      (is flag)
+      (is (lt/logged? 'net.willcohen.native.http :warn InterruptedException
+                      #"HTTP request failed")))))
 
 (deftest fetch-reports-a-transport-failure-as-status-0
   (testing "an unreachable host is status 0 with an empty header map"

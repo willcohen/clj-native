@@ -14,7 +14,8 @@
 ### Changed
 
 - Clojure 1.12.6, dtype-next 11.026, GraalVM 25.3.4.1, Node.js 22 or later.
-- GraalVM reads a NULL string as nil.
+- GraalVM reads a NULL string as nil, and a ccall that throws makes `call!`
+  throw, as on FFI.
 
 ### Removed
 

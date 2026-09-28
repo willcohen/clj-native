@@ -62,7 +62,14 @@
       (is (identical? a b) "same library-key returns the existing context")
       (is (= a (get @w/contexts ::idem)))
       (is (nil? (get @w/contexts ::never-registered)))
-      (finally (swap! w/contexts dissoc ::idem)))))
+      (finally (swap! w/contexts dissoc ::idem))))
+  (testing "racing first calls get one context"
+    (try
+      (let [start (java.util.concurrent.CountDownLatch. 1)
+            fs    (doall (repeatedly 32 #(future (.await start) (w/create-wasm-context! ::race))))]
+        (.countDown start)
+        (is (= 1 (count (distinct (map (comp System/identityHashCode deref) fs))))))
+      (finally (swap! w/contexts dissoc ::race)))))
 
 (deftest malloc-hands-out-distinct-usable-addresses
   (on-module
@@ -74,7 +81,10 @@
          "consecutive allocations do not overlap")
      (testing "free-on-heap accepts a pointer and is nil-safe"
        (is (nil? (w/free-on-heap nil)))
-       (w/free-on-heap a)))))
+       (w/free-on-heap a))
+     (testing "a size that an i32 cannot hold throws, not wraps"
+       (is (thrown? clojure.lang.ExceptionInfo (w/malloc 5000000000)))
+       (is (thrown? clojure.lang.ExceptionInfo (w/malloc -1)))))))
 
 (deftest string-round-trips-through-the-heap
   (on-module
@@ -85,15 +95,26 @@
    (testing "the empty string"
      (is (= "" (w/pointer->string (w/allocate-string-on-heap "")))))
    (testing "nil in, nil out -- no allocation"
-     (is (nil? (w/allocate-string-on-heap nil))))))
+     (is (nil? (w/allocate-string-on-heap nil))))
+   (testing "NULL reads as nil, as on FFI"
+     (is (nil? (w/pointer->string 0)))
+     (is (= [] (w/string-array-pointer->strs 0))))))
 
 (deftest string-list-to-native-array-builds-a-walkable-char**
   (on-module
    (testing "the array walks to its NULL terminator"
      (let [arr (w/string-list-to-native-array ["alpha" "beta" "gamma"])]
        (is (= ["alpha" "beta" "gamma"] (w/string-array-pointer->strs arr)))))
-   (testing "an empty list is the null pointer, not an allocation"
-     (is (zero? (w/address-as-int (w/string-list-to-native-array [])))))
+   (testing "one allocation, so one free-on-heap releases the array"
+     (let [n (atom 0)
+           malloc w/malloc]
+       (with-redefs [w/malloc (fn [b] (swap! n inc) (malloc b))]
+         (w/string-list-to-native-array ["alpha" "beta"]))
+       (is (= 1 @n))))
+   (testing "an empty list is a one-slot NULL array, as on FFI"
+     (let [arr (w/string-list-to-native-array [])]
+       (is (pos? (w/address-as-int arr)))
+       (is (= [] (w/string-array-pointer->strs arr)))))
    (testing "a nil element throws rather than writing an unrepresentable char*"
      (is (thrown? clojure.lang.ExceptionInfo
                   (w/string-list-to-native-array ["ok" nil "also ok"]))))))
@@ -188,7 +209,7 @@
   (let [loaded (w/create-wasm-context! ::multi-loaded)
         empty' (w/create-wasm-context! ::multi-empty)]
     (try
-      (w/set-module! loaded (w/get-module @ctx))
+      (reset! (:module-ref loaded) (w/get-module @ctx))
       (testing "the bound context supplies the module"
         (is (pos? (w/address-as-int (w/with-wasm-context loaded (w/malloc 8))))))
       (testing "binding a context whose bootstrap has not run throws"
@@ -211,7 +232,7 @@
   (testing "exactly one registered is the documented fallback -- no binding needed"
     (with-redefs [w/contexts (atom {})]
       (let [only (w/create-wasm-context! ::sole)]
-        (w/set-module! only (w/get-module @ctx))
+        (reset! (:module-ref only) (w/get-module @ctx))
         (is (pos? (w/address-as-int (w/malloc 8))))))))
 
 ;; test/fixtures/graal-load-loader.mjs returns a module that reports what its
@@ -266,6 +287,30 @@
 (deftest bootstrap-surfaces-a-rejected-load
   (is (thrown? java.util.concurrent.ExecutionException
                (boot-load-fixture ::load-throw {"mode" "throw"}))))
+
+(defn- boot-result
+  "What a bootstrap with `opts` gives within 5 s: the module, a Throwable, or
+   ::timeout."
+  [lib opts]
+  (let [c (w/create-wasm-context! lib)]
+    (try
+      (deref (future (try (w/bootstrap-graal-module! c opts) (catch Throwable t t)))
+             5000 ::timeout)
+      (finally (swap! w/contexts dissoc lib)))))
+
+(deftest bootstrap-refuses-a-loader-that-gives-no-module
+  (is (instance? Throwable
+                 (boot-result ::empty-success
+                              {:loader-module-url (-> (java.io.File. "test/fixtures/graal-empty-success.mjs") .toURI .toURL)}))
+      "onSuccess with no module")
+  (is (instance? Throwable
+                 (boot-result ::load-undefined {:loader-module-url (load-loader-url)
+                                                :init-opts {"mode" "undefined"}}))
+      "a load that resolves to undefined")
+  (is (instance? Throwable
+                 (boot-result ::load-never {:loader-module-url (load-loader-url)
+                                            :init-opts {"mode" "never"}}))
+      "a load whose promise never settles"))
 
 (deftest bootstrap-rejects-a-module-that-is-not-a-loader
   (let [c (w/create-wasm-context! ::no-load-fn)
@@ -577,8 +622,7 @@
     (is (= 3000000000 r) "all 64 bits, above 2^31")))
 
 (deftest graal-leg-sends-an-int64-argument-as-a-bigint
-  ;; A WASM_BIGINT module rejects a JS number for an i64 parameter, and
-  ;; jvm-graal-call then logs the TypeError and gives nil.
+  ;; A WASM_BIGINT module rejects a JS number for an i64 parameter.
   (let [lib (dispatch/library {:key lib-key
                                :fndefs {:i64_echo {:rettype :int64
                                                    :argtypes [[:v :int64]]}}
@@ -590,6 +634,12 @@
     (is (= 1 (on-module (dispatch/call! lib :i64_echo [nil])))
         "nil goes in as 0")))
 
+(deftest call!-on-graal-throws-when-the-ccall-throws
+  ;; jvm-graal-call logged the exception and gave nil, which hid a clj-gdal
+  ;; OGR_F_SetFieldInteger64 write that never happened.
+  (let [lib (dispatch/library {:key lib-key :impl-atom (atom :graal)
+                               :fndefs {:i64_echo {:rettype :int64 :argtypes [[:v :int32]]}}})]
+    (is (thrown-with-msg? Exception #"i64_echo" (on-module (dispatch/call! lib :i64_echo [7]))))))
 (defn- jar-with-modules
   "A temp jar that holds each {path text} entry of `entries`."
   ^java.io.File [entries]

@@ -404,26 +404,35 @@
         "busy wrap probes the heap once per emitted BUSY event when on")
     (reset-substrate!)))
 
+(defn- failing-init
+  "An init with no await. It counts its runs in `attempts` and throws unless
+   its args carry `ok`."
+  [attempts]
+  (fn init-fn [args]
+    (swap! attempts inc)
+    (when-not (.-ok args)
+      (throw (js/Error. "missing required arg `ok`")))))
+
+(defn- async-init
+  "`init` in an async fn, so its throw becomes a rejection."
+  [init]
+  (fn ^:async async-init-fn [args] (init args)))
+
 (deftest ^:async init-failure-rolls-state-back-so-subsequent-calls-can-retry
-  ;; A failed init must clear cachedFingerprint and initPromise, so a retry
-  ;; with corrected args is not rejected as a re-init.
-  (let [attempts (atom 0)
-        factory (makeHandler
-                 #js {:fingerprint (fn [] "")
-                      :init (fn ^:async init-fn [args]
-                              (swap! attempts inc)
-                              (when-not (.-ok args)
-                                (throw (js/Error. "missing required arg `ok`"))))
-                      :methods #js {:ping (fn ^:async ping [] "pong")}})]
-    (try
-      (await (factory #js {:ok false}))
-      (is false "first call should reject")
-      (catch :default e
-        (is (re-find #"missing required arg" (.-message e)))))
-    (let [h (await (factory #js {:ok true}))]
-      (is (= "pong" (await (.ping h)))))
-    (is (= 2 @attempts)
-        "init must run twice: once for the failed attempt, once for the retry")))
+  ;; A failed init must clear the fingerprint and initPromise, so a retry with
+  ;; corrected args is not rejected as a re-init. A sync init that threw once
+  ;; left initPromise set, and every retry failed.
+  (doseq [[why wrap-init] [["async init" async-init] ["sync init" identity]]]
+    (let [attempts (atom 0)
+          factory (makeHandler
+                   #js {:init (wrap-init (failing-init attempts))
+                        :fingerprint (fn [] "")
+                        :methods #js {:ping (fn ^:async ping [] "pong")}})]
+      (is (thrown-with-msg? js/Error #"missing required arg"
+                            (await (factory #js {:ok false})))
+          why)
+      (is (= "pong" (await (.ping (await (factory #js {:ok true}))))) why)
+      (is (= 2 @attempts) why))))
 
 (deftest importing-the-runtime-keeps-the-default-exit
   ;; A pool worker that crashes must exit nonzero, or worker-router cannot

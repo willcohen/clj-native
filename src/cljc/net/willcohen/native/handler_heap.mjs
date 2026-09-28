@@ -18,11 +18,22 @@ const moduleOrThrow = (getModule) => {
   return mod;
 };
 
+// The same checks as graal-wasm/malloc. _malloc takes an i32, so a larger size
+// wraps, and a failed _malloc returns 0.
+const checkedMalloc = (mod, size) => {
+  if (!(size >= 0 && size < 2 ** 31)) {
+    throw new RangeError('handler-heap: malloc size out of range: ' + size);
+  }
+  const ptr = mod._malloc(size);
+  if (ptr === 0 && size > 0) throw new Error('handler-heap: malloc of ' + size + ' bytes failed');
+  return ptr;
+};
+
 export const heapHelpers = (getModule) => {
   const m = () => moduleOrThrow(getModule);
 
   const out = {
-    malloc: async (size) => m()._malloc(size),
+    malloc: async (size) => checkedMalloc(m(), size),
     free: async (ptr) => { m()._free(ptr); return { ok: true }; },
 
     get_value: async (ptr, type) => m().getValue(ptr, type),

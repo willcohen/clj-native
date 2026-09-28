@@ -210,8 +210,31 @@ export function makeHandler({
   };
 
   let cachedFingerprint = null;
-  let cachedHandler = null;
   let initPromise = null;
+
+  const build = async (initArgs) => {
+    if (typeof init === 'function') {
+      await init(initArgs, { attachEmscriptenModule(m) { emscriptenModule = m; } });
+    }
+    const wrapped = {};
+    for (const name of Object.keys(methods)) {
+      wrapped[name] = wrap(name, methods[name]);
+    }
+    // Reserved name. The :handler-runtime broadcast of init-pool! calls it. It
+    // bypasses wrap(), so it does not wait behind in-flight calls.
+    wrapped.__setLogConfig = setLogConfig;
+    // Reserved name. init-pool! calls it once per worker, and later events
+    // carry `slot=N`. It records the slot while logging is off too.
+    wrapped.__setWorkerSlot = (s) => { slot = s; };
+    return wrapped;
+  };
+
+  // Roll back to let the caller retry with corrected args.
+  const rollback = (e) => {
+    cachedFingerprint = null;
+    initPromise = null;
+    throw e;
+  };
 
   const factory = async (initArgs) => {
     // A worker is a separate JS context that a host setLogConfig cannot
@@ -221,45 +244,14 @@ export function makeHandler({
       setLogConfig({ level: hr.logLevel, categories: hr.logCategories });
     }
     const print = fingerprint(initArgs);
-    if (cachedHandler !== null) {
-      if (print !== cachedFingerprint) {
-        throw new Error(
-          `makeHandler: re-init with different args (cached fingerprint ${cachedFingerprint}, got ${print})`,
-        );
-      }
-      return cachedHandler;
-    }
     if (initPromise === null) {
       cachedFingerprint = print;
-      initPromise = (async () => {
-        try {
-          if (typeof init === 'function') {
-            await init(initArgs, { attachEmscriptenModule(m) { emscriptenModule = m; } });
-          }
-          const wrapped = {};
-          for (const name of Object.keys(methods)) {
-            wrapped[name] = wrap(name, methods[name]);
-          }
-          // Reserved name. The :handler-runtime broadcast of init-pool! calls
-          // it. It bypasses wrap(), so it does not wait behind in-flight calls.
-          wrapped.__setLogConfig = setLogConfig;
-          // Reserved name. init-pool! calls it once per worker, and later
-          // events carry `slot=N`. It records the slot while logging is off
-          // too.
-          wrapped.__setWorkerSlot = (s) => { slot = s; };
-          cachedHandler = wrapped;
-          return wrapped;
-        } catch (e) {
-          // Roll back to let the caller retry with corrected args.
-          cachedFingerprint = null;
-          cachedHandler = null;
-          initPromise = null;
-          throw e;
-        }
-      })();
+      // build is async, so an init that throws with no await still rejects,
+      // and rollback runs after this assignment.
+      initPromise = build(initArgs).catch(rollback);
     } else if (print !== cachedFingerprint) {
       throw new Error(
-        `makeHandler: re-init with different args while init in flight (pending fingerprint ${cachedFingerprint}, got ${print})`,
+        `makeHandler: re-init with different args (cached fingerprint ${cachedFingerprint}, got ${print})`,
       );
     }
     return initPromise;

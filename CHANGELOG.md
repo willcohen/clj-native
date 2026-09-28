@@ -31,8 +31,9 @@
 - GraalVM starts from a jar and reads `/dev/urandom`.
 - `extract-archive` leaves no partial dir when tar fails. It reads tar only.
 - A host with no packaged native lib falls back to GraalVM.
-- A handler init that throws fails its task. A shutdown and a start wait for
-  each other.
+- A handler init that throws fails its task, and a sync one can retry. A
+  shutdown and a start wait for each other. `malloc` throws when it cannot
+  allocate.
 - HTTP bridge: a late response no longer loses the next request, and a
   crashed fetch worker keeps the count of its users.
 - A crashed Node worker and a drained test run exit 1.

@@ -64,6 +64,16 @@
     (is (true? (.-ok (await ((.-free heap) ptr)))))
     (is (= [ptr] @freed))))
 
+(deftest ^:async malloc-throws-when-the-module-cannot-allocate
+  ;; _malloc takes an i32, so 5e9 once allocated 705032704 bytes. A failed
+  ;; _malloc returns 0, and callers once wrote through address 0.
+  (let [{:keys [module]} (fake-module)
+        heap (heapHelpers (fn [] module))]
+    (is (thrown? js/RangeError (await ((.-malloc heap) 5e9))))
+    (set! (.-_malloc module) (fn [_] 0))
+    (is (thrown-with-msg? js/Error #"malloc of 16 bytes failed"
+                          (await ((.-malloc heap) 16))))))
+
 (deftest ^:async get-value-and-set-value-round-trip
   (let [{:keys [module]} (fake-module)
         heap (heapHelpers (fn [] module))]

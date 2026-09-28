@@ -4,51 +4,48 @@
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 (ns net.willcohen.native.handler-paths-test
-  "Coverage for handler-paths against the real filesystem.
-
-   resolveAsset exists because the same probe is off-by-one prone in every
-   consumer, so the tests use real directories rather than a stubbed existsSync:
-   a wrong number of levels has to actually fail. The suite writes its own
-   temporary tree, and reads test/fixtures through a relative candidate list
-   resolved from this compiled test file's own location."
+  "Tests of handler-paths against real directories, since a stubbed existsSync
+   cannot catch a wrong level count."
   (:require [cljs.test :refer [deftest is testing]]
             ["ffi-wasm/handler-paths" :refer [resolveAsset loadEmscriptenModule]]
             ["ffi-wasm/test-runner" :as tr]
-            ["node:fs" :refer [mkdirSync mkdtempSync writeFileSync]]
+            ["node:fs" :refer [mkdirSync mkdtempSync rmSync writeFileSync]]
             ["node:os" :refer [tmpdir]]
             ["node:path" :refer [join]]))
 
 (def ^:private here (.-url js/import.meta))
 
 ;; This file compiles to test/cljs/net/willcohen/native/, so test/fixtures is
-;; four levels up. A shorter or longer climb is exactly the mistake resolveAsset
-;; is meant to make loud, so the count is spelled out rather than derived.
+;; four levels up. The count is literal, since a wrong climb is the bug to catch.
 (def ^:private fixtures-candidates #js [#js [".." ".." ".." ".." "fixtures"]])
 
-(defn- temp-tree!
-  "Create <tmp>/a and <tmp>/b, put `name` in whichever of them `in` names, and
-   return the two absolute dirs. Left behind for the OS to reap; a test that
-   removed it would race the next one's probe."
-  [name in]
+(defn- ^:async with-temp-tree
+  "Create <tmp>/a and <tmp>/b, put `name` in the one `in` names, await
+   (f {:a dir :b dir}), then remove the tree."
+  [name in f]
   (let [root (mkdtempSync (join (tmpdir) "handler-paths-test-"))
         a (join root "a")
         b (join root "b")]
     (mkdirSync a)
     (mkdirSync b)
     (writeFileSync (join (if (= in :a) a b) name) "x")
-    {:root root :a a :b b}))
+    (try
+      (await (f {:a a :b b}))
+      (finally (rmSync root #js {:recursive true :force true})))))
 
 (deftest ^:async resolve-asset-returns-the-first-candidate-holding-the-name
-  (let [{:keys [a b]} (temp-tree! "found.dat" :a)
-        r (await (resolveAsset here "found.dat" #js [a b]))]
-    (is (= a (.-dir r)) "the first hit wins")
-    (is (= (join a "found.dat") (.-path r))
-        "path is the dir joined with the name, ready to open")))
+  (await (with-temp-tree "found.dat" :a
+           (fn ^:async first-hit [{:keys [a b]}]
+             (let [r (await (resolveAsset here "found.dat" #js [a b]))]
+               (is (= a (.-dir r)) "the first hit wins")
+               (is (= (join a "found.dat") (.-path r))
+                   "path is the dir joined with the name, ready to open"))))))
 
 (deftest ^:async resolve-asset-falls-through-a-miss-to-a-later-candidate
-  (let [{:keys [a b]} (temp-tree! "later.dat" :b)
-        r (await (resolveAsset here "later.dat" #js [a b]))]
-    (is (= b (.-dir r)) "an empty earlier candidate is skipped, not fatal")))
+  (await (with-temp-tree "later.dat" :b
+           (fn ^:async later-hit [{:keys [a b]}]
+             (let [r (await (resolveAsset here "later.dat" #js [a b]))]
+               (is (= b (.-dir r)) "an empty earlier candidate is skipped, not fatal"))))))
 
 (deftest ^:async resolve-asset-accepts-segment-arrays-and-relative-strings
   (testing "an array of segments resolves against the caller's own directory"
@@ -60,16 +57,17 @@
       (is (.endsWith (.-dir r) (join "test" "fixtures"))))))
 
 (deftest ^:async resolve-asset-lists-every-probed-path-when-it-misses
-  (let [{:keys [a b]} (temp-tree! "elsewhere.dat" :a)]
-    (try
-      (await (resolveAsset here "absent.dat" #js [a b]))
-      (is false "resolveAsset should have thrown")
-      (catch :default e
-        (let [msg (.-message e)]
-          (is (.includes msg "absent.dat"))
-          (testing "both probed dirs are named, so the caller can see the miss"
-            (is (.includes msg a))
-            (is (.includes msg b))))))))
+  (await (with-temp-tree "elsewhere.dat" :a
+           (fn ^:async miss [{:keys [a b]}]
+             (try
+               (await (resolveAsset here "absent.dat" #js [a b]))
+               (is false "resolveAsset should have thrown")
+               (catch :default e
+                 (let [msg (.-message e)]
+                   (is (.includes msg "absent.dat"))
+                   (testing "both probed dirs are named, so the caller can see the miss"
+                     (is (.includes msg a))
+                     (is (.includes msg b))))))))))
 
 (deftest ^:async resolve-asset-guards-its-arguments
   (testing "the name must be a non-empty string"

@@ -4,9 +4,8 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: a module that is not a loader. It exports a plausible name and
-// a value under the right name, so the suite pins that bootstrap-graal-module!
-// rejects on a missing EXECUTABLE load/initialize rather than on a missing key.
+// Test fixture: not a loader. `initialize` exists but is not a function, so
+// bootstrap-graal-module! must check for an executable member.
 
 export const setup = () => ({ ok: true });
 export const initialize = 'not a function';

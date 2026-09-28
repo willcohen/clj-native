@@ -4,16 +4,9 @@
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 (ns net.willcohen.native.platform-state-test
-  "Dual-runtime coverage for platform-state's pure predicates and the
-   two-atom force/impl transitions. Every fn takes atoms or plain values
-   as arguments, so one body exercises identical logic under JVM
-   clojure.test and squint cljs.test. The one genuine platform
-   divergence -- null-ptr? treating 0 as null on cljs/wasm but as a
-   valid pointer on JVM dt-ffi -- is pinned behind a reader conditional.
-
-   try-init! is JVM-only, so its branch tests sit under :clj. Both
-   bootstrap fns are supplied by the test, so all three branches run on a
-   clean checkout with no native or wasm resources present."
+  "Tests of platform-state's predicates and force/impl transitions under JVM
+   clojure.test and squint cljs.test. The JVM-only try-init! tests supply both
+   bootstrap fns, so they need no native or wasm resources."
   (:require #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing]])
             #?(:clj  [net.willcohen.native.platform-state :as ps]
@@ -57,9 +50,8 @@
 
 #?(:clj
    (defn- silently
-     "Run f with stdout captured and System/err muted; returns f's value.
-      try-init!'s fallback branch prints a diagnostic block and a stack trace
-      unconditionally, which would otherwise bury the test report."
+     "Run `f` with stdout captured and System/err muted, and return its value.
+      try-init!'s fallback prints a stack trace that would bury the report."
      [f]
      (let [saved System/err
            result (atom nil)]
@@ -79,26 +71,16 @@
        (is (= [:ffi] @ran) "the graal bootstrap never ran"))))
 
 #?(:clj
-   (deftest try-init!-falls-back-to-graal-when-the-ffi-bootstrap-throws
+   (deftest try-init!-falls-back-to-graal-on-an-error
+     ;; A missing native library throws UnsatisfiedLinkError, which an
+     ;; Exception catch would let escape.
      (let [impl (atom nil) force (atom false) ran (atom [])]
        (is (= :graal (silently #(ps/try-init! impl force false
                                               (fn [] (swap! ran conj :ffi)
-                                                (throw (ex-info "no ffi here" {})))
+                                                (throw (UnsatisfiedLinkError. "no such library")))
                                               (fn [] (swap! ran conj :graal))))))
        (is (= :graal @impl))
-       (is (= [:ffi :graal] @ran) "ffi is attempted first, then graal picks up"))))
-
-#?(:clj
-   (deftest try-init!-falls-back-on-an-error-not-just-an-exception
-     ;; The catch is Throwable on purpose: a missing or incompatible native
-     ;; library surfaces as UnsatisfiedLinkError, which an Exception catch
-     ;; would let escape and take the whole init down instead of falling back.
-     (let [impl (atom nil) force (atom false) ran (atom [])]
-       (is (= :graal (silently #(ps/try-init! impl force false
-                                              (fn [] (throw (UnsatisfiedLinkError. "no such library")))
-                                              (fn [] (swap! ran conj :graal))))))
-       (is (= :graal @impl))
-       (is (= [:graal] @ran)))))
+       (is (= [:ffi :graal] @ran)))))
 
 #?(:clj
    (deftest try-init!-honors-force-graal-without-attempting-ffi

@@ -5,24 +5,16 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.platform-test
-  "Tests for the library-agnostic platform helpers. The native-fn resolvers are
-   exercised against clojure.core (which has interned Vars) so no external native
-   library is needed -- the resolution mechanics are identical to resolving a
-   dt-ffi define-library-functions Var by fndef key.
-
-   Extraction is exercised against fixture resources under test/resources, which
-   the :test alias puts on the classpath. Host detection is pinned to
-   linux/amd64 for those tests so one committed fixture path works on every
-   machine; get-os and get-arch have their own tests above."
+  "Tests of the library-agnostic platform helpers. The resolvers run against
+   clojure.core. Extraction runs against test/resources with the host pinned
+   to linux/amd64, so one fixture path works on every machine."
   (:require [clojure.test :refer [deftest is testing]]
             [net.willcohen.native.platform :as platform]
             [tech.v3.datatype.ffi :as dt-ffi])
   (:import [java.io File]))
 
 (deftest get-os-arch
-  ;; Asserting only keyword? cannot fail short of a crash. These arms pin the
-  ;; value against the running JVM's own properties, so a broken branch in
-  ;; either cond/case shows up as a wrong answer rather than as a keyword.
+  ;; Compare with the JVM's own properties, since keyword? alone cannot fail.
   (testing "get-os agrees with os.name on the machine running the suite"
     (let [os-name (.toLowerCase (System/getProperty "os.name"))
           vendor  (.toLowerCase (System/getProperty "java.vendor"))]
@@ -69,16 +61,8 @@
       (is (identical? (r :inc) (r :inc))))))
 
 (deftest call-native-fn-maps-a-null-const-char*-return-to-nil
-  ;; dt-ffi gives the generated wrapper nil for a NULL const char* return.
-  ;; c->string calls ->pointer first. PToPointer has no nil extension.
-  ;; The throw message contains "PToPointer". This test simulates that
-  ;; failure, because clj-native has no live native library.
-  ;;
-  ;; The simulated message is the same one the implementation sniffs for, so
-  ;; this arm cannot show that a real dt-ffi still throws that text. It pins
-  ;; the branch, not the upstream behavior. The live path is covered by
-  ;; clj-proj's FFI lane, by declared intent: that is where a real library
-  ;; returns a NULL const char*.
+  ;; dt-ffi throws a PToPointer error for a NULL const char* return. This
+  ;; simulates that error, so it cannot show that dt-ffi still throws it.
   (let [thrower (fn [& _]
                   (throw (IllegalArgumentException.
                           "No implementation of method: :->pointer of protocol: #'tech.v3.datatype.ffi/PToPointer found for class: nil")))]
@@ -106,9 +90,7 @@
     (is (= "z" (platform/libname-from-file (File. "/tmp/x/libz.so.1"))))
     (is (= "z" (platform/libname-from-file (File. "/tmp/x/libz.so.1.3.1")))))
   (testing "lib strips as a prefix only"
-    ;; An interior lib run stays: tifflib.dll is the Windows name of libtiff,
-    ;; and glib-2.0.so keeps its whole name. Both are shapes a caller could
-    ;; pass; neither has a leading lib to strip.
+    ;; tifflib.dll is the Windows name of libtiff.
     (is (= "tifflib" (platform/libname-from-file (File. "/tmp/x/tifflib.dll"))))
     (is (= "glib-2.0" (platform/libname-from-file (File. "/tmp/x/glib-2.0.so"))))))
 
@@ -234,11 +216,8 @@
       (is (= "nested entry\n" (slurp (File. ^String path "extract-test/nested/b.txt")))))))
 
 (deftest extract-and-bind-library-accepts-a-resource-dir-without-a-trailing-slash
-  ;; resource-dir-files gives back paths relative to the directory, so the
-  ;; separator has to come from somewhere. Unnormalized, "extract-test" plus
-  ;; "a.txt" reads as the resource "extract-testa.txt", the copy throws
-  ;; FileNotFoundException, and extract-and-bind-library! turns that into {} --
-  ;; a silent whole-extraction failure from one missing character.
+  ;; Unnormalized, "extract-test" plus "a.txt" reads as "extract-testa.txt",
+  ;; and the whole extraction silently returns {}.
   (let [{:keys [path]} (extract-fixture-library!
                         {:lib-basename    "libextracttest"
                          :fn-defs-var     #'platform/default-library-suffixes
@@ -248,14 +227,8 @@
     (is (= "nested entry\n" (slurp (File. ^String path "extract-test/nested/b.txt"))))))
 
 (deftest extracted-files-are-readable-whatever-the-umask-is
-  ;; The permission calls used to run before the copy, where File.setReadable
-  ;; and friends fail and return false on a path that does not exist. The
-  ;; extracted library was readable only because the default umask made it so.
-  ;;
-  ;; Only the canExecute arm can be driven red by moving the calls back: a
-  ;; usual umask already leaves the file rw-r--r--, so canRead holds either
-  ;; way. It stays because the umask is the thing under test, and a caller
-  ;; running under a restrictive one has no other assertion covering it.
+  ;; File.setReadable fails on a path that does not exist yet, so the
+  ;; permission calls must follow the copy.
   (let [{:keys [file]} (extract-fixture-library!
                         {:lib-basename "libextracttest"
                          :fn-defs-var  #'platform/default-library-suffixes})]
@@ -297,10 +270,8 @@
        (filter #(and (seq? %) (= 'clojure.core/defn (first %))))))
 
 (deftest define-library-fns-interns-one-var-per-fndef
-  ;; The generated Vars are reached the way a consumer reaches them, through
-  ;; resolve-native-fn over the namespace it names as :ffi-impl-ns. That is
-  ;; also why they are never written as literal symbols here: nothing resolves
-  ;; them until load time.
+  ;; Reach the Vars as a consumer does, through resolve-native-fn, since they
+  ;; do not exist until load time.
   (let [demo-ns 'net.willcohen.native.platform-test
         add     (platform/resolve-native-fn demo-ns :demo_add)
         nm      (platform/resolve-native-fn demo-ns :demo_name)]
@@ -312,10 +283,8 @@
       (is (= '([lhs rhs]) (:arglists (meta add))))
       (is (= '([ctx]) (:arglists (meta nm)))))
     (testing "the Var is bound late through the singleton in the state atom"
-      ;; The singleton was never bound to a library, so dt-ffi reports that.
-      ;; Reaching this message proves the generated Var routes through
-      ;; library-fn-finder into the state atom rather than into a stub. Calls
-      ;; against a real library are covered by each consumer's own FFI lane.
+      ;; The singleton has no bound library, so this dt-ffi error shows the Var
+      ;; routes through the state atom.
       (is (thrown-with-msg? Exception #"Library instance not found"
                             (@add 1 2))))))
 

@@ -4,16 +4,8 @@
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 (ns net.willcohen.native.handler-heap-test
-  "Coverage for handler-heap's methods object and its plain ccall method.
-
-   The stand-in module is backed by one real ArrayBuffer with all eight
-   emscripten heap views over it, so a write through one view is visible
-   through another and the get/set pairs are tested against real memory rather
-   than a recorded call list. Every method is async, as handler-runtime
-   requires, so each assertion awaits.
-
-   The late-binding thunk is under test too: the object is built while getModule
-   still returns null, which is the order a consumer builds it in."
+  "Tests of handler-heap's methods object and ccall method, against a stand-in
+   module with real heap views over one ArrayBuffer."
   (:require [cljs.test :refer [deftest is testing]]
             ["ffi-wasm/handler-heap" :refer [heapHelpers ccallMethod]]
             ["ffi-wasm/test-runner" :as tr]))
@@ -38,9 +30,7 @@
     (set! (.-HEAPF64 m) (js/Float64Array. buffer))
     (set! (.-_malloc m) (fn [size] (let [p @bump] (swap! bump + (max 8 size)) p)))
     (set! (.-_free m) (fn [ptr] (swap! freed conj ptr) nil))
-    ;; "*" is a pointer slot. On wasm32 that is the same 4-byte read as i32,
-    ;; and emscripten treats it that way too. read_string_array walks slots
-    ;; with "*", so the stand-in has to answer it.
+    ;; read_string_array reads slots as "*", the same 4-byte read as i32 on wasm32.
     (set! (.-getValue m) (fn [ptr type]
                            (case type
                              ("i32" "*") (aget (.-HEAP32 m) (bit-shift-right ptr 2))
@@ -106,10 +96,8 @@
 (deftest ^:async a-heap-offset-counts-elements-not-bytes
   (let [{:keys [module]} (fake-module)
         heap (heapHelpers (fn [] module))]
-    ;; The offset indexes the typed-array view, so the same bytes sit at
-    ;; different offsets depending on which view reaches them. Worth pinning:
-    ;; a caller reading a wide view at a byte offset gets the wrong window, and
-    ;; on a large enough offset a RangeError instead of bad data.
+    ;; A caller that passes a byte offset to a wide view gets the wrong window,
+    ;; or a RangeError.
     (await ((.-heapu8_set heap) 8 (js/Uint8Array. #js [1 0 0 0])))
     (is (= [1] (vec (js/Array.from (await ((.-heap32_get heap) 2 1)))))
         "byte 8 is element 2 of HEAP32")
@@ -133,9 +121,8 @@
           "a later heap write does not reach the copy, so it survives a free"))))
 
 (deftest ^:async the-shared-ok-result-is-frozen
-  ;; Every method with nothing to return answers with one shared object. If a
-  ;; caller could write to it, that write would change the answer every later
-  ;; call gives. The freeze turns such a write into an error instead.
+  ;; Methods with nothing to return share one result object, so a write to it
+  ;; would change every later answer.
   (let [{:keys [module]} (fake-module)
         heap (heapHelpers (fn [] module))
         r (await ((.-free heap) 8))]
@@ -156,9 +143,8 @@
         "the same object works once init has resolved the module")))
 
 (defn- ^:async write-string-array!
-  "Write each string of `strs` into the heap, then a NUL-terminated table of
-   pointers to them at `table-ptr`. Returns nothing. The caller picks the
-   addresses, so a test can place an entry on purpose."
+  "Write each of `strs` at its address in `addrs`, then a NULL-terminated
+   pointer table at `table-ptr`."
   [heap table-ptr addrs strs]
   (doseq [[addr s] (map vector addrs strs)]
     (await ((.-string_to_utf8 heap) s addr (inc (count s)))))
@@ -180,9 +166,8 @@
         "a null char** is an empty list, and not a walk from address 0")))
 
 (deftest ^:async an-empty-string-entry-is-not-the-terminator
-  ;; The terminator is a NULL SLOT. A slot that points at a lone NUL byte is a
-  ;; present, empty string. Confusing the two truncates the list at the first
-  ;; empty entry, and the caller never learns that it lost the tail.
+  ;; The terminator is a NULL slot. Treating an empty string as one silently
+  ;; truncates the list.
   (let [{:keys [module]} (fake-module)
         heap (heapHelpers (fn [] module))]
     (await (write-string-array! heap 400 [100 200 300] ["alpha" "" "gamma"]))

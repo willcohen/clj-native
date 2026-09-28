@@ -5,98 +5,72 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.platform-state
-  "Predicates and the init flow for the platform-selection state of each
-   consumer library. Each consumer owns two atoms:
-     impl-atom   The chosen impl keyword. On the JVM this is :ffi or :graal.
-                 On cljs this is :node, :browser or :unknown. It is nil
-                 before init.
-     force-atom  A boolean. When it is true, JVM init forces GraalVM even if
-                 FFI works.
+  "Platform-selection state of a consumer library, held in two atoms:
+     impl-atom   The chosen impl keyword, nil before init. The JVM uses :ffi
+                 or :graal. cljs uses :node, :browser or :unknown.
+     force-atom  When true, JVM init uses GraalVM even if FFI works.
 
-   Five keywords for three backends, because the two hosts answer two
-   different questions. :ffi and :graal name a MECHANISM, and try-init! below
-   picks between them at run time when it catches a Throwable. :node,
-   :browser and :unknown name a HOST ENVIRONMENT, and a cljs consumer sets
-   the value itself, because one JS backend serves every environment. So the
-   JVM discovers its backend, and the JS side declares its surroundings. The
-   asymmetry is deliberate. Do not collapse the two sets into one axis.
+   The JVM keywords name a mechanism that try-init! picks at run time. The
+   cljs keywords name a host that the consumer sets, because one JS backend
+   serves every host. Keep the two sets apart.
 
-   The two atoms MUST be defonce. Do not use def. dispatch/library captures
-   impl-atom by identity. It keeps that atom for the life of the library
-   value, which is itself a defonce.
-
-   A plain def gives a fresh atom each time the namespace reloads. The library
-   then reads the previous atom, while the predicates here read the new one.
-   Nothing fails. The two only disagree about which backend is in use. A REPL
-   reload is the usual path into this state, because a reload is how a
-   developer applies a change.")
+   Define both atoms with defonce. dispatch/library holds impl-atom by
+   identity, so after a REPL reload of a def the library and these
+   predicates read different atoms, with no error.")
 
 (defn ffi?
-  "Returns true if and only if impl-atom holds :ffi."
   [impl-atom]
   (= :ffi @impl-atom))
 
 (defn graal?
-  "Returns true if and only if impl-atom holds :graal."
   [impl-atom]
   (= :graal @impl-atom))
 
 (defn node?
-  "Returns true if and only if impl-atom holds :node."
   [impl-atom]
   (= :node @impl-atom))
 
 (defn force-graal!
-  "Set force-atom to true. Then clear impl-atom, so a subsequent init
-   runs again and chooses GraalVM."
+  "Force GraalVM, and clear impl-atom so the next init runs again."
   [impl-atom force-atom]
   (reset! force-atom true)
   (reset! impl-atom nil))
 
 (defn force-ffi!
-  "Set force-atom to false. Then clear impl-atom, so a subsequent init
-   runs again and chooses FFI. GraalVM stays as the fallback."
+  "Stop forcing GraalVM, and clear impl-atom. The next init tries FFI
+   first, with GraalVM as the fallback."
   [impl-atom force-atom]
   (reset! force-atom false)
   (reset! impl-atom nil))
 
 (defn toggle-graal!
-  "Set force-atom to the opposite of its current value. Then clear
-   impl-atom."
+  "Flip force-atom, and clear impl-atom."
   [impl-atom force-atom]
   (swap! force-atom not)
   (reset! impl-atom nil))
 
-;; FFI null-pointer convention. JVM dt-ffi returns nil for NULL. cljs and wasm
-;; return 0, and (nil? 0) is false. Thus a JVM (nil? ptr) check loops forever on
-;; cljs. One example is a loop over a next-record iterator that returns NULL at
-;; the end. Use null-ptr? and some-ptr? on all runtimes.
 (defn null-ptr?
-  "Returns true if and only if `p` is the null pointer for the current
-   runtime. JVM dt-ffi gives nil for NULL. cljs and wasm give 0."
+  "True when `p` is NULL for this runtime: nil on the JVM, nil or 0 on
+   cljs. Use it in place of nil?, which misses a cljs NULL and can make an
+   iterator loop run forever. A JVM :graal heap read gives 0 for NULL,
+   which this misses."
   [p]
   #?(:clj  (nil? p)
      :cljs (or (nil? p) (zero? p))))
 
 (defn some-ptr?
-  "The complement of null-ptr?. Returns true if and only if `p` is a
-   non-null pointer."
+  "True when `p` is a non-null pointer."
   [p]
   (not (null-ptr? p)))
 
 #?(:clj
    (defn try-init!
-     "JVM-only. Run ffi-fn. If ffi-fn throws a Throwable, run graal-fn instead.
-      When @force-atom is true, run graal-fn directly. Records the chosen impl
-      keyword and returns it.
+     "Run the zero-argument ffi-fn, and on a Throwable run graal-fn. When
+      @force-atom is true, run graal-fn only. Stores the chosen keyword in
+      impl-atom and returns it.
 
-      ffi-fn and graal-fn are zero-argument bootstrap functions, and try-init!
-      discards their return values. When log? is true, try-init! prints the
-      chosen path to stdout.
-
-      A fallback always reports itself, whatever log? says. A silent run on the
-      slower backend is the failure mode with the highest cost to diagnose. The
-      exception is also the only record that try-init! tried the FFI path."
+      log? prints the chosen path. A fallback always prints its exception,
+      because a silent run on GraalVM is hard to diagnose."
      [impl-atom force-atom log? ffi-fn graal-fn]
      (let [chosen
            (cond

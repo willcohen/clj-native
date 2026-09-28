@@ -5,9 +5,7 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.workload-pool-test
-  "JVM smoke tests for the workload-pool registry: init runs once per
-   thread, current-context returns per-thread state, destroy fires at
-   shutdown."
+  "JVM smoke tests for the workload-pool registry."
   (:require [clojure.test :refer [deftest is testing]]
             [net.willcohen.native.workload-pool :as wp])
   (:import [java.util.concurrent ExecutorService Callable TimeUnit ThreadPoolExecutor]))
@@ -91,9 +89,7 @@
                              :destroy (fn [_])
                              :args nil})
       (let [^ExecutorService exec (wp/as-executor-service registry :compute)
-            ;; Submit 4 long-running tasks at once so the executor
-            ;; spawns all 4 threads. Each task records its
-            ;; current-context.
+            ;; The latch holds all 4 tasks in flight, so the executor spawns 4 threads.
             latch (java.util.concurrent.CountDownLatch. 4)
             futures (vec (for [_ (range 4)]
                            (.submit exec

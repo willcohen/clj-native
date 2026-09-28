@@ -6,62 +6,34 @@
 
 #?(:clj
    (ns net.willcohen.native.dispatch
-     "Generic dispatch engine for one fn at a time, for native and wasm-backed
-      C bindings. A consumer builds one library value with `library`, and
-      calls `call!` for each fn. The library value carries the hooks. There is
-      no registry.
+     "Calls C fns one at a time, on native and wasm builds. A consumer builds
+      a library value with `library` and passes it to `call!`. There is no
+      registry.
 
-      Three backends, on two axes. The host is the JVM or JavaScript. The
-      compiled artifact is a native shared library or an emscripten .wasm.
-      Three of the four cells exist, because a JS host cannot bind a native
-      shared library.
+        JVM + native .so/.dylib -> :ffi   (Panama, through dt-ffi)
+        JVM + emscripten .wasm  -> :graal (GraalWasm, through ccall)
+        JS  + emscripten .wasm  -> CLJS   (worker pool, through ccall)
 
-        JVM host + native .so/.dylib -> :ffi   (Panama, through dt-ffi)
-        JVM host + emscripten .wasm  -> :graal (GraalWasm, through ccall)
-        JS host  + emscripten .wasm  -> CLJS   (worker pool, through ccall)
-
-      The two wasm backends speak ccall because they share the ARTIFACT, and
-      not the host. That is why `fn-record` below precomputes :ccall-rettype
-      and :ccall-argtypes in shared code, and why the FFI backend ignores
-      both. The FFI backend has real symbols, so it binds them directly and
-      needs no type list at call time.
-
-      JVM (GraalVM). Do a ccall on the module in scope: a bound
-      *wasm-context* wins, and the registered module of the library is the
-      fallback. The call holds the monitor of the Context that owns the
-      module. An exception becomes a rettype-shaped nil. The rettype
-      postprocess step wraps, dereferences or coerces the result for each
-      type. ccall is an emscripten runtime export.
-      net.willcohen.native.graal-wasm documents the full module contract.
-
-      JVM (FFI). Apply the generated dt-ffi var through
-      platform/call-native-fn. There is no ccall and no postprocess step.
-      dt-ffi coerces by rettype in the generated wrapper.
-
-      CLJS. Build a {:cmd \"ccall\"} envelope, with the extras from the
-      extras-builder. Route it through pool/worker-call. Then apply
-      :on-result, and then the result-wrapper."
+      The two wasm backends share the artifact, so both use the ccall types
+      that `fn-record` precomputes. The FFI backend binds real symbols and
+      ignores them."
      (:require [net.willcohen.native.graal-wasm :as nw]
                [net.willcohen.native.platform :as nplatform]
                [clojure.tools.logging :as log]
                [tech.v3.resource :as resource]))
    :cljs
    (ns net.willcohen.native.dispatch
-     "Generic dispatch engine for one fn at a time, for wasm-backed C library
-      bindings. Refer to the JVM namespace docstring for context. CLJS routes
-      ccalls through the worker-router ref that the caller supplies. Library
-      hooks build the extras, and they wrap the results."
+     "Calls C fns one at a time on wasm builds. A consumer builds a library
+      value with `library` and passes it to `call!`, which routes a ccall
+      through the worker-router pool in the :pool opt."
      (:require ["./pool.mjs" :as pool]
                ["./handler_runtime.mjs" :as hrt])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn argtype->ccall-type
-  "Map a fndefs argument or return type keyword to the ccall type keyword.
-   Use (name (argtype->ccall-type t)) when you must have a string.
-
-   `library` validates the fndefs types before this map runs. Thus the
-   default arm serves direct callers only."
+  "Map a fndefs type keyword to its ccall type keyword. An unknown type maps
+   to :number."
   [t]
   (case t
     (:pointer :pointer? :string-array :string-array? :int32 :int64 :float64 :size-t :void) :number
@@ -69,24 +41,18 @@
     :number))
 
 (def supported-types
-  "The fndefs type vocabulary that `library` accepts for :rettype and for
-   argtypes. Refer to `library`."
+  "The fndefs types that `library` accepts for :rettype and argtypes."
   #{:pointer :pointer? :string-array :string-array? :int32 :int64 :float64
     :size-t :void :string :string?})
 
-;; This message is written out, and not derived from supported-types.
-;; (str :pointer) gives ":pointer" on the JVM, and "pointer" under squint,
-;; where a keyword is already a string. A derived message would read
-;; differently in the two lanes.
-;; validate-fn-def!-names-every-supported-type pins this against the set.
+;; Written out, because (str :pointer) is ":pointer" on the JVM and "pointer"
+;; under squint. validate-fn-def!-names-every-supported-type pins it to the set.
 (def ^:private supported-types-msg
   (str ":pointer :pointer? :string-array :string-array? :int32 :int64 "
        ":float64 :size-t :void :string :string?"))
 
 (defn- validate-fn-def!
-  "Throw when a fn-def carries a type outside the supported vocabulary.
-   `library` runs this one time for each fn-key, at build time. Thus a bad
-   type fails at assembly, and not at the first call."
+  "Throw ex-info when `fn-def` has a type outside supported-types."
   [fn-key fn-def]
   (let [rettype (:rettype fn-def)]
     (when-not (contains? supported-types rettype)
@@ -100,25 +66,15 @@
                         {:fn-key fn-key :arg arg-name :argtype t}))))))
 
 (defn normalize-null-pointer
-  "Give nil for a :pointer or :pointer? return with a raw address of 0. A
-   zero address is true in JS and in Clojure, thus it defeats a (nil? x)
-   test.
-
-   The scope is call! return values only. A raw address from a heap read is
-   still 0 for null. Thus null-ptr? keeps its zero branch.
-
-   :pointer and :pointer? behave identically here. Thus the JVM-GraalVM
-   backend must also treat them identically, in jvm-rettype-postprocess. That
-   function also wraps a live address in a TrackablePointer."
+  "nil for a :pointer or :pointer? result of 0, else `result`. A 0 address
+   is logical true, so it defeats a nil? test. This applies to call! results
+   only: a heap read still gives 0 for null. jvm-rettype-postprocess must
+   treat the two types the same way."
   [rettype result]
   (if (and (or (= rettype :pointer) (= rettype :pointer?))
            (= 0 result))
     nil
     result))
-
-;; The library value. A consumer builds one library value and keeps it. The
-;; consumer gives that value to each call. No code finds a library by its name
-;; at call time.
 
 (defn- type-indexes
   "The set of indexes in `argtypes` whose type is `t`."
@@ -126,8 +82,7 @@
   (set (keep-indexed (fn [i [_ at]] (when (= t at) i)) argtypes)))
 
 (defn- fn-record
-  "Calculate the data that a call must have from the fn-def alone. `library`
-   does this one time for each fn-key."
+  "The call data that `library` precomputes for one fn-def."
   [fn-key fn-def]
   {:fn-key         fn-key
    :c-name         #?(:clj (name fn-key) :cljs (str fn-key))
@@ -146,56 +101,34 @@
     (vec (map-indexed (fn [i a] (if (contains? ix i) (f a) a)) args))))
 
 (defn library
-  "Build a library value from the fndefs of a consumer. The consumer holds
-   the returned map and passes it to call!. There is no global registry.
+  "Build a library value for call!.
 
-   Keys:
-     :key         The library keyword. It routes pool affinity,
-                  LibraryContext tracking, eviction, and WasmContext lookup.
-     :fndefs      The fn-key -> fn-def map of the consumer.
-     :impl-atom   An atom that holds :ffi, :graal, :node, or :browser. The
-                  library value keeps a REFERENCE to this atom and reads it
-                  at each call. Thus force-graal! has an effect with no
-                  rebuild.
-     :ffi-impl-ns The symbol of the namespace that holds the generated
-                  dt-ffi vars.
-     :hooks       {:extras-builder :result-wrapper :context-isolator
-                  :result-check}. All hooks are optional. The
-                  context-isolator returns a map. Dispatch reads only :args
-                  from that map. Dispatch gives the full map to the
-                  result-wrapper as :isolator-result. All other keys in the
-                  map belong to the consumer.
+     :key         Library keyword. It keys pool affinity, context tracking,
+                  eviction and the WasmContext lookup.
+     :fndefs      Map of fn-key to fn-def.
+     :impl-atom   (JVM) Atom of :ffi or :graal, read at each call, so
+                  force-graal! needs no rebuild.
+     :ffi-impl-ns Symbol of the ns that holds the generated dt-ffi vars.
+     :hooks       Optional {:extras-builder :result-wrapper
+                  :context-isolator :result-check}. Dispatch reads only
+                  :args from the map that the context-isolator returns, and
+                  passes the full map to the result-wrapper as
+                  :isolator-result.
 
-   Type vocabulary. `library` validates each fn-def at build time. An
-   unknown :rettype or argtype throws, with the supported set in the
-   message.
+   Types for :rettype and argtypes: :pointer :pointer? :string-array
+   :string-array? :int32 :int64 :float64 :size-t :void :string :string?.
+   An unknown type throws here, at build time.
+   :string? is a :string that can be nil (NULL), which dt-ffi's :string
+   rejects. A NULL result is nil on the JVM and \"\" on CLJS, where ccall
+   gives \"\" for both.
+   :int64 is a Long on the JVM. The wasm backends send a BigInt, which a
+   WASM_BIGINT module (the emscripten default since 4.0.0) needs. CLJS
+   returns the BigInt.
 
-   These types are valid in the two positions: :pointer :pointer?
-   :string-array :string-array? :int32 :int64 :float64 :size-t :void
-   :string :string?.
-
-   :string? is a :string argument that can be nil (NULL), which dt-ffi's
-   :string rejects. A NULL string result is nil on the JVM and \"\" on
-   CLJS, where emscripten ccall gives \"\" for both.
-
-   :int64 is a Long on the JVM. The wasm legs send it as a BigInt, as a
-   WASM_BIGINT module (the emscripten default since 4.0.0) needs, and the
-   CLJS leg returns the BigInt.
-
-   clj-native has two other type vocabularies. read-heap-array has its heap
-   views (:u8 :i8 :u16 :i16 :u32 :i32 :f32 :f64). read-struct has its field
-   types (:string :int :double :boolean). The three stay separate on
-   purpose, and each one names what its own layer reads.
-
-   The shape of the returned value is API, and the dispatch suite pins it.
-   :key, :impl-atom, :ffi-impl-ns and :hooks pass through unchanged.
-   `library` replaces :fndefs with :fns. :fns maps each fn-key to a
-   precomputed record of {:fn-key :c-name :fn-def :rettype :ccall-rettype
-   :ccall-argtypes :string?-indexes :int64-indexes}.
-
-   The returned value does not carry the raw fndefs map. Reach one fn-def
-   through (get-in lib [:fns fn-key :fn-def]). A rename of any of these keys
-   is a breaking change."
+   The returned value is API, and the dispatch suite pins it. :key,
+   :impl-atom, :ffi-impl-ns and :hooks pass through. :fns replaces :fndefs
+   and maps each fn-key to {:fn-key :c-name :fn-def :rettype :ccall-rettype
+   :ccall-argtypes :string?-indexes :int64-indexes}."
   [{:keys [key fndefs impl-atom ffi-impl-ns hooks]}]
   {:key         key
    :impl-atom   impl-atom
@@ -207,18 +140,12 @@
                            {} fndefs)})
 
 (defn ^:async check-result
-  "Run the result-check hook of the library, if the library has one. Without
-   a hook, return the result unchanged.
+  "Pass `result` through the :result-check hook of `lib`, if it has one.
 
    The hook is (fn [library fn-key fn-def opts result]). It returns a new
-   result, or it throws. An example is a throw on errno != 0 after a NULL
-   return. On CLJS it can return a Promise, and check-result awaits it.
-
-   The hook receives the library VALUE. Thus a hook that dispatches again
-   does no lookup.
-
-   A consumer calls check-result one time for each public fn. A hook that
-   dispatches again must test fn-key, to prevent re-entry."
+   result or throws, for example on errno after a NULL return. On CLJS it
+   can return a Promise. A hook that dispatches again must test fn-key, to
+   prevent re-entry."
   [lib fn-key fn-def opts result]
   (if-let [f (:result-check (:hooks lib))]
     #?(:clj  (f lib fn-key fn-def opts result)
@@ -227,11 +154,8 @@
 
 #?(:clj
    (defn- convert-arg-jvm
-     "Generic JVM argument conversion.
-      - A pointerlike record (TrackablePointer and its variants) -> :address
-      - An atom with {:ptr ...} (a context atom) -> the :address from :ptr
-      - nil -> 0
-      - Anything else -> unchanged"
+     "A pointer record gives its :address. An atom of {:ptr p} gives the
+      address of p. nil gives 0. Anything else passes through."
      [arg]
      (cond
        (and (record? arg) (contains? arg :address)) (:address arg)
@@ -247,12 +171,10 @@
 
 #?(:clj
    (defn jvm-rettype-postprocess
-     "Coerce a GraalVM ccall result by rettype. A :pointer or :pointer?
-      result becomes a TrackablePointer, or nil for a null address, which
-      would defeat a (nil? x) test. :int32, :float64, :int64 and :size-t read
-      a Polyglot Value as a number. :void gives nil. Any other result passes
-      through: a string from nw/ccall-string, or a :string-array address for
-      the caller to walk. nil stays nil."
+     "Coerce a GraalVM ccall result by rettype. :pointer and :pointer? give
+      a TrackablePointer, or nil for address 0. The numeric types read a
+      Polyglot Value as a number. :void gives nil. Other results pass
+      through."
      [rettype result]
      (case rettype
        (:pointer :pointer?) (when (some? result)
@@ -320,8 +242,7 @@
 
 #?(:clj
    (defn- graal-leg
-     "The JVM-GraalVM backend of call!. It reads the ccall types from the
-      precomputed record. It does not calculate them again from the fn-def."
+     "The GraalVM backend of call!."
      [lib rec args]
      (let [rettype (:rettype rec)
            raw (jvm-graal-call (:key lib)
@@ -340,17 +261,11 @@
 
 #?(:cljs
    (defn- convert-arg-cljs
-     "Generic CLJS argument conversion. The library extras-builder runs
-      first, and it replaces library-specific shapes such as coord-arrays.
-      - A map or JS object with :ptr -> that :ptr
-      - nil -> 0
-      - Anything else -> unchanged"
+     "A map or JS object with :ptr gives that :ptr. nil gives 0. Anything
+      else passes through. The extras-builder runs first."
      [arg]
-     ;; One arm covers the two shapes. The squint object? is a strict subset
-     ;; of map?. map? returns true for everything that object? accepts, and
-     ;; also for Map instances and the IMap types. (:ptr arg) reads the same
-     ;; "ptr" key that (.-ptr arg) reads, because a single-word name has no
-     ;; munging. A separate object? arm below this one is unreachable.
+     ;; One arm covers JS objects too: squint's map? accepts every object?,
+     ;; and (:ptr arg) reads the same key as (.-ptr arg).
      (cond
        (and (map? arg) (:ptr arg)) (:ptr arg)
        (nil? arg) 0
@@ -364,8 +279,7 @@
 
 #?(:cljs
    (defn ^:async cljs-leg
-     "The CLJS worker backend of call!. It reads the ccall types from the
-      precomputed record. It reads the hooks from the library value."
+     "The CLJS worker backend of call!."
      [lib rec args opts]
      (let [library-key (:key lib)
            hooks (:hooks lib)
@@ -382,28 +296,17 @@
            worker-idx (if (some? force-idx)
                         force-idx
                         (pool/worker-idx-from-args library-key args))
-             ;; Page-side substrate event. It captures the routing decision
-             ;; of the call before dispatch. force-idx and worker-idx record
-             ;; the affinity resolution. primary-handle is the identity
-             ;; string that the consumer passes, and it does not go through
-             ;; the ccall envelope. It lets a trace consumer correlate this
-             ;; dispatch with the matching BUSY-INC and BUSY-DEC on the
-             ;; worker side. The category is "dispatch", and the
-             ;; setLogConfig categories list can filter it.
+             ;; :primary-handle lets a trace match this call to its worker
+             ;; BUSY-INC and BUSY-DEC. It stays out of the ccall envelope.
            _dispatch-resolve (hrt/dbg "DISPATCH-RESOLVE"
                                       #js {:lib (str library-key)
                                            :c-fn (str fn-key)
                                            :force-idx force-idx
                                            :worker-idx worker-idx
                                            :primary-handle (:primary-handle opts)})
-             ;; The .ctx_id property name is the wire contract for handle
-             ;; identity. The result-wrapper of a consumer sets it on a
-             ;; wrapped handle. This scan reads it back, and so do the
-             ;; refcount and eviction machinery of the pool. Worker affinity
-             ;; has a registry (pool/register-worker-idx-predicate!),
-             ;; because the extractors differ for each consumer. ctx_id
-             ;; stays one fixed name on purpose, so do not add a second
-             ;; registry for it.
+             ;; .ctx_id is the wire contract for handle identity: a consumer
+             ;; result-wrapper sets it, and this scan and the pool refcount
+             ;; and eviction read it. Keep it one fixed name, not a registry.
            ctx-ids (vec (keep (fn [a]
                                 (when (and (object? a) (some? (.-ctx_id a)))
                                   (.-ctx_id a)))
@@ -414,14 +317,8 @@
                                        (extras-builder fn-def args)
                                        {:args args :extras nil :on-result nil})
            on-result (or on-result identity)
-             ;; Library-specific context isolator. It runs only when the
-             ;; fn-def sets :isolate-context? true. Without that flag, the
-             ;; argument passes through. The flag check prevents recursion
-             ;; on the sub-dispatches of the isolator. Dispatch reads only
-             ;; :args from the return value of the isolator. The rest is
-             ;; consumer state, and the result-wrapper receives the full map
-             ;; as :isolator-result. It emits ISOLATE-FIRE, so a trace can
-             ;; confirm the isolator path.
+             ;; Only for a fn-def with :isolate-context?, which also stops
+             ;; recursion on the sub-dispatches of the isolator.
            isolator-result (when (:isolate-context? fn-def)
                              (when-let [iso (:context-isolator hooks)]
                                (hrt/dbg "ISOLATE-FIRE" #js {:lib (str library-key)
@@ -448,8 +345,7 @@
          (when (pool/evicted? library-key cid)
            (throw (ex-info (str "context " cid " was evicted (LRU); recreate it")
                            {:library-key library-key :ctx-id cid :evicted true}))))
-         ;; Increment refcount and touched-at, so the LRU sweep skips an
-         ;; in-flight ctx. unref fires in the finally on every exit path.
+         ;; Ref each ctx so the LRU sweep skips it while in flight.
        (doseq [cid ctx-ids] (pool/ref-handle! library-key cid))
        (try
          (let [raw (await (pool/worker-call pool-ref
@@ -470,43 +366,31 @@
                                           :isolator-result isolator-result})
                          postprocessed)]
            wrapped)
-           ;; Defense in depth. The wrap in handler_runtime.mjs normalizes
-           ;; wasm traps before they cross the comlink RPC boundary. But a
-           ;; future layer (pool or handler) can inject a non-cloneable
-           ;; error downstream of that point. This catch normalizes again,
-           ;; so the caller await always sees a propagatable Error.
+           ;; handler_runtime.mjs already normalizes wasm traps, but a later
+           ;; layer can inject a non-cloneable error, so normalize again.
          (catch :default e
            (throw (hrt/normalizeWasmError e)))
          (finally
            (doseq [cid ctx-ids] (pool/unref-handle! library-key cid)))))))
 
 (defn ^:async call!
-  "The single entry point for each fn. It reads the precomputed record. It
-   selects the backend from the implementation atom of the library. Then it
-   calls that backend.
+  "Call C fn `fn-key` of `lib` with the vector `args`: on the JVM through
+   the backend that :impl-atom selects, on CLJS through the worker pool.
+   Throws on an unknown fn-key. Does not initialize the library.
 
-   lib     A value from `library`.
-   fn-key  A C function keyword, for example :mylib_create_context.
-   args    The call arguments, as a vector.
-   opts    Routing data for CLJS only. :pool is the worker-router ref, and
-           CLJS must have it. :force-worker-idx replaces the affinity result.
-           :primary-handle is a trace-correlation string, and it does not
-           cross the worker boundary.
+   Hooks: :extras-builder and :context-isolator run on CLJS only,
+   :result-wrapper on :graal and CLJS. call! never runs :result-check; call
+   check-result. A ccall exception gives nil on :graal (logged) and rejects
+   on CLJS.
 
-   call! does NOT initialize. Initialization belongs to the public surface of
-   the consumer.
+   opts (CLJS only): :pool, the worker-router ref (required);
+   :force-worker-idx, which overrides affinity; :primary-handle, a trace
+   string that stays on the page.
 
-   Ownership. call! copies a :string return from native memory, and
-   clj-native never frees the native side. clj-native never frees a :pointer
-   return either. The consumer has the contract to free native memory,
-   usually through the destroy functions of the library.
-
-   This fn has one variadic arity, and not two arities. squint makes only the
-   outer dispatcher of a multi-arity ^:async defn async. Thus an `await` in
-   an inner arity body does not bundle."
-  ;; opts carries CLJS-only routing. Refer to the docstring. The :clj reader
-  ;; view never references it, thus the clj-kondo unused-binding fires under
-  ;; :clj only.
+   A :string result is a copy. clj-native never frees a native :string or
+   :pointer result. The consumer frees it, usually through the destroy fns
+   of the library."
+  ;; :clj never reads opts.
   #_{:clj-kondo/ignore [:unused-binding]}
   [lib fn-key args & [opts]]
   (let [rec (get-in lib [:fns fn-key])]

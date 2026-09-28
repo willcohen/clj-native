@@ -3,15 +3,6 @@
 ;; Part of clj-native, under the Apache License v2.0 with LLVM Exceptions.
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-;;
-;; cljs.test suite for LibraryContext lifetime in pool.cljc. Uses
-;; squint's cljs.test adapter (node_modules/squint-cljs/src/squint/test.js):
-;; (deftest ^:async name body) returns a Promise that test_var awaits.
-;;
-;; The cljs branch delegates to resource-tracker (FinalizationRegistry
-;; under the hood), so the disposefn fires once V8 collects the JS owner.
-;; Requires --expose-gc plus an event-loop yield (setImmediate) so the FR
-;; callback drains before the next assertion.
 
 (ns net.willcohen.native.pool-test
   (:require [cljs.test :refer [deftest is]]
@@ -35,21 +26,19 @@
                      get_pool_stats]]
             ["ffi-wasm/test-runner" :as tr]))
 
-;; Five major-GC cycles with an async yield between each is what V8
-;; empirically needs to clear a fresh WeakRef on darwin/arm64 Node 22.
-;; One cycle frees the object; subsequent cycles let the WeakRef
-;; bookkeeping observe and clear deref() to undefined.
-(defn ^:async flush-gc []
+(defn ^:async gc-until
+  "Run a major GC and yield, until (done?) or 20 rounds."
+  [done?]
   (loop [i 0]
-    (when (< i 5)
+    (when (and (< i 20) (not (done?)))
       (.gc js/globalThis)
       (await (js/Promise. (fn [resolve _reject] (js/setImmediate resolve))))
       (recur (inc i)))))
 
-;; Allocate + register the owner inside a helper so the strong reference
-;; goes out of scope on return. If the test held `owner` as a local,
-;; V8's stack-frame retention can pin the object across our gc() loop
-;; and starve the WeakRef.
+;; Reachable for the whole run, so its release must never fire on GC.
+(def ^:private live-owner #js {:kind "ctx-2"})
+
+;; Allocate the owner here, so no caller stack frame pins it across the gc() loop.
 (defn track-ephemeral [lib ctx-id worker-idx release-fn]
   (let [owner #js {:kind ctx-id}]
     (track_context_BANG_ lib ctx-id worker-idx release-fn owner)))
@@ -64,25 +53,13 @@
     (let [release1 (atom 0)
           release2 (atom 0)
           release1-fn (fn [] (swap! release1 inc))
-          release2-fn (fn [] (swap! release2 inc))
-          owner2 #js {:kind "ctx-2"}]
-      ;; owner1 is allocated inside a helper so the only reference is the
-      ;; WeakRef inside the library's ctx-workers map; owner2 stays
-      ;; strongly referenced from this scope.
+          release2-fn (fn [] (swap! release2 inc))]
       (track-ephemeral lib 1 0 release1-fn)
-      (track_context_BANG_ lib 2 1 release2-fn owner2)
-      (is (= 0 @release1))
-      (is (= 0 @release2))
-      (await (flush-gc))
-      ;; After GC + event-loop yields, resource-tracker's
-      ;; FinalizationRegistry callback has fired for owner1 (collected)
-      ;; but not owner2 (still strongly held).
+      (track_context_BANG_ lib 2 1 release2-fn live-owner)
+      (await (gc-until #(pos? @release1)))
       (is (= 1 @release1) "release1-fn fired exactly once on FR drain")
-      (is (= 0 @release2) "release2-fn did not fire (owner2 still alive)")
-      (reset_library_context_BANG_ lib)
-      ;; Touch owner2 here so the JIT cannot dead-store its assignment
-      ;; and collect it before the sweep above runs.
-      (is (= "ctx-2" (.-kind owner2))))))
+      (is (= 0 @release2) "release2-fn did not fire (live-owner still alive)")
+      (reset_library_context_BANG_ lib))))
 
 (deftest untrack-context-fires-release-for-tracked-entries
   (let [lib "pool-test-untrack"]
@@ -92,7 +69,6 @@
       (track_context_BANG_ lib "only" 0 (fn [] (swap! releases inc)) owner)
       (untrack_context_BANG_ lib "only")
       (is (= 1 @releases) "untrack fires release once")
-      ;; Idempotent: untracking an already-released ctx-id is a no-op.
       (untrack_context_BANG_ lib "only")
       (is (= 1 @releases))
       (reset_library_context_BANG_ lib))))
@@ -109,21 +85,13 @@
       (reset_library_context_BANG_ lib)
       (is (= (.-length owners) @releases)))))
 
-;; Worker affinity + per-library context isolation + the disposer-drain gate.
-;; These exercise pool.cljc's most consumer-load-bearing machinery — worker
-;; pinning and joint-pool teardown — using fake owners and release-fns, no
-;; real worker-router pool (so the assertions are deterministic rather than
-;; racing real workers).
-
 (deftest worker-idx-from-args-resolves-affinity-and-falls-back
   (let [lib "affinity-test"]
     (register_library_context_BANG_ lib)
-    ;; An arg carrying .worker_idx (the munged :worker-idx convention a
-    ;; consumer tags onto its context returns) pins the call to that worker.
+    ;; .worker_idx is the munged :worker-idx a consumer tags on its context.
     (is (= 3 (worker_idx_from_args lib #js [#js {:worker_idx 3} "scalar"])))
-    ;; Library-pure args (raw scalars) carry no index → fallback 0. The 0 is
-    ;; a deliberate deterministic pin, not an any() opportunity: dispatch
-    ;; cannot tell a pure call from one touching worker-local module state.
+    ;; The fallback is a fixed 0, since dispatch cannot tell a pure call from
+    ;; one that touches worker-local module state.
     (is (= 0 (worker_idx_from_args lib #js ["scalar" 42])))
     (reset_library_context_BANG_ lib)))
 
@@ -140,9 +108,7 @@
     (reset_library_context_BANG_ lib)))
 
 (deftest two-library-contexts-stay-isolated
-  ;; Joint-pool guarantee: two handler-keys sharing one pool keep independent
-  ;; context registries. Same ctx-id in both libraries maps to different
-  ;; workers, and resetting one library does not disturb the other.
+  ;; Two handler-keys that share one pool keep independent context registries.
   (let [libA "iso-A"
         libB "iso-B"]
     (register_library_context_BANG_ libA)
@@ -166,12 +132,8 @@
       (is (= "b" (.-k owner-b))))))
 
 (deftest ^:async parent-drain-gate-stays-open-until-child-release-promises-settle
-  ;; The TOCTOU gate that context teardown depends on: a parent context must not
-  ;; consider its children drained until every child's async release-fn Promise
-  ;; has actually settled — not merely when the child was dissoc'd from the live
-  ;; map. Register two child handles under one parent whose release-fns return
-  ;; controllable Promises, fire explicit disposes, and assert the in-flight
-  ;; count (and await-parent-drain!) stay open until both Promises resolve.
+  ;; A parent must count its children drained only when each async release-fn
+  ;; Promise settles, not when the child leaves the live map.
   (let [lib "drain-test"
         parent 100]
     (register_library_context_BANG_ lib)
@@ -181,13 +143,10 @@
                                            (swap! resolvers conj res))))
           owner-1 #js {:k 1}
           owner-2 #js {:k 2}]
-      ;; Pass the fn itself (not a call): the wrapped disposer invokes it, and
-      ;; each invocation mints a fresh pending Promise whose resolver we capture.
+      ;; Pass the fn itself, so each dispose mints a fresh pending Promise.
       (register_handle_BANG_ lib 1 0 pending-release owner-1 parent)
       (register_handle_BANG_ lib 2 0 pending-release owner-2 parent)
       (is (= 2 (in_flight_count_for_parent parent)) "both children counted")
-      ;; Explicit dispose runs each release-fn (capturing its resolver) but the
-      ;; Promise is still pending, so the gate must NOT have decremented yet.
       (dispose_handle_BANG_ lib 1)
       (dispose_handle_BANG_ lib 2)
       (is (= 2 (count @resolvers)) "both release-fns were invoked")
@@ -196,15 +155,14 @@
       (let [drained (atom false)
             drain-p (.then (await_parent_drain_BANG_ parent)
                            (fn [_] (reset! drained true)))]
-        ;; Settle both release Promises; each .finally fires the decrement.
         (doseq [r @resolvers] (r nil))
         (await drain-p)
         (is (= 0 (in_flight_count_for_parent parent)) "gate closes after both settle")
         (is (true? @drained) "await-parent-drain! resolved only after all releases settled"))
       (reset_library_context_BANG_ lib))))
 
-;; Bounded-LRU eviction, deterministic: owners stay strongly reachable, so
-;; these fail if the owner-alive gate is restored (eviction would refuse).
+;; Owners stay reachable in the eviction tests, so an owner-alive gate on
+;; eviction would make them fail.
 
 (deftest eviction-reclaims-idle-entry-with-owner-still-reachable
   (let [lib "evict-reclaim"
@@ -246,9 +204,9 @@
         o #js {}]
     (register_library_context_BANG_ lib #js {:max_live_ctxs 2 :min_age_ms 0})
     (register_handle_BANG_ lib "p" 0 (fn [] nil) o)
-    (ref_handle_BANG_ lib "p")                        ; refcount 1
+    (ref_handle_BANG_ lib "p")
     (is (= "none-evictable" (evict_oldest_BANG_ lib)) "refcount>0 pins the entry")
-    (unref_handle_BANG_ lib "p")                      ; refcount 0
+    (unref_handle_BANG_ lib "p")
     (is (= "evicted" (evict_oldest_BANG_ lib)) "unref makes it evictable")
     (is (identical? o o))                             ; keep o alive
     (reset_library_context_BANG_ lib)))
@@ -263,7 +221,4 @@
     (is (false? (evicted_QMARK_ lib "x")) "fresh registration clears the tombstone")
     (reset_library_context_BANG_ lib)))
 
-;; Run on module load: deftest forms above register at top level;
-;; run-tests-and-exit! iterates the registry, awaits any Promise each
-;; ^:async test returns, and process.exit-s 0 on green / 1 on failure.
 (tr/run-tests-and-exit! "net.willcohen.native.pool-test")

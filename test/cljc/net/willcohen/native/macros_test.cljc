@@ -4,16 +4,9 @@
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 (ns net.willcohen.native.macros-test
-  "Dual-runtime coverage for the surface-generation helpers.
-
-   These helpers decide the public name of every generated fn, so a
-   difference between the two lanes would rename part of a consumer's
-   API on one platform only. The suite therefore runs the same bodies
-   under JVM clojure.test and squint cljs.test.
-
-   Every input here is a plain string, because `name` accepts a string
-   on both platforms while squint has no keyword reader. The JVM-only
-   intern loop sits behind a reader conditional."
+  "Tests of the wrapper-generation helpers under JVM clojure.test and squint
+   cljs.test. A difference between the two renames a consumer's API on one
+   platform. Inputs are plain strings, because squint has no keyword reader."
   (:require #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing]])
             #?(:clj  [net.willcohen.native.macros :as m]

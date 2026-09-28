@@ -5,10 +5,8 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.callbacks-test
-  "JVM smoke tests for upcall registration. The end-to-end callback invocation is
-   exercised by the consumer suites (clj-proj network callbacks, clj-gdal
-   CPLHTTPFetch); here we verify the define -> instantiate -> ->c chain produces a
-   real, retained function pointer under the :jdk backend."
+  "JVM smoke tests for upcall registration under the :jdk backend. The consumer
+   suites (clj-proj, clj-gdal) test callback invocation end to end."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [net.willcohen.native.platform :as platform]
             [net.willcohen.native.callbacks :as cb]

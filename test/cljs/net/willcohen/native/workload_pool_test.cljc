@@ -3,23 +3,6 @@
 ;; Part of clj-native, under the Apache License v2.0 with LLVM Exceptions.
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-;;
-;; cljs.test coverage for workload-pool's CLJS joint-pool registry: the
-;; single-pool state shape, register-handler!'s flat upsert (workload arg
-;; ignored), ensure-pool!'s latched fold into ONE real worker-router
-;; pool, adopt-pool!'s owned?=false path, and shutdown-pool!'s walk
-;; (pre-terminate hooks in reverse registration order, owned-only
-;; terminate, generation bump). The fold test spawns a real
-;; worker-router pool over test/fixtures/registry-handler.mjs; the
-;; adopted-pool tests drive the same API with a pool-shaped object
-;; (worker-router's pool is an object literal whose terminate closes
-;; over pool state, so terminate must not need `this` -- the fake
-;; matches that shape).
-;;
-;; The wiring half covers make-wiring!/ensure-wired!/wiring-pool/
-;; live-pool?/shutdown-wiring!: one registry per latched pass even when
-;; the pass awaits, a cleared wiring after a rejected pass, and
-;; live-pool? keying on pool identity so a re-adopted pool stays live.
 
 (ns net.willcohen.native.workload-pool-test
   (:require [cljs.test :refer [deftest is testing]]
@@ -30,14 +13,14 @@
             ["node:path" :refer [join dirname]]))
 
 (def this-dir (dirname (fileURLToPath (.-url js/import.meta))))
-;; test/cljs/net/willcohen/native -> up four (native, willcohen, net,
-;; cljs) to test/, where the shared fixtures live.
+;; Four levels up from test/cljs/net/willcohen/native is test/.
 (def test-dir (join this-dir ".." ".." ".." ".."))
 (def handler-url
   (.-href (pathToFileURL (join test-dir "fixtures" "registry-handler.mjs"))))
 
 (defn- resolved-fake-pool
-  "Pool-shaped object whose terminate records into `calls` and resolves."
+  "Pool-shaped object whose terminate records into `calls` and resolves. As
+   in worker-router, terminate needs no `this`."
   [calls]
   #js {:terminate (fn terminate []
                     (swap! calls conj :terminate)
@@ -95,8 +78,7 @@
         "a :pre-terminate-only spec may still register after adoption")))
 
 (deftest current-context-throws-on-cljs-reserved-for-the-worker-side
-  ;; CLJS main-thread current-context always throws: per-worker state
-  ;; lives inside Web Workers and is unreachable synchronously.
+  ;; Per-worker state lives in Web Workers, out of synchronous reach.
   (is (thrown-with-msg? js/Error #"not callable from the main thread"
                         (wp/current-context :lib-a))))
 
@@ -112,10 +94,8 @@
         "ensure-pool! resolves to the adopted pool")))
 
 (deftest current-pool-reads-the-live-pool-through-the-registry
-  ;; The accessor exists for cross-package CLJS consumers: the registry's
-  ;; atoms belong to this package's squint-cljs instance, and a consumer
-  ;; bundled against its own squint-cljs copy cannot deref a foreign Atom
-  ;; (per-instance protocol symbols).
+  ;; A consumer bundled with its own squint-cljs copy cannot deref this
+  ;; package's Atoms, since protocol symbols are per instance.
   (let [reg (wp/init-workload-pool! {})]
     (is (nil? (wp/current-pool reg)) "nil before adopt-pool!/ensure-pool!")
     (let [fake (resolved-fake-pool (atom []))]
@@ -211,10 +191,8 @@
       (is (= true @(:terminated? reg))))))
 
 (deftest ^:async shutdown-pool!-survives-a-terminate-that-rejects
-  ;; Owned pools come only from ensure-pool!, so owned state is injected
-  ;; directly here; the registry map's shape is documented API
-  ;; (init-workload-pool! docstring), so this is contract use, not a
-  ;; reach into private internals.
+  ;; Only ensure-pool! makes an owned pool, so inject owned state through the
+  ;; documented registry shape.
   (let [reg (wp/init-workload-pool! {})
         fake #js {:terminate (fn terminate []
                                (js/Promise.reject (js/Error. "terminate failed")))}]
@@ -230,22 +208,18 @@
   (let [wiring (wp/make-wiring!)]
     (is (nil? @(:registry wiring)) "no registry until a pass runs")
     (is (nil? @(:latch wiring)) "no memo until a pass runs")
-    ;; identical?, not nil?: squint's nil? is a loose null check that
-    ;; passes for undefined too, and a `when` in tail position yields
-    ;; undefined. identical? compiles to === and holds the fn to nil,
-    ;; which is what a consumer comparing strictly against null needs.
+    ;; squint's nil? also passes for the undefined a tail `when` returns.
+    ;; identical? compiles to ===.
     (is (identical? nil (wp/wiring-pool wiring))
         "no pool before ensure-wired!, and null rather than undefined")))
 
 (deftest ^:async ensure-wired!-latches-the-whole-pass-so-one-registry-is-built
-  ;; The pass BUILDS the registry, so the registry's own latch cannot
-  ;; guard it. Without the wiring memo both callers get past the await
-  ;; inside :register!, each builds a registry, and each spawns a pool.
+  ;; The setup builds the registry, so the registry cannot guard it. Without
+  ;; the wiring, each caller spawns a pool.
   (let [wiring    (wp/make-wiring!)
         built     (atom [])
         register! (fn ^:async register! [reg]
-                    ;; A real consumer awaits here, reading its per-worker
-                    ;; init payload. That await is the race window.
+                    ;; A real consumer awaits its init payload here: the race window.
                     (await (js/Promise.resolve nil))
                     (swap! built conj reg)
                     (wp/register-handler! reg :compute :lib-a
@@ -328,10 +302,9 @@
     (is (= false (wp/live-pool? wiring nil)) "nil is never live")
     (await (wp/shutdown-wiring! wiring))
     (is (= false (wp/live-pool? wiring fake)) "no pool, so nothing is live")
-    ;; The adopted pool survived shutdown with its workers and their id
-    ;; sequences intact, so its handles' teardowns must fire again once
-    ;; the consumer re-adopts it. A generation counter would drop them
-    ;; and leak the native memory they free.
+    ;; An adopted pool keeps its workers across shutdown, so its handles'
+    ;; teardowns must fire after re-adoption. A check on :generation would
+    ;; drop them and leak their native memory.
     (await (wp/ensure-wired! wiring {:pool fake}))
     (is (wp/live-pool? wiring fake) "the same pool object is live again")
     (await (wp/shutdown-wiring! wiring))))

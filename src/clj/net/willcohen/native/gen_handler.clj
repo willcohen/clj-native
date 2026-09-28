@@ -5,12 +5,10 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.gen-handler
-  "Build-time generator. It emits a Worker-router ModuleHandler module from
-   fndefs and library overrides.
-
-   This generator is a JVM or babashka fn, and not a CLJS macro. Thus it can
-   read the consumer fndefs through a deps.edn :local/root. A CLJS macro
-   cannot do that, because of the squint user-space defmacro limitation."
+  "Build-time generator of a worker-router ModuleHandler module from fndefs
+   and library overrides. It runs on the JVM or babashka, because a squint
+   user-space macro cannot read consumer fndefs through a deps.edn
+   :local/root."
   (:require [clojure.string :as str]))
 
 (def ^:private required-override-keys
@@ -23,8 +21,6 @@
                       {:missing k :overrides-keys (vec (keys overrides))})))))
 
 (defn- js-string-literal
-  "Render a JS double-quoted string literal. This function escapes each
-   backslash and each quote."
   [s]
   (let [s (name s)]
     (str "\""
@@ -52,54 +48,29 @@
        "// classification computed from the consumer's fndefs."))
 
 (defn gen-handler-source
-  "Generate a JS handler module source string.
+  "Return the source of a JS handler module.
 
-   fndefs    A map of { fn-key -> { :rettype :argtypes :busy? :destroy? ... } }.
-             When overrides omit :destroy-fns, gen-handler-source derives
-             `destroyFns` from this map. `destroyFns` holds the C function
-             names that the ccall dispatcher treats as teardown.
+   fndefs     {fn-key {:rettype :argtypes :busy? :destroy? ...}}.
+   overrides  Keys:
+     :overrides-import-path  Required. Path of the overrides .mjs.
+     :runtime-import-path    Required. Path of the handler runtime.
+     :exposed-methods        Required. Method keywords, each mapped to
+                             overrides.methods.<name>.
+     :busy-methods           Subset of :exposed-methods, disjoint from
+                             :destroy-methods. Default [].
+     :destroy-methods        Subset of :exposed-methods. Default [].
+     :destroy-fns            C fn names. Default: fndefs keys with :destroy?.
+     :fingerprint-fields     Init-arg names. Emits a byteLengthFingerprint
+                             in place of overrides.fingerprint.
+     :fingerprint-prefix     Fingerprint label for re-init errors. Needs
+                             :fingerprint-fields.
+     :preamble               Text for the top of the output, with its own
+                             // markers.
 
-   overrides A map with these keys:
-       :overrides-import-path  The module path of the hand-written overrides
-                               .mjs.
-       :runtime-import-path    The module path of the published handler
-                               runtime.
-       :exposed-methods        Method-name keywords. Each one wires
-                               methods.<name> from the overrides module.
-       :busy-methods           An optional subset with the busy
-                               classification. A busy method increments a
-                               counter on entry, and decrements it on exit.
-                               The default is []. The runtime queue is fully
-                               serial, thus this classification affects trace
-                               fields only at this time. It stays accepted for
-                               a future queue that serializes entry only.
-       :destroy-methods        An optional subset with the destroy
-                               classification. A destroy method is gated on
-                               counter == 0. The default is []. It has the
-                               same trace-only status as :busy-methods.
-       :destroy-fns            Optional C function name strings. When they are
-                               absent, gen-handler-source derives them from
-                               the fndefs :destroy? flags.
-       :fingerprint-fields     Optional init-arg names for the handler
-                               fingerprint. With these names,
-                               gen-handler-source emits a
-                               byteLengthFingerprint call here. Without them,
-                               it takes overrides.fingerprint. The first form
-                               lets an overrides module import nothing from
-                               the handler runtime. Refer to
-                               :fingerprint-prefix.
-       :fingerprint-prefix     An optional label for the fingerprint, so a
-                               re-init error names the handler.
-                               gen-handler-source ignores it without
-                               :fingerprint-fields.
-       :preamble               An optional string for the top of the output.
-
-   gen-handler-source can generate the fingerprint, so no one must write it by
-   hand. There is one reason for this. The overrides module of a handler stays
-   external, while the bundler inlines this generated module. Thus an
-   overrides module that imports the handler runtime gets a SECOND copy of
-   that runtime, with its own logging state. The fingerprint here keeps the
-   one import of the runtime in the one inlined module."
+   The busy and destroy classes affect trace fields only, because the
+   runtime queue is serial. Prefer :fingerprint-fields: the bundler inlines
+   this module but not the overrides module, so an overrides module that
+   imports the runtime gets a second copy with its own logging state."
   [fndefs overrides]
   (check-required! overrides)
   (let [{:keys [overrides-import-path runtime-import-path
@@ -167,9 +138,8 @@
      "export const destroy = overrides.destroy;\n")))
 
 (defn write-handler!
-  "Invoke gen-handler-source. Then write the result to `out-path`, a string or
-   a java.io.File. Returns the path. This is the entry point with side effects
-   for bb tasks."
+  "Write the gen-handler-source output to `out-path`, a string or File.
+   Returns the path as a string."
   [fndefs overrides out-path]
   (let [src (gen-handler-source fndefs overrides)]
     (spit out-path src)

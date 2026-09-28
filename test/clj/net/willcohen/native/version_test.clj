@@ -5,10 +5,9 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.version-test
-  "build.clj holds the one version of record. deps.edn and package.json
-   cannot read it, so they are pinned here. Every other file must carry no
-   version literal. Each pattern asserts its match count, so a rename cannot
-   make a check vacuous."
+  "build.clj holds the one version of record. These tests pin its copies in
+   deps.edn and package.json, and forbid version literals in bb.edn,
+   README.md and .gitignore."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]))
 
@@ -24,9 +23,8 @@
   (mapv second (re-seq re s)))
 
 (defn- npm-version
-  "The top-level \"version\" of package.json, read with a regex rather than a
-   JSON parser. cheshire ships with babashka but is not on the JVM test
-   classpath, and no other key in the file is named \"version\"."
+  "The top-level \"version\" of package.json. A regex reads it, since cheshire
+   is not on the JVM test classpath and no other key is named \"version\"."
   []
   (second (re-find #"\"version\"\s*:\s*\"([^\"]+)\"" (slurp-root "package.json"))))
 
@@ -63,8 +61,7 @@
           "bb.edn :init must define project-version")
       (is (str/includes? bb "project-version \".jar\"")
           "the jar task must compose its path from project-version")))
-  ;; some?, not (= canonical ...): canonical comes from the same pattern, so an
-  ;; equality check here agrees with itself even when both read nil.
+  ;; some?, since canonical comes from the same pattern and would equal nil too.
   (testing "the pattern bb.edn's :init carries still matches build.clj"
     (let [bb-pattern (re-pattern "\\(def version \"([^\"]+)\"\\)")]
       (is (some? (second (re-find bb-pattern (slurp-root "build.clj"))))

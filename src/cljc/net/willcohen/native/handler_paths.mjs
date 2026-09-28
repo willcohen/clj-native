@@ -4,21 +4,9 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Asset-path resolution for wasm-backed handlers. A handler must find sibling
-// files, such as a database or a secondary .mjs or .wasm. Those files sit at
-// different depths in different layouts. A consumer that runs from source
-// finds them some levels up, under resources/. A consumer that runs from a
-// bundled distribution finds them in the same directory. The probe is the same
-// in every consumer, and it is easy to get the number of levels wrong.
-//
-// resolveAsset(importMetaUrl, name, candidates) returns the first candidate
-// directory that holds `name`. If no candidate holds it, the function throws
-// and lists every path it probed. Node only.
-//
-// loadEmscriptenModule uses resolveAsset. It imports the emscripten output of
-// a consumer and returns the module factory with a matching locateFile. On
-// Node it resolves through resolveAsset. In a browser it resolves against
-// import.meta.url.
+// Asset-path resolution for wasm-backed handlers. A sibling file, such as a
+// database or a .wasm, sits some levels up under resources/ when run from
+// source, and in the same directory in a bundled distribution.
 
 import { isNode } from './handler_env.mjs';
 
@@ -28,10 +16,8 @@ const ensureNode = () => {
   }
 };
 
-// Make a candidate into an absolute directory. An absolute string passes
-// through unchanged. An array of segments resolves against the __dirname of
-// the caller, for example ['..','..','resources'], which is the usual form. A
-// relative string also resolves against that __dirname.
+// An absolute string passes through. An array of segments, such as
+// ['..', '..', 'resources'], or a relative string resolves against `here`.
 const resolveCandidate = async (here, candidate) => {
   const { resolve, isAbsolute } = await import('node:path');
   if (Array.isArray(candidate)) return resolve(here, ...candidate);
@@ -42,8 +28,9 @@ const resolveCandidate = async (here, candidate) => {
   return resolve(here, candidate);
 };
 
-// importMetaUrl is the import.meta.url of the caller. A relative candidate
-// resolves from the file location of the caller, not from clj-native.
+// Returns {dir, path} for the first candidate directory that holds `name`, or
+// throws with every path it probed. Pass the caller's import.meta.url: a
+// relative candidate resolves from the caller's directory. Node only.
 export const resolveAsset = async (importMetaUrl, name, candidates) => {
   ensureNode();
   if (typeof name !== 'string' || name.length === 0) {
@@ -67,26 +54,18 @@ export const resolveAsset = async (importMetaUrl, name, candidates) => {
   throw new Error('handler-paths: ' + name + ' not found on any candidate: ' + tried.join(', '));
 };
 
-// Import the emscripten output of a consumer and return the parts needed to
-// start it. On Node the result is {factory, locateFile, dir}. In a browser it
-// is {factory, locateFile, baseUrl}. No branch returns both dir and baseUrl.
-//
-// `factory` is the default export of the module, which is the function that
-// emscripten MODULARIZE emits. The caller invokes it with its own module
-// arguments. `locateFile` maps the name of a sibling file, such as the .wasm
-// or a .data pack, to the place this import found it. Pass it straight to the
-// factory. A caller whose output finds its own siblings can ignore it.
-//
-// On Node the resolution goes through resolveAsset, so one candidate list
-// finds both a database and the module. In a browser the resolution is against
-// importMetaUrl. That keeps a bundled distribution correct from any directory,
-// including the ./dist/ layout that a CDN uses, with no server-relative path.
+// Imports a consumer's emscripten output. Returns {factory, locateFile, dir}
+// on Node and {factory, locateFile, baseUrl} in a browser. `factory` is the
+// MODULARIZE default export. Pass `locateFile` to it to find the .wasm and any
+// .data pack next to the module. Node probes through resolveAsset. A browser
+// resolves against importMetaUrl, which works from any directory, a CDN
+// ./dist/ included.
 //
 // opts:
-//   name         asset name. Both runtimes use it if no override is given.
-//   nodeName     override for Node only, for example a single-threaded build
-//   browserName  override for a browser only, for example a pthreads build
-//   candidates   candidate directories for the Node probe. See resolveAsset.
+//   name         asset name for both runtimes
+//   nodeName     Node override, for example a single-threaded build
+//   browserName  browser override, for example a pthreads build
+//   candidates   directories for the Node probe
 export const loadEmscriptenModule = async (importMetaUrl, opts) => {
   const { name, nodeName = name, browserName = name, candidates } = opts ?? {};
   if (typeof nodeName !== 'string' || typeof browserName !== 'string') {

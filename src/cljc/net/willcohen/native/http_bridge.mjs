@@ -4,35 +4,27 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Platform HTTP transport for wasm libraries whose C runtime issues blocking
-// XHR, for example emscripten FETCH or the HTTP entry point of a library.
-// There is one bridge for each process.
+// HTTP transport for a wasm library whose C runtime issues blocking XHR, such
+// as emscripten FETCH. There is one bridge per thread.
 //
-// createSyncFetch(opts) returns syncFetch(url, reqOpts), which returns
-// {status, headers, bodyBytes}. On Node the call goes to a fetch_worker over
-// SharedArrayBuffer and Atomics. In a browser it is a synchronous XHR, and the
-// caller must already be in a Web Worker. createSyncFetch returns a Promise,
-// because on Node it waits for the worker to become ready.
+// createSyncFetch(opts) resolves to syncFetch(url, reqOpts), which returns
+// {status, headers, bodyBytes}. On Node, syncFetch blocks on Atomics while a
+// fetch_worker does the request. In a browser it is a synchronous XHR, and the
+// caller must be in a Web Worker.
 //
-// Four behaviors here are safety-critical:
-//   - On Node, createSyncFetch REJECTS if the worker cannot become ready. A
-//     decorator import failure is one such case. The alternative would serve
-//     requests with no authentication.
-//   - A response larger than dataBufferSize resolves to {status:0,
-//     overflow:true}, which a caller can tell apart from a network error.
-//   - A worker that stops answering unblocks the caller with status 0 after
-//     requestTimeoutMs plus slack, in place of a permanent Atomics.wait.
-//   - Every request carries a generation, so a response that the caller
-//     already gave up on can never become the answer to the next request.
+// Contracts:
+//   - On Node, createSyncFetch rejects if the worker cannot become ready, for
+//     example when the decorator import fails. A later call reuses the
+//     running worker and ignores its own decorateUrl, dataBufferSize and
+//     requestTimeoutMs.
+//   - A response larger than dataBufferSize gives {status: 0, overflow: true}.
+//   - A worker that stops answering gives status 0 after requestTimeoutMs plus
+//     slack.
+//   - A response that the caller gave up on never answers the next request.
 //
-// The auth decorator runs in the worker on Node, and synchronously in line in
-// a browser. It never runs in the blocked caller.
-//
-// installXhrPolyfill sends the synchronous path of a global XHR through
-// syncFetch. shutdown() releases one consumer reference, and the worker
-// terminates at the last release. shutdownMethod and moduleDestroy are the two
-// stock wirings that a generated handler needs. See them at the end of this
-// file.
+// The auth decorator runs in the worker on Node and inline in a browser, never
+// in the blocked caller. installXhrPolyfill sends the synchronous path of a
+// global XHR through syncFetch.
 
 import { isNode } from './handler_env.mjs';
 
@@ -40,43 +32,23 @@ const CONTROL_BUFFER_SIZE = 12;
 const META_BUFFER_SIZE = 20;
 const DEFAULT_DATA_BUFFER_SIZE = 50 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 35000;
-// The caller waits a little longer than the request timeout of the worker.
-// This is a backstop against an Atomics.wait that never ends.
-//
-// This cap does more than catch a crashed worker. An earlier version of this
-// comment claimed that it did only that, and the claim hid a real defect. The
-// timeout of the worker is an IDLE timer, and each body chunk resets it, so a
-// healthy slow transfer has no total bound. This cap is fixed wall-clock time,
-// and nothing resets it. Any transfer longer than the cap, with no single stall
-// longer than requestTimeoutMs, ends here while the worker still streams. The
-// generation on every request is what stops that abandoned response from
-// becoming the answer to the next request.
+// The caller waits past the worker's idle timeout, so a stall comes back as
+// the worker's status 0. A slow transfer can still outlast this fixed cap, and
+// the request generation keeps its late response off the next request.
 const WAIT_SLACK_MS = 5000;
-// How long ensureWorker waits for the worker's 'ready' before giving up.
 const WORKER_READY_TIMEOUT_MS = 10000;
-// metaBuffer[3] bit 0: the response did not fit the data buffer (see fetch_worker).
+// metaBuffer[3] bit 0: the response did not fit dataBuffer.
 const OVERFLOW_FLAG = 1;
-// The generation pairs a response with the request that asked for it. The wait
-// of the caller is a wall-clock cap, but the timeout of the worker is an idle
-// timer. A healthy slow transfer can therefore outlive the patience of the
-// caller, and the worker continues to serve a request that nobody waits for.
-// Without a generation, that abandoned response reached the shared buffers and
-// became the answer to the NEXT request: status 200 with the bytes of another
-// URL, which no downstream caller can detect. This function never issues 0, so
-// a generation cannot collide with a metaBuffer that was just zeroed.
+// Never returns 0, so a generation cannot match a zeroed metaBuffer.
 function nextGeneration(state) {
   const next = (state.generation + 1) | 0;
   state.generation = next === 0 ? 1 : next;
   return state.generation;
 }
 
-// There is one fetch worker for each process. workerState is a global
-// singleton for the process, and ensureWorker creates it on first use.
-// Consumers share it, because a joint pool loads the handler modules of
-// several libraries into one worker thread. The ensure and shutdown pairs are
-// therefore reference-counted. Each successful createSyncFetch on Node takes
-// one reference, and shutdown() releases one. The worker terminates at the
-// last release, and not at the teardown of the first consumer.
+// One fetch worker per thread, shared and reference-counted, because a joint
+// pool loads the handlers of several libraries into one worker thread. Each
+// createSyncFetch on Node takes a reference, and shutdown() releases one.
 let workerState = null;
 let refCount = 0;
 
@@ -127,14 +99,9 @@ async function ensureWorker(workerUrl, decorateUrl, opts) {
   return workerState;
 }
 
-// Send the init message and resolve when the worker reports ready. The
-// function rejects in four cases: the worker reports an init error, the worker
-// emits an 'error', the worker exits during init, or the worker does not
-// report ready within WORKER_READY_TIMEOUT_MS. A decorator import failure is
-// one such init error, and it must never fall back to serving with no
-// authentication. An earlier version used a busy-wait that could turn forever.
-// On any rejection this function terminates the worker and leaves workerState
-// null, so a later createSyncFetch starts clean.
+// Resolves when the worker reports ready. Rejects on an init error, a worker
+// 'error', a nonzero exit, or a timeout. A rejection terminates the worker and
+// leaves workerState null, and a later createSyncFetch starts clean.
 function waitForWorkerReady(worker, initMsg) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -200,37 +167,29 @@ function nodeSyncFetch(state, url, reqOpts) {
   Atomics.store(control, 0, 1);
   Atomics.notify(control, 0, 1);
 
-  // One wall-clock budget, whatever number of stale responses arrive.
+  // One budget covers any number of stale responses.
   const deadline = Date.now() + waitTimeoutMs;
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0 || Atomics.wait(control, 1, 0, remaining) === 'timed-out') {
-      // The worker crashed, stopped, or still serves a transfer that outlived
-      // this budget. Return a transport failure, so that the caller does not
-      // hang forever. The worker drops that response when it arrives. See
-      // writeResponse.
+      // The worker crashed, stalled, or still streams a transfer that outlived
+      // this budget. writeResponse drops that late response.
       console.error(
         `http-bridge: fetch worker did not answer within ${waitTimeoutMs}ms for ${url}. ` +
         'Returning a transport failure.');
       return { status: 0, headers: {}, bodyBytes: new Uint8Array(0) };
     }
     if (Atomics.load(meta, 4) === generation) break;
-    // This is a response for a request that this caller already gave up on.
-    // writeResponse drops such a response on the worker side, so this check
-    // guards only the window between its generation test and its control[1]
-    // store. That window holds two dataBuffer.set copies, so it gets wider as
-    // the body gets larger. The suite cannot force that interleaving, so no
-    // test covers this branch. It stays because the check on the worker side is
-    // not atomic with its write.
+    // A stale response. writeResponse drops these, but its generation check is
+    // not atomic with its write, and the gap holds two dataBuffer copies. No
+    // test can force this interleaving.
     Atomics.store(control, 1, 0);
   }
 
   const flags = Atomics.load(meta, 3);
   const status = Atomics.load(meta, 0);
   if (flags & OVERFLOW_FLAG) {
-    // A caller can tell this apart from a network error, which has status 0
-    // and no overflow field. The upstream request was good, but its body was
-    // larger than the transport buffer.
+    // `overflow` tells this apart from a network error.
     console.error(
       `http-bridge: the response for ${url} is larger than the ${data.length}-byte transport ` +
       `buffer. Upstream status ${status}. Returning a transport failure.`);
@@ -251,7 +210,7 @@ function browserSyncFetch(decorate, url, reqOpts) {
     headers: reqOpts.headers || {},
     body: reqOpts.body ?? null,
   };
-  if (decorate) request = decorate(request);  // The browser path is synchronous only.
+  if (decorate) request = decorate(request);  // A browser decorator must be synchronous.
 
   const xhr = new XMLHttpRequest();
   xhr.open(request.method, request.url, false);
@@ -284,7 +243,7 @@ function makeXhrClass(syncFetch, XHR2) {
   return class XMLHttpRequest {
     constructor() {
       this._id = ++xhrIdCounter;
-      this._xhr2 = null;  // lazily built; only the async path needs xhr2
+      this._xhr2 = null;  // Only the async path needs xhr2.
       this._async = true;
       this._method = 'GET';
       this._url = null;
@@ -379,17 +338,14 @@ export async function installXhrPolyfill(opts = {}) {
     const require = createRequire(import.meta.url);
     XHR2 = require('xhr2');
   } catch (_) {
-    // Without xhr2 there is no async XHR. The synchronous path, which is the
-    // one that every wasm library uses, works in either case.
+    // Without xhr2 there is no async XHR. The synchronous path, which wasm
+    // libraries use, still works.
   }
   globalThis.XMLHttpRequest = makeXhrClass(syncFetch, XHR2);
 }
 
-// Release one consumer reference. The function returns true if this call
-// terminated the worker, which happens at the last release, or when a live
-// worker has no references left. It returns false if the worker stays up for
-// other consumers, or if no worker was ever started. A call made after all
-// references are released is a safe no-op.
+// Releases one consumer reference and terminates the worker at the last one.
+// Returns true if this call terminated the worker. An extra call is safe.
 export async function shutdown() {
   if (!workerState) {
     refCount = 0;
@@ -404,24 +360,12 @@ export async function shutdown() {
   return true;
 }
 
-// The two stock wirings for a handler whose init called createSyncFetch. Both
-// release one reference. They differ only in which path reaches them.
-//
-// shutdownMethod goes in the methods object of the handler under the name
-// `shutdown`, where an explicit client RPC reaches it. moduleDestroy is the
-// top-level `destroy` export of the handler module. The coordinator in
-// worker-router invokes that export one time for each worker when the pool
-// terminates. See loadAllHandlers in worker-bootstrap. A handler needs both:
-// the method for a client that closes the transport on purpose during a
-// session, and the export for the teardown path that no client calls.
-//
-// A deliberate close is not a fix for a leak. This was measured on node 26
-// with sixteen pool workers. Each one started a fetch worker, did a real round
-// trip, and then terminated with no call to destroy. The process still exits
-// 0. That holds even when a pool worker sits in Atomics.wait and its fetch
-// worker is in the middle of a fetch, because terminate() reaps the nested
-// thread. These exports were first written for the node 24 libuv regression,
-// which the flakes now pin past.
+// Stock wirings for a handler whose init called createSyncFetch. Each releases
+// one reference. Put shutdownMethod in the handler methods as `shutdown`, for a
+// client that closes the transport. Export moduleDestroy as the handler
+// module's `destroy`, which worker-router calls once per worker at pool
+// termination. A missing call does not hang exit, because terminate() reaps
+// the nested fetch worker.
 export const shutdownMethod = async () => {
   await shutdown();
   return { ok: true };

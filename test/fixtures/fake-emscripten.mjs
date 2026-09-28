@@ -4,10 +4,8 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture standing in for a consumer's emscripten MODULARIZE output: one
-// default export, a factory taking module arguments and resolving a module.
-// loadEmscriptenModule only has to find it, import it and hand back the default
-// export, so nothing here needs to be real wasm.
+// Test fixture: stands in for emscripten MODULARIZE output, a default-export
+// factory that resolves a module.
 
 export default () => Promise.resolve({
   marker: 'fake-emscripten',

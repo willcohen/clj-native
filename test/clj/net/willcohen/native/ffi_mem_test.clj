@@ -5,9 +5,8 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.ffi-mem-test
-  "JVM round-trip tests for the native-memory primitives. Each test allocates a
-   dtype native buffer, writes through the put-*/builder helpers, and reads back
-   through the rd-*/reader helpers -- no external native library needed."
+  "JVM round-trip tests for the native-memory primitives, on dtype native
+   buffers. They need no external native library."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [net.willcohen.native.platform :as platform]
             [net.willcohen.native.ffi-mem :as m]
@@ -57,10 +56,8 @@
     (is (= 222 (m/rd-addr (+ a 8))))))
 
 (deftest alloc-cstring-round-trip
-  ;; The allocator hands back memory pre-filled with 0xFF. dt-nb/malloc zeroes
-  ;; by default, so against a fresh block both assertions below hold whether or
-  ;; not alloc-cstring writes a terminator at all. The four spare bytes keep the
-  ;; rd-i32 probe, which reads four, inside the block alloc-cstring owns.
+  ;; Fill with 0xFF, since a zeroed block from dt-nb/malloc hides a missing
+  ;; NUL. The 4 spare bytes keep the 4-byte rd-i32 probe inside the block.
   (let [alloc (fn [n]
                 (let [a (scratch (+ n 4))]
                   (dotimes [i (+ n 4)] (m/put-byte! a i -1))

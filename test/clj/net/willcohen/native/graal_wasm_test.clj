@@ -5,21 +5,9 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.graal-wasm-test
-  "Behavioral coverage for graal_wasm.clj against a real GraalVM Polyglot Context
-   and a real WebAssembly.Memory.
-
-   test/fixtures/wasm-heap-loader.mjs supplies the module: hand-written wasm
-   bytes (a memory plus a bump allocator) wrapped in the emscripten Module
-   shape graal_wasm.clj expects. It is loaded through bootstrap-graal-module!, the
-   same entry point consumers use, so the loader contract is under test too.
-   No emcc or wabt is involved, so the suite runs on a clean checkout.
-
-   read-heap-array gets all eight heap-type arms here, so the coverage does
-   not depend on any consumer's own dtype-to-heap-type mapping reaching them.
-
-   Tests bind *wasm-context* explicitly rather than leaning on the
-   sole-registered-context fallback, so they do not depend on what else is in
-   the registry. The fallback has its own test, which controls the registry."
+  "Tests of graal_wasm.clj against a real GraalVM Context and WebAssembly.Memory.
+   test/fixtures/wasm-heap-loader.mjs supplies a hand-written module, so the
+   suite needs no emcc."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [net.willcohen.native.dispatch :as dispatch]
@@ -41,8 +29,7 @@
     (try
       (f)
       (finally
-        ;; Leave the global registry as it was found; other namespaces resolve
-        ;; through it, and the sole-context fallback is sensitive to its size.
+        ;; The sole-context fallback depends on the registry size.
         (swap! w/contexts dissoc lib-key)
         (reset! ctx nil)))))
 
@@ -52,8 +39,7 @@
   `(w/with-wasm-context @ctx ~@body))
 
 (defn- set-value!
-  "Write `v` at raw address `addr` through the module's own setValue, the same
-   interop path graal_wasm.clj uses. Lets a test seed the heap for a read."
+  "Write `v` at `addr` through the module's own setValue."
   [addr v type]
   (let [m (w/get-module @ctx)]
     (.execute (.getMember m "setValue") (object-array [addr v type]))))
@@ -155,9 +141,7 @@
        (is (thrown? clojure.lang.ExceptionInfo (w/read-heap-array p 1 :i64)))))))
 
 (deftest read-heap-array-widens-unsigned-views-by-bit-pattern
-  ;; The JVM has no unsigned primitives, so :u16/:u32 keep the bit pattern and
-  ;; leave interpretation to the caller. Pinned because it is the surprising
-  ;; half of the docstring's promise.
+  ;; The JVM has no unsigned primitives, so :u16/:u32 keep the bit pattern.
   (on-module
    (let [p (w/malloc 16)
          a (w/address-as-int p)]
@@ -230,17 +214,15 @@
         (w/set-module! only (w/get-module @ctx))
         (is (pos? (w/address-as-int (w/malloc 8))))))))
 
-;; The `load` loader contract, and the byte encoding a loader receives its
-;; binary resources through. test/fixtures/graal-load-loader.mjs reports what it
-;; got, so one fixture covers the promise bridge and the widening together.
+;; test/fixtures/graal-load-loader.mjs returns a module that reports what its
+;; `load` received.
 
 (defn- load-loader-url []
   (-> (java.io.File. "test/fixtures/graal-load-loader.mjs") .toURI .toURL))
 
 (defn- boot-load-fixture
-  "Bootstrap the load-contract fixture under a throwaway library-key and return
-   the module it registered. Each call gets a fresh key, because bootstrap is
-   idempotent per context and would otherwise hand back the first module."
+  "Bootstrap the load-contract fixture under `lib` and return its module. Give
+   each call a fresh key, since bootstrap is idempotent per context."
   [lib init-opts]
   (let [c (w/create-wasm-context! lib)]
     (try
@@ -305,8 +287,8 @@
 (defn- module [] (w/get-module @ctx))
 
 (defn- ccall-log
-  "The stand-in ccall's record of the call at `idx`, as a Clojure map. types
-   and vals are nil when the list did not arrive as a JS array."
+  "The stand-in ccall's record of call `idx`. :types and :vals are nil when
+   the list did not arrive as a JS array."
   [idx]
   (let [entry (.getArrayElement (.getMember (module) "__ccalls") idx)
         lst   (fn [k]
@@ -394,10 +376,8 @@
       (is (= "same text" (on-module (w/pointer->string written)))))))
 
 (deftest ccall-hands-its-lists-across-as-js-arrays
-  ;; The defect this pins is silent: a host array reaches JS with no length,
-  ;; no index access and no array methods, so the C function receives nothing
-  ;; while the call still returns. The fixture answers -1 and records null
-  ;; lists in that state, which is what makes it visible.
+  ;; A host array reaches JS with no length or index access, so the C function
+  ;; gets nothing and the call still returns. The fixture records it as null.
   (let [idx (ccall-count)
         r   (w/ccall (module) "sum" :number [:number :number] [20 22])]
     (testing "the arguments reach the C function"
@@ -417,9 +397,8 @@
              (ccall-log idx))))))
 
 (deftest jvm-graal-call-respects-the-wasm-context-binding
-  ;; A pool worker binds its WasmContext; every dispatch ccall must land
-  ;; on that module, not on the registered default. A pointer is only
-  ;; meaningful inside the Context that created it.
+  ;; A pointer is valid only in the Context that made it, so a pool worker's
+  ;; ccall must land on its bound module.
   (let [pctx (w/new-polyglot-context!)]
     (try
       (let [wc (w/->WasmContext ::dispatch-pool (atom nil))]
@@ -442,14 +421,11 @@
   (testing "the default Context and a pooled Context share one Engine"
     (let [pooled (w/new-polyglot-context!)]
       (try
-        ;; (context) returns the current-API wrapper, whose .getEngine is
-        ;; also a current-API wrapper; the builder's Engine is a different
-        ;; object and .equals does not bridge the two (measured
-        ;; 2026-08-21). Compare current wrappers on both sides: identical
-        ;; exactly when the Contexts share one Engine.
+        ;; The builder's Engine is a different object from the current-API
+        ;; wrapper, and .equals does not bridge them. Compare wrappers.
         (is (identical? (.getEngine (w/context))
                         (.getEngine (.getContext (.asValue pooled 0)))))
-        (is (identical? (w/engine) (.getEngine pooled))
+        (is (identical? @@#'w/engine-state (.getEngine pooled))
             "the pooled creator instance reports the shared Engine")
         (finally (.close pooled)))))
   (testing "truffle-runtime-name reports a non-blank runtime"
@@ -470,9 +446,8 @@
       (testing "the registry does not know the pooled WasmContext"
         (is (nil? (get @w/contexts ::pooled-lib))))
       (testing "heap utilities and scalar Pointerlike ops stay in the pooled Context"
-        ;; allocate-string-on-heap wraps a host scalar through
-        ;; address-as-polyglot-value; a wrap through the default Context
-        ;; would throw a cross-context error here.
+        ;; allocate-string-on-heap wraps a scalar through
+        ;; address-as-polyglot-value, which throws if it uses the default Context.
         (w/with-wasm-context wc
           (is (pos? (w/address-as-int (w/malloc 8))))
           (is (= "pooled write" (w/pointer->string (w/allocate-string-on-heap "pooled write"))))
@@ -481,10 +456,7 @@
       (finally (.close pooled)))))
 
 (deftest pooled-contexts-serve-a-workload-pool-slot
-  ;; The integration recipe for a consumer: a graal Context worker is a
-  ;; plain workload-pool handler. :init builds a Context on the shared
-  ;; Engine and bootstraps the module into it; :destroy closes it. The
-  ;; barrier holds both workers in flight at once, which one shared
+  ;; The barrier holds both workers in flight at once, which one shared
   ;; Context under the global lock cannot do.
   (let [registry (wp/init-workload-pool! {:size 2})
         seen (atom #{})
@@ -524,14 +496,14 @@
                (let [v (.asInt (aget args 0))]
                  (reset! called v)
                  (* 2 v))))]
-    (w/put-js-globals! {"__clj_native_test_cb" cb})
+    (w/put-js-globals! (w/context) {"__clj_native_test_cb" cb})
     (testing "the C stub route reaches the published callback with its argument"
       (is (= 42 (.asInt (w/ccall (module) "call_global" :number
                                  ["string" "number"]
                                  ["__clj_native_test_cb" 21]))))
       (is (= 21 @called)))
     (testing "a keyword key publishes under its name"
-      (w/put-js-globals! {:__clj_native_test_kw cb})
+      (w/put-js-globals! (w/context) {:__clj_native_test_kw cb})
       (is (= 20 (.asInt (w/ccall (module) "call_global" :number
                                  ["string" "number"]
                                  ["__clj_native_test_kw" 10])))))))
@@ -619,8 +591,7 @@
         "nil goes in as 0")))
 
 (defn- jar-with-modules
-  "A temp jar that holds the JS text of each entry of `entries`, a map of
-   {path text}."
+  "A temp jar that holds each {path text} entry of `entries`."
   ^java.io.File [entries]
   (let [f (java.io.File/createTempFile "modules" ".jar")]
     (.deleteOnExit f)

@@ -6,32 +6,16 @@
 
 #?(:clj
    (ns net.willcohen.native.pool
-     "JVM stub. The JVM path uses GraalVM Polyglot, and not the JS worker
-      pool. Every fn here throws, thus incorrect use fails loudly and does
-      not degrade silently. set-log-config! is the one exception, and it
-      carries its own note below. pool-stub-test pins this block against the
-      CLJS surface, name for name and arity for arity.
-
-      The CLJS branch holds the real implementation, a Clojure wrapper
-      around the worker-router substrate.")
+     "JVM stub. The JVM uses GraalVM Polyglot, not a worker pool, so every
+      fn here except set-log-config! throws. pool-stub-test checks that this
+      surface matches the CLJS one by name and arity.")
    :cljs
    (ns net.willcohen.native.pool
-     "Clojure wrapper around worker-router/WorkerPool. It supplies
-      init-pool!, worker-call, terminate-pool! and the accessors.
+     "Clojure wrapper around worker-router/WorkerPool.
 
-      A caller brings its own workers. init-pool! adopts a supplied :pool
-      and sets owned? to false. Without one, it spawns a fresh pool from the
-      handler map of the caller, and sets owned? to true.
-
-      The context lifetime of each library delegates to resource-tracker,
-      the JS port of tech.resource. It tracks a JS owner in gc mode. The
-      disposefn of that owner fires from the FinalizationRegistry when V8
-      collects it.
-
-      The bounded-LRU helpers enforce max-live-ctxs. They evict an idle
-      context directly, ahead of GC. Those helpers are register-handle!,
-      ref-handle!, unref-handle!, evict-oldest! and
-      bounded-create-handle!."
+      Library contexts live as gc-mode resource-tracker owners, whose
+      disposefn fires when V8 collects the owner. The bounded-LRU helpers
+      enforce max-live-ctxs by evicting idle contexts ahead of GC."
      (:require ["worker-router" :as cp]
                ["resource-tracker" :as resource]
                ["./handler_runtime.mjs" :as hrt]
@@ -40,10 +24,8 @@
 #?(:cljs
    (defn- handler-spec->js
      [spec]
-     ;; Squint compiles a map literal to a JS-native shape. Thus clj->js does
-     ;; nothing, and a Clojure-style map reads the same as the plain JS
-     ;; object of a TypeScript caller. Only :module and :init reach the
-     ;; worker.
+     ;; A squint map is a plain JS object, so clj->js does nothing here.
+     ;; Copy only the keys the worker reads.
      (let [obj (js-obj)]
        (when-let [m (:module spec)]
          (aset obj "module" m))
@@ -54,15 +36,8 @@
 #?(:cljs
    (defn- handlers->js
      [handlers]
-     ;; The local is named put!, and not assoc!. squint 0.14.202 and later
-     ;; special-case the assoc! symbol at every call site. They arity-check
-     ;; it against the built-in shape even when a local binding shadows it,
-     ;; and the compile then fails.
-     ;;
-     ;; One walk covers the two shapes. A squint map and the plain JS object
-     ;; of a caller are each plain objects. Thus doseq gives the same pairs,
-     ;; and a reverse-DNS string key such as "com.example.mylib" survives in
-     ;; each case.
+     ;; A squint map and a caller's JS object are both plain objects, so one
+     ;; doseq walks either.
      (let [obj  (js-obj)
            put! (fn [k v]
                   (aset obj (str k) (handler-spec->js v)))]
@@ -76,10 +51,10 @@
 
 #?(:cljs
    (defn- opts-get
-     "Read k from a Clojure map, or read its snake_case name from a JS
-      object. A squint map compiles to a plain JS object, thus (map? #js {})
-      is also true. The JS branch MUST come before the map branch. Otherwise
-      (get js-obj :a-b) returns nil silently for every kebab-case key."
+     "Read `k` from opts by its snake_case name, then by its own name. A
+      squint map is a plain JS object, so map? is true for a JS object too.
+      The object? branch must come first, or every snake_case JS key reads
+      as nil."
      [opts k]
      (cond
        (nil? opts) nil
@@ -94,23 +69,17 @@
 
 #?(:cljs
    (defn- coerce-cat
-     ;; squint-cljs/core has no keyword?. Discriminate with string?, and use
-     ;; name for the other case, which works on a keyword.
+     ;; A squint keyword is a string, so both pass through unchanged.
      [x]
      (if (string? x) x (name x))))
 
 #?(:cljs
    (defn ^:async broadcast-to-handlers!
-     "Call `method-name` on every (worker x handler-key) cell of the pool.
-      `args-fn` builds the arguments for each worker index.
-
-      This fn reaches every handler key, and not the first key only. A joint
-      pool can inline handler_runtime one time for each bundle, and each copy
-      carries its own logState. Thus a call to one key leaves the rest
-      unconfigured, and nothing reports that.
-
-      Each call has its own guard. A handler with a bundle against an older
-      clj-native has no such method, and that must not fail pool init."
+     "Call `method-name` on every handler key of every worker, with the args
+      that (args-fn worker-idx) returns. Every key gets the call, because
+      each bundle in a joint pool can carry its own handler_runtime state.
+      Each call swallows its own error, so a handler built against an older
+      clj-native without the method does not fail pool init."
      [pool handler-keys method-name args-fn]
      (dotimes [w (.-size pool)]
        (let [target (.worker pool w)]
@@ -123,28 +92,23 @@
 
 #?(:cljs
    (defn ^:async init-pool!
-     "Adopt a pool from the caller, or spawn a fresh pool. Returns {pool,
-      owned?}. owned? is true if and only if this call constructed the pool.
+     "Adopt the caller's pool, or spawn one. Returns #js {:pool :owned},
+      where owned is true only when this call made the pool.
 
       opts:
-        :pool       Adopt this WorkerPool, and do no spawn.
-        :handlers   handler-key -> {:module url :init args}. Each key is a
-                    keyword or a string. This key is necessary when :pool is
-                    absent.
-        :size       :auto, an integer, or \"auto\". The default is :auto.
-        :bootstrap  The bootstrap URL. The default resolves
-                    worker-router/worker-bootstrap.
-        :handler-runtime  An optional diagnostic config. init-pool!
-                    broadcasts it to every worker through __setLogConfig. It
-                    ignores this key on adoption."
+        :pool             Adopt this WorkerPool. No spawn.
+        :handlers         handler-key -> {:module url :init args}, keyed by
+                          keyword or string. Required without :pool.
+        :size             :auto (default), \"auto\" or an integer.
+        :bootstrap        Bootstrap URL. Defaults to
+                          worker-router/worker-bootstrap.
+        :handler-runtime  Diagnostic config sent to every worker through
+                          __setLogConfig. Ignored on adoption."
      [opts]
      (let [caller-pool (opts-get opts :pool)]
        (if (some? caller-pool)
-         ;; The JS property name is `owned`, with no `?`. That prevents an
-         ;; asymmetry in the squint keyword munging. `#js {:owned? ...}`
-         ;; writes the literal property name "owned?". But
-         ;; `(.-owned? result)` reads the munged `.owned_QMARK_`. Thus the
-         ;; two sides never see the same key.
+         ;; `owned`, not `owned?`: squint writes #js {:owned? ..} as "owned?"
+         ;; but reads (.-owned? x) as .owned_QMARK_.
          #js {:pool caller-pool :owned false}
          (let [handlers (opts-get opts :handlers)
                _ (when (nil? handlers)
@@ -159,9 +123,8 @@
                pool      (await (.create (.-WorkerPool cp) cp-opts))
                hr        (opts-get opts :handler-runtime)
                handler-keys (vec (js/Object.keys handlers))]
-           ;; Broadcast inline, and not through worker-call. worker-call
-           ;; would be a forward reference, and it would add queue trace
-           ;; noise.
+           ;; Not through worker-call, which is a forward reference here and
+           ;; adds queue trace noise.
            (when (some? hr)
              (let [level (opts-get hr :level)
                    cats  (opts-get hr :categories)
@@ -174,26 +137,20 @@
                    (aset cfg "categories" arr)))
                (await (broadcast-to-handlers! pool handler-keys "__setLogConfig"
                                               (fn log-config-args [_w] #js [cfg])))))
-           ;; Always send the slot index of each worker, even with the
-           ;; diagnostic substrate off.
            (await (broadcast-to-handlers! pool handler-keys "__setWorkerSlot"
                                           (fn worker-slot-args [w] #js [w])))
            #js {:pool pool :owned true})))))
 
 #?(:cljs
-   ;; Pool-wide monotonic dispatch counter. Every QUEUE-DISPATCH and
-   ;; QUEUE-COMPLETE carries it as `disp-id`. Thus a tail-grep can pair a
-   ;; start event with an end event, even across reordered worker output.
-   ;; This counter differs from the handler-runtime `id` field. That field
-   ;; counts the BUSY and DESTROY calls of each handler, and not the
-   ;; dispatches of each pool.
+   ;; The `disp-id` of the dispatch trace events, so a reader can pair each
+   ;; start with its end across reordered worker output. Distinct from the
+   ;; per-handler `id` of handler-runtime.
    (defonce ^:private dispatch-id-counter (atom 0)))
 
 #?(:cljs
    (defn- sanitize-reason
-     "Munge an error message for an inline trace. Collapse each whitespace
-      run and each `=` character to `_`, so the formatEvent key=value parser
-      stays correct. Cap the result at 200 characters."
+     "Make `msg` safe for a key=value trace field: whitespace and `=` runs
+      become `_`, capped at 200 characters."
      [msg]
      (let [s (if (string? msg) msg (str msg))
            one-line (string/replace s #"[\s=]+" "_")]
@@ -201,22 +158,16 @@
 
 #?(:cljs
    (defn ^:async worker-call
-     "Dispatch a method on a registered handler. Returns the awaited result
-      of the call.
+     "Call `method-name` on handler `handler-key`, and return the awaited
+      result. A nil worker-idx routes through pool.any(), the least-loaded
+      worker. An integer routes through pool.worker(idx).
 
-      With a nil worker-idx, this fn routes through pool.any(), which picks
-      the least-loaded worker. With an integer worker-idx, 0 included, it
-      routes through pool.worker(idx) for affinity.
+      `args` is a JS array or nil. It spreads through the host
+      Function.prototype.apply, because squint `apply` can throw `Cannot
+      convert object to primitive value` on a Comlink proxy.
 
-      `args` is a JS array, or nil. The native `Function.prototype.apply` of
-      the host spreads it into the proxied method. The squint `apply` would
-      coerce a `#js []` through the cljs.core seq machinery, which can throw
-      `Cannot convert object to primitive value` on a Comlink proxy.
-
-      This is the raw dispatch primitive, and it does NOT refcount. call!
-      puts ref-handle! and unref-handle! around each ccall. The signature
-      here carries no ctx-id. Do not fold the refcount in, because a
-      lifecycle op bypasses it for a good reason."
+      No refcount here, because lifecycle ops must bypass it. call! adds
+      ref-handle! and unref-handle! around each ccall."
      [pool handler-key method-name args worker-idx]
      (let [target        (if (some? worker-idx)
                            (.worker pool worker-idx)
@@ -226,12 +177,9 @@
            method-fn     (aget handler-proxy method-name)
            call-args     (or args #js [])
            worker-tag    (if (some? worker-idx) worker-idx "auto")
-           ;; call-args[0] is the ccall C-fn name. It is nil for an op that
-           ;; is not a ccall.
            c-fn          (when (= method-name "ccall") (aget call-args 0))
-           ;; Read the enablement one time, so a paired open and close match
-           ;; even when setLogConfig changes the level during the call. Skip
-           ;; the counter when the substrate is off.
+           ;; Read once, so the open and close events pair even when
+           ;; setLogConfig changes the level during the call.
            queue-enabled? (hrt/isEnabled "QUEUE-DISPATCH" "debug")
            rpc-enabled?   (hrt/isEnabled "RPC-POST" "debug")
            disp-id       (when (or queue-enabled? rpc-enabled?)
@@ -251,36 +199,31 @@
 
 #?(:cljs
    (defn ^:async terminate-pool!
-     "Calls pool.terminate(). This fn is internal to the registry. The
-      shutdown-pool! of the workload-pool registry is the consumer-facing
-      teardown, and it already skips an adopted pool that the caller owns. A
-      consumer does not call this fn directly."
+     "Call pool.terminate(). Consumers tear down through the registry's
+      shutdown-pool!, which skips an adopted pool."
      [pool]
      (await (.terminate pool))))
 
 #?(:cljs
    (defn pool-size
-     "The integer worker count of the pool."
+     "The worker count of `pool`."
      [pool]
      (.-size pool)))
 
-;; Diagnostic substrate config. The host side uses set-log-config!. The
-;; worker side uses the init-args {:handlerRuntime {:logLevel
-;; :logCategories}}. It is opt-in, and off by default.
-
 #?(:cljs
    (defn set-log-config!
-     "Configure the diagnostic substrate on the host side.
+     "Configure the host-side diagnostic substrate, which is off by default.
+      A nil opts turns it off. An absent key keeps its current state.
 
       opts:
-        :level      :off, :error, :warn, :info, :debug or :trace. A nil
-                    value means off. Every current event is debug-grade.
-        :categories The keywords or strings to allow. A nil value allows
-                    all. A category is the lower-case event-tag prefix, thus
-                    BUSY-* is :busy and FR-* is :fr.
+        :level       :off, :error, :warn, :info, :debug or :trace. nil is
+                     off. Every current event is debug level.
+        :categories  Keywords or strings to allow, nil for all. A category
+                     is the lower-case event-tag prefix: BUSY-* is :busy.
 
-      An absent key leaves that state unchanged. A nil opts disables the
-      substrate. For example:
+      Workers take the same config through init-args
+      {:handlerRuntime {:logLevel :logCategories}}.
+
       (set-log-config! {:level :debug :categories [:busy :fr]})"
      [opts]
      (if (nil? opts)
@@ -302,26 +245,20 @@
                                 arr)))))
          (hrt/setLogConfig cfg)))))
 
-;; Cmd-envelope translator, from {:cmd ...} to JS positional args. The
-;; generic ccall is built in. A library-specific op registers its translator
-;; through register-cmd-args!.
-
 #?(:cljs
    (defonce ^:private cmd-args-registry (atom {})))
 
 #?(:cljs
    (defn register-cmd-args!
-     "Register a translator for a custom op. The translator maps a cmd-map
-      to the #js positional args. Thus worker-call stays shape-agnostic for
-      a library-specific op, such as context_create or context_destroy."
+     "Register `f`, which maps a cmd-map to #js positional args, for a
+      library-specific op such as context_create."
      [op-name f]
      (swap! cmd-args-registry assoc op-name f)))
 
 #?(:cljs
    (defn- ccall-args
-     "Build the 5-argument JS array for a ccall envelope. A non-standard key
-      travels in the trailing `extra` object, and a consumer handler reads it
-      there."
+     "The 5-element JS args of a ccall envelope. Other keys go in the
+      trailing `extra` object for the handler."
      [cmd]
      (let [extra    (js-obj)
            std-keys #{:cmd :fn :returnType :argTypes :args}]
@@ -332,9 +269,9 @@
 
 #?(:cljs
    (defn cmd-args
-     "Translate a {:cmd ...} envelope to the #js positional args of the
-      handler method. \"ccall\" is built in. Another op uses its
-      register-cmd-args! translator. An unknown op gives an empty arg list."
+     "Translate a {:cmd ...} envelope to #js positional args for the handler
+      method. \"ccall\" is built in. Other ops use their register-cmd-args!
+      translator, and an unknown op gives #js []."
      [cmd]
      (let [op (:cmd cmd)]
        (cond
@@ -343,19 +280,14 @@
                  (f cmd)
                  #js [])))))
 
-;; LibraryContext. For each library, it tracks ctx-id -> worker-idx. This is
-;; the CURL* and sqlite3* threading idiom. The placement uses the
-;; worker-router claim(). claim() picks the least-loaded worker, and it
-;; increments claim_count atomically with that pick. Thus there is no race
-;; between the pick and the dispatch. Each ctx carries its own release fn,
-;; and a destroy fires that fn.
+;; LibraryContext: per library, ctx-id -> worker-idx, the CURL* and sqlite3*
+;; affinity idiom. claim() picks the least-loaded worker and increments
+;; claim_count in one step, so no dispatch can race the pick.
 
 #?(:cljs
    (defn claim
-     "Reserve a worker through the worker-router claim(). Returns the JS
-      {index, release} object. clj-native wraps it in
-      assign-worker-for-context!. A direct consumer can use this fn when it
-      must have the raw handle."
+     "Reserve the least-loaded worker through worker-router claim(). Returns
+      the raw #js {index, release}. assign-worker-for-context! wraps it."
      [pool]
      (.claim pool)))
 
@@ -365,41 +297,33 @@
 #?(:cljs
    (defn- now-ms [] (.now js/Date)))
 
-;; A wrapped disposer captures its release Promise here. Thus a consumer can
-;; call flush-pending-disposes! before it terminates the pool. Without that
-;; flush, an async destroy can fail to reach the worker. This does not live
-;; in resource-tracker, which stays close to tech.resource. The async flush
-;; is a clj-native concern.
+;; Release Promises of wrapped disposers, for flush-pending-disposes!. They
+;; live here, not in resource-tracker, to keep that close to tech.resource.
 
 #?(:cljs
    (defonce ^:private pending-disposes (atom #js [])))
 
 #?(:cljs
    (defonce ^:private pending-disposes-by-parent (atom {})))
-;; parent-ctx-id -> #js [Promise ...]. This lets a ctx destroy drain ITS
-;; children only, and not every in-flight dispose. The 2-arity form of
-;; capture-pending-dispose! populates it. A nil parent goes to the flat list
-;; only.
+;; parent-ctx-id -> #js [Promise ...], so a ctx destroy drains only its own
+;; children.
 
 #?(:cljs
    (defonce ^:private in-flight-by-parent (atom {})))
-;; parent-ctx-id -> the count of child handles with an unsettled dispose
-;; worker_call. The 6-arity register-handle! increments it. It decrements
-;; when the release Promise settles. destroy-context! gates on a value of
-;; zero. That closes the TOCTOU window, where a membership poll saw the entry
-;; dissoc'd before its worker_call posted.
+;; parent-ctx-id -> count of child handles registered with this parent whose
+;; release has not settled. A live, undisposed child counts. A parent destroy
+;; waits for zero. A membership poll is not enough: an entry leaves
+;; live-handles before its worker_call posts.
 
 #?(:cljs
    (defonce ^:private gate-promises-by-parent (atom {})))
-;; parent-ctx-id -> {:promise :resolve}. destroy-context! awaits this, and it
-;; does no poll. The promise resolves when in-flight reaches zero. A
-;; setTimeout-0 poll here starves behind the worker-queue traffic.
+;; parent-ctx-id -> {:promise :resolve}, resolved when in-flight reaches
+;; zero. A parent destroy awaits it, because a setTimeout-0 poll starves
+;; behind worker-queue traffic.
 
 #?(:cljs
    (defn- ensure-gate-promise!
-     "The deferred {:promise :resolve} for `parent`. This fn creates it
-      lazily. Single-threaded JS makes the create-if-missing free of a
-      race."
+     "The deferred {:promise :resolve} for `parent`, created on first use."
      [parent]
      (when-not (contains? @gate-promises-by-parent parent)
        (let [resolve-fn (atom nil)
@@ -413,10 +337,7 @@
 
 #?(:cljs
    (defn- resolve-gate-promise!
-     "When `parent` has a deferred gate Promise, remove the entry and
-      resolve the Promise with nil. The decrement! of the 6-arity
-      register-handle! calls this fn when in-flight-by-parent[parent] reaches
-      zero."
+     "Remove and resolve the gate Promise of `parent`, if it has one."
      [parent]
      (when-let [entry (get @gate-promises-by-parent parent)]
        (swap! gate-promises-by-parent dissoc parent)
@@ -424,11 +345,9 @@
 
 #?(:cljs
    (defn await-parent-drain!
-     "A Promise that resolves when the in-flight count of the parent reaches
-      zero. It resolves at once when that count is zero already. The caller
-      MUST check again after the resolve. A new register-handle! can
-      increment the count between the resolve and the next step of the
-      caller."
+     "A Promise that resolves when the in-flight count of `parent` is zero.
+      Check the count again after it resolves, because a new
+      register-handle! can raise it first."
      [parent]
      (if (zero? (get @in-flight-by-parent parent 0))
        (js/Promise.resolve nil)
@@ -436,11 +355,8 @@
 
 #?(:cljs
    (defn- capture-pending-dispose!
-     "When `result` is a Promise, push it onto pending-disposes. When
-      parent-ctx-id is not nil, also push it onto the bucket for that parent
-      in pending-disposes-by-parent. Thus destroy-context! can drain the
-      children of this ctx only. Returns `result` unchanged, so a caller
-      chain sees the original value."
+     "When `result` is a Promise, add it to pending-disposes, and to the
+      bucket of parent-ctx-id when that is not nil. Returns `result`."
      ([result] (capture-pending-dispose! result nil))
      ([result parent-ctx-id]
       (when (instance? js/Promise result)
@@ -455,18 +371,14 @@
 
 #?(:cljs
    (defn drain-pending-disposes-for-parent!
-     "Return a Promise.allSettled over the handle dispose Promises under
-      `parent-ctx-id`. It covers the Promises captured since the last drain
-      of that bucket. This fn clears the bucket before it awaits. Thus a
-      concurrent capture lands on the next drain, and nothing is lost. It
-      resolves immediately when the bucket is empty or unknown, so a caller
-      can always await it.
+     "Promise.allSettled over the dispose Promises captured under
+      `parent-ctx-id` since its last drain. Clears the bucket first, so a
+      concurrent capture goes to the next drain. Resolves at once for an
+      empty or unknown bucket.
 
-      Pair this fn with destroy-context!. Then the ctx destroy awaits the
-      already-firing call!s of its children, before it posts context_destroy
-      to the worker. Without this gate, the destroy can race ahead of an
-      in-flight handle dispose. It then frees the parent context while the
-      child release is still in transit."
+      A consumer's parent destroy (clj-proj's wasm/destroy-context!) awaits
+      it before it posts context_destroy, so it cannot free the parent while
+      a child release is in transit."
      [parent-ctx-id]
      (let [bucket (get @pending-disposes-by-parent parent-ctx-id)]
        (if (or (nil? bucket) (zero? (.-length bucket)))
@@ -477,10 +389,10 @@
 
 #?(:cljs
    (defn flush-pending-disposes!
-     "A Promise.allSettled over the disposer Promises captured since the last
-      flush. This fn clears the list before it awaits, so a concurrent
-      dispose lands on the next flush. Await this fn before you terminate the
-      workers. Otherwise an async destroy can fail to reach them."
+     "Promise.allSettled over the disposer Promises captured since the last
+      flush. Clears the list first, so a concurrent dispose goes to the next
+      flush. Await it before you terminate the workers, or an async destroy
+      can fail to reach them."
      []
      (let [pending @pending-disposes]
        (reset! pending-disposes #js [])
@@ -488,10 +400,9 @@
 
 #?(:cljs
    (defn fire-and-capture-dispose!
-     "Fire `disposer-fn`, and capture its Promise into pending-disposes.
-      Thus an explicit (Symbol.dispose) release drains through
-      flush-pending-disposes!, the same as a GC-fired release. This fn emits
-      the optional context-info as EXPLICIT-DISPOSE."
+     "Call `disposer-fn` and capture its Promise, so an explicit
+      (Symbol.dispose) release drains through flush-pending-disposes! like a
+      GC release. Traces `context-info` as EXPLICIT-DISPOSE."
      ([disposer-fn]
       (fire-and-capture-dispose! disposer-fn nil))
      ([disposer-fn context-info]
@@ -503,7 +414,8 @@
 ;; library-key ->
 ;;   {:ctx-workers (atom {ctx-id -> {:idx Integer :release Fn}})
 ;;    :live-handles    (atom {ctx-id -> {:owner WeakRef :release Fn
-;;                                   :exec-unit Integer :touched-at ms
+;;                                   :exec-unit Integer :parent-ctx-id
+;;                                   :created-at ms :touched-at ms
 ;;                                   :refcount Integer}})
 ;;    :max-live-ctxs (Integer | nil)
 ;;    :min-age-ms   Integer
@@ -511,9 +423,8 @@
 ;;    :stats (atom {:evictions Integer :blocks Integer})
 ;;    :worker-idx-extractor (Fn | nil)}
 ;;
-;; ctx-workers holds the claim drainers. live-handles holds the bounded-LRU
-;; entries. The two can overlap on the same ctx-id, or they can run in
-;; parallel for each library.
+;; ctx-workers holds claim releases. live-handles holds bounded-LRU entries.
+;; A ctx-id can be in both.
 
 #?(:cljs
    (defn- ensure-library!
@@ -525,7 +436,6 @@
                 :live-handles (atom {})
                 :max-live-ctxs nil
                 :min-age-ms DEFAULT-MIN-AGE-MS
-                ;; The ctx-ids that an eviction reclaimed, as tombstones.
                 :evicted (atom #{})
                 :stats (atom {:evictions 0 :blocks 0})}))
       (when (some? opts)
@@ -538,20 +448,18 @@
 
 #?(:cljs
    (defn register-library-context!
-     "Declare that library-key uses the LibraryContext pattern, and
-      initialize the state for that library. This fn is idempotent.
+     "Set up the LibraryContext state of `library-key`. Idempotent.
 
       opts:
-        :max-live-ctxs The bound. A nil value means no bound.
-        :min-age-ms    The eviction age gate. The default is 100."
+        :max-live-ctxs  The live-handle bound. nil means none.
+        :min-age-ms     The eviction age gate. Default 100."
      ([library-key] (ensure-library! library-key))
      ([library-key opts] (ensure-library! library-key opts))))
 
 #?(:cljs
    (defn- default-worker-idx-extractor
-     "The default convention. An object with .worker_idx, the munged form of
-      :worker-idx, carries the worker index. A map with :worker-idx carries
-      it too."
+     "The worker index from an object's .worker_idx (munged :worker-idx) or
+      a map's :worker-idx, else nil."
      [arg]
      (cond
        (and (object? arg) (some? (.-worker-idx arg)))
@@ -562,31 +470,23 @@
 
 #?(:cljs
    (defn register-worker-idx-predicate!
-     "Override the default worker-idx extractor for a library. The extractor
-      is a fn from an argument to an index, or to nil. This is necessary only
-      when a handle carries the index under a non-standard property name.
-      worker-idx-from-args reads the registry slot that this fn writes, on
-      every affinity-routed call."
+     "Set the worker-idx extractor of a library, a fn from one argument to
+      an index or nil. Needed only when a handle keeps the index under
+      another property name."
      [library-key extractor-fn]
      (ensure-library! library-key)
      (swap! library-contexts assoc-in [library-key :worker-idx-extractor] extractor-fn)))
 
 #?(:cljs
    (defn worker-idx-from-args
-     "Affinity routing. Scan `args` with the extractor of the library, and
-      return the first worker-idx that an argument carries. Return 0 when no
-      argument carries one.
+     "The first worker-idx that the library extractor finds in `args`, else
+      0. The 0 default pins unrouted calls to one worker, because each
+      worker's wasm module holds its own state, such as MEMFS files and
+      driver registries, and this layer cannot tell a pure call from one
+      that touches it.
 
-      The 0 result pins every call with no affinity to worker 0, on purpose.
-      A wasm module for each worker is worker-local state. That state covers
-      MEMFS files, driver registries, error state and the allocator. This
-      layer cannot separate a pure call from a call that creates or reads
-      that state. Thus an unrouted call gets a deterministic worker, and not
-      a least-loaded one.
-
-      A consumer that knows a call is spreadable routes that call itself. It
-      calls worker-call directly with a nil worker-idx for the any() path, or
-      it passes :force-worker-idx through call!."
+      To spread a known-pure call, call worker-call with a nil worker-idx,
+      or pass :force-worker-idx through call!."
      [library-key args]
      (let [entry (get @library-contexts library-key)
            extract (or (:worker-idx-extractor entry) default-worker-idx-extractor)]
@@ -594,12 +494,12 @@
 
 #?(:cljs
    (defn assign-worker-for-context!
-     "Pick a worker for a new context. Returns {:idx :release}. This fn
-      bounds-checks an explicit :worker, and it takes no claim for that case.
-      Without :worker, pool.claim() picks the least-loaded worker.
+     "Pick a worker for a new context. Returns {:idx :release}. An explicit
+      :worker is bounds-checked and takes no claim. Without it,
+      pool.claim() picks the least-loaded worker.
 
-      A consumer MUST fire release exactly one time, on a destroy or on a
-      create failure. Then the claim_count of the pool drains."
+      Call release exactly once, on destroy or on create failure, so the
+      claim_count of the pool drains."
      [pool library-key opts]
      (ensure-library! library-key)
      (if-let [explicit (:worker opts)]
@@ -612,12 +512,10 @@
 
 #?(:cljs
    (defn track-context!
-     "Record ctx-id -> {:idx :release}. Also register `owner` for GC
-      reclaim, so release-fn fires when V8 collects the owner.
-
-      release-fn MUST NOT close over `owner`, because that would pin the
-      owner. A CAS wraps the disposer. Thus an explicit untrack and a later
-      FinalizationRegistry fire stay one release."
+     "Record ctx-id -> {:idx :release}, and track `owner` so release-fn
+      fires when V8 collects it. release-fn must not close over `owner`, or
+      the owner stays reachable. A CAS makes an explicit untrack plus a later
+      GC fire one release."
      [library-key ctx-id worker-idx release-fn owner]
      (ensure-library! library-key)
      (let [ctx-workers (:ctx-workers (get @library-contexts library-key))
@@ -635,9 +533,8 @@
 
 #?(:cljs
    (defn untrack-context!
-     "Fire the stored release for ctx-id, which drains the claim of the pool.
-      This fn does nothing for an untracked ctx-id. The wrapped-release CAS
-      makes it idempotent."
+     "Fire the stored release of ctx-id, which drains its pool claim.
+      Idempotent, and a no-op for an untracked ctx-id."
      [library-key ctx-id]
      (when-let [entry (get @library-contexts library-key)]
        (let [ctx-workers (:ctx-workers entry)
@@ -647,9 +544,8 @@
 
 #?(:cljs
    (defn get-context-worker
-     "The worker-idx for a ctx. The ctx is a map with :ctx-id, or a raw
-      ctx-id. Returns 0 for an untracked ctx, which keeps backward
-      compatibility."
+     "The worker-idx of `ctx`, a map with :ctx-id or a raw ctx-id. 0 for an
+      untracked ctx."
      [library-key ctx]
      (let [ctx-id (cond
                     (map? ctx) (:ctx-id ctx)
@@ -661,10 +557,9 @@
 
 #?(:cljs
    (defn reset-library-context!
-     "Fire every stored release, which covers the claims and the LRU
-      disposers. Then clear ctx-workers, live-handles and the eviction
-      tombstones. This is the consumer shutdown path. The CAS on each release
-      makes a later FinalizationRegistry fire do nothing."
+     "Consumer shutdown. Fire every stored claim release and LRU disposer,
+      then clear ctx-workers, live-handles and the eviction tombstones. The
+      CAS on each release makes a later GC fire a no-op."
      [library-key]
      (when-let [entry (get @library-contexts library-key)]
        (let [ctx-workers (:ctx-workers entry)
@@ -683,18 +578,14 @@
 
 #?(:cljs
    (defn register-handle!
-     "Track a handle in live-handles. Also register `owner` with
-      resource-tracker, so release-fn fires on GC. Returns ctx-id.
+     "Track a handle in live-handles, and track `owner` so release-fn frees
+      the native handle on GC. Returns ctx-id. release-fn must not close
+      over `owner`, or the owner stays reachable. A CAS makes an eviction or
+      manual release plus a later GC fire one release.
 
-      release-fn releases the native handle. It MUST NOT close over `owner`,
-      because that would pin the owner. A CAS guard makes this fn idempotent.
-      Thus an eviction or a manual release, with a later FinalizationRegistry
-      fire, stays one release.
-
-      The 6-arity form attributes the handle to parent-ctx-id. It buckets the
-      release Promise for destroy-context! to await. It also increments
-      in-flight-by-parent here, and decrements it on settle. That pair is the
-      TOCTOU gate. The 5-arity form records no parent."
+      With parent-ctx-id, the release Promise goes into that parent's
+      bucket, and in-flight-by-parent counts the handle until the Promise
+      settles. A parent destroy gates on that count."
      ([library-key ctx-id exec-unit-idx release-fn owner]
       (register-handle! library-key ctx-id exec-unit-idx release-fn owner nil))
      ([library-key ctx-id exec-unit-idx release-fn owner parent-ctx-id]
@@ -734,7 +625,6 @@
                 :created-at (now-ms)
                 :touched-at (now-ms)
                 :refcount 0})
-        ;; A fresh handle removes the tombstone of a recurring ctx-id.
         (swap! (:evicted lib) disj ctx-id)
         (when (some? parent-ctx-id)
           (swap! in-flight-by-parent
@@ -743,15 +633,13 @@
 
 #?(:cljs
    (defn dispose-handle!
-     "Fire the release of a live handle at once, by ctx-id. It uses the SAME
-      wrapped disposer that GC uses. Thus an explicit (Symbol.dispose)
-      release runs the full accounting: the CAS guard, the dissoc, the
-      in-flight decrement, and the capture.
-
-      Returns the dispose Promise. Returns nil when the handle is gone, and
-      the caller must then use its raw destroy-fn. A raw destroy that skips
-      this fn never decrements in-flight-by-parent, and that wedges the drain
-      gate of destroy-context!."
+     "Fire the release of live handle ctx-id now, through the same wrapped
+      disposer as GC, so the in-flight accounting runs. Returns release-fn's
+      result (the dispose Promise), or undefined when the handle is gone and
+      the caller must use its raw destroy-fn. release-fn must return a
+      Promise, or the caller cannot tell the two apart. A raw destroy of a
+      live handle never decrements in-flight-by-parent, and wedges a parent
+      destroy."
      [library-key ctx-id]
      (when-let [lib (get @library-contexts library-key)]
        (when-let [stored (get @(:live-handles lib) ctx-id)]
@@ -760,17 +648,16 @@
 
 #?(:cljs
    (defn in-flight-count-for-parent
-     "The count of child handles of `parent` with an unsettled dispose
-      worker_call. destroy-context! gates on a value of zero."
+     "The count of child handles registered under `parent` whose release has
+      not settled, live children included."
      [parent]
      (get @in-flight-by-parent parent 0)))
 
 #?(:cljs
    (defn ref-handle!
-     "Increment the refcount, and update :touched-at. Dispatch calls this fn
-      on entry, for any ccall with a reference to ctx-id. It pairs with
-      unref-handle! in the dispatch finally. The eviction guard uses a
-      refcount above 0 to skip an in-flight context."
+     "Increment the refcount of ctx-id and update :touched-at. Pair it with
+      unref-handle! in a finally. Eviction skips an entry with a refcount
+      above 0."
      [library-key ctx-id]
      (when-let [lib (get @library-contexts library-key)]
        (swap! (:live-handles lib)
@@ -783,31 +670,27 @@
 
 #?(:cljs
    (defn unref-handle!
-     "Decrement the refcount. Dispatch calls this fn on exit, in the finally,
-      and that includes the throw path. It does nothing for an untracked
-      ctx-id."
+     "Decrement the refcount of ctx-id, with a floor of 0. A no-op for an
+      untracked ctx-id."
      [library-key ctx-id]
      (when-let [lib (get @library-contexts library-key)]
        (swap! (:live-handles lib)
               (fn [m]
                 (if (contains? m ctx-id)
-                  ;; Keep 0 as the floor. An unpaired or double unref must not
-                  ;; drive the refcount below zero. Otherwise the (zero?
-                  ;; refcount) test of the eviction guard never fires, and the
-                  ;; entry pins forever.
+                  ;; A count below zero would let the next ref-handle! leave
+                  ;; an in-flight entry at 0, where eviction can free it
+                  ;; mid-call.
                   (update-in m [ctx-id :refcount] (fn [rc] (max 0 (dec rc))))
                   m))))))
 
-;; The eviction gate, stated one time. find-oldest-evictable picks by it, and
-;; get-pool-detail reports on it. Thus the diagnostic cannot drift from the
-;; behavior that it explains. Each one takes a single `now` snapshot and
-;; passes it down. Thus no entry can cross the age boundary during a scan.
+;; find-oldest-evictable and get-pool-detail share one eviction gate, so the
+;; diagnostic matches the behavior. Each takes one `now` snapshot, so no
+;; entry crosses the age boundary during a scan.
 
 #?(:cljs
    (defn- entry-age-ms
-     "The age of a live-handles entry, against the `now` snapshot of the
-      caller. This fn reads :created-at. Thus a context that updates
-      :touched-at again and again still ages out."
+     "The age of entry `e` at `now`, from :created-at, so a context that is
+      touched often still ages out."
      [e now]
      (- now (or (:created-at e) (:touched-at e)))))
 
@@ -822,10 +705,10 @@
 
 #?(:cljs
    (defn- find-oldest-evictable
-     "The LRU [ctx-id entry] with a refcount of 0, above min-age. Returns nil
-      when there is none. Owner reachability does not gate this choice. Thus
-      the cap reclaims an idle context ahead of GC. The caller then calls
-      invalidate-evicted! on it, so a reuse fails cleanly."
+     "The least recently touched [ctx-id entry] that is idle and past
+      min-age, or nil. Owner reachability does not count, so the cap
+      reclaims idle contexts ahead of GC. The caller must
+      invalidate-evicted! the entry, so a reuse fails cleanly."
      [live min-age-ms]
      (let [now (now-ms)
            evictable (filter (fn [kv] (entry-evictable? (val kv) now min-age-ms))
@@ -838,9 +721,8 @@
 
 #?(:cljs
    (defn- invalidate-evicted!
-     ;; Tombstone the ctx-id, and mark the owner, which is still reachable.
-     ;; Do this before anything frees the native handle. Thus a reuse reaches
-     ;; evicted?, and it does not reach freed memory.
+     ;; Run before the release frees the native handle, so a reuse of the
+     ;; still-reachable owner hits evicted? and not freed memory.
      [lib ctx-id entry]
      (when-let [owner (some-> ^js/WeakRef (:owner entry) (.deref))]
        (aset owner evicted-owner-marker true))
@@ -848,21 +730,17 @@
 
 #?(:cljs
    (defn evicted?
-     "Returns true if and only if an LRU eviction reclaimed ctx-id. Such an
-      eviction frees the native handle."
+     "True when an LRU eviction reclaimed ctx-id and freed its native
+      handle."
      [library-key ctx-id]
      (boolean (when-let [lib (get @library-contexts library-key)]
                 (some-> (:evicted lib) deref (contains? ctx-id))))))
 
 #?(:cljs
    (defn evict-oldest!
-     "Reclaim the LRU evictable entry. This fires its release, and
-      invalidates it. Returns \"evicted\", \"none-evictable\", or \"empty\".
-
-      An evictable entry has a refcount of 0 and an age above min-age. Refer
-      to find-oldest-evictable. This fn does not touch the stats counter.
-      bounded-create-handle! owns that counter, which prevents a double
-      count."
+     "Invalidate and release the LRU evictable entry. Returns \"evicted\",
+      \"none-evictable\" or \"empty\". Does not update :evictions, which
+      counts only bounded-create-handle! evictions."
      [library-key]
      (when-let [lib (get @library-contexts library-key)]
        (let [live @(:live-handles lib)
@@ -878,14 +756,10 @@
 
 #?(:cljs
    (defn bounded-create-handle!
-     "Run `create-fn` under the max-live-ctxs gate. `create-fn` must call
-      register-handle!.
-
-      At the bound or above it, this fn evicts the LRU idle entry first. When
-      no entry is evictable, it throws an ex-info with
-      {:blocked :bounded-blocked}. No entry is evictable when every entry is
-      busy, with a refcount above 0, or is below min-age. Returns the result
-      of `create-fn`."
+     "Run `create-fn`, which must call register-handle!, under the
+      max-live-ctxs bound, and return its result. At the bound, evict the
+      LRU idle entry first. When every entry is busy or below min-age, throw
+      ex-info with {:blocked :bounded-blocked}."
      [library-key create-fn]
      (ensure-library! library-key)
      (let [lib (get @library-contexts library-key)
@@ -907,13 +781,11 @@
 
 #?(:cljs
    (defn get-pool-detail
-     "DIAGNOSTIC. A breakdown for each entry, of why that entry is evictable
-      or is not. Returns a plain JS object of {total, evictable,
-      blocked_refcount, blocked_age_gate, blocked_weakref, sample}.
-
-      `sample` lists 8 blocked entries at most. Each one carries the fields
-      {ctx_id, refcount, owner_alive, age_ms, age_gated}. Returns undefined
-      when the library is not registered."
+     "Diagnostic. Why each live entry is or is not evictable, as #js {total,
+      evictable, blocked_refcount, blocked_age_gate, blocked_weakref (always
+      0: owner reachability does not gate eviction), sample}. `sample` holds up to 8 blocked entries as {ctx_id, refcount,
+      owner_alive, age_ms, age_gated}. undefined for an unregistered
+      library."
      [library-key]
      (when-let [lib (get @library-contexts library-key)]
        (let [live @(:live-handles lib)
@@ -951,10 +823,8 @@
 
 #?(:cljs
    (defn get-pool-stats
-     "Return the counters of each library as a plain JS object. Thus a JS
-      caller and the LRU acceptance test get property-access semantics. The
-      shape is {live, evictions, blocks, max_live_ctxs, min_age_ms}. Returns
-      undefined when the library is not registered."
+     "The counters of a library as #js {live, evictions, blocks,
+      max_live_ctxs, min_age_ms}. undefined for an unregistered library."
      [library-key]
      (when-let [lib (get @library-contexts library-key)]
        (let [s @(:stats lib)]
@@ -964,10 +834,8 @@
               :max_live_ctxs (:max-live-ctxs lib)
               :min_age_ms (:min-age-ms lib)}))))
 
-;; A .cljc consumer that requires this namespace cross-platform resolves
-;; these on the JVM. Each one fails loudly at the call, with the correct
-;; name. That is better than a break of the consumer compile on an unresolved
-;; var.
+;; These let a .cljc consumer compile on the JVM. Each throws at the call,
+;; with its own name.
 #?(:clj
    (do
      (defn- unsupported
@@ -1019,6 +887,6 @@
      (defn get-pool-detail [_library-key] (unsupported 'get-pool-detail))
      (defn get-pool-stats [_library-key] (unsupported 'get-pool-stats))
      (defn evicted? [_library-key _ctx-id] (unsupported 'evicted?))
-     ;; The diagnostic substrate is JS-only at this time. This JVM version
-     ;; does nothing, thus a consumer can call it with no platform branch.
+     ;; A no-op, so a consumer needs no platform branch for a JS-only
+     ;; diagnostic.
      (defn set-log-config! [_opts] nil)))

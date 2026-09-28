@@ -4,27 +4,16 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// MEMFS staging helper for wasm-backed handlers. A worker that runs an
-// emscripten module has its own MEMFS. That MEMFS cannot see host paths. To
-// let the C library in the worker read a host file, the consumer must first
-// copy the bytes across the worker boundary into MEMFS.
-//
-// stageFiles(module, files, memfsDir) makes the directory, writes the bytes of
-// each file, and returns a map of basename to absolute MEMFS path. A repeat
-// call on the same directory is safe. The host half of the job stays with the
-// consumer, because it is specific to the library and the platform. The
-// consumer reads the bytes from disk and groups sibling files that must stage
-// together. Call stageFiles from a handler method on the worker side. The host
-// reaches it through pool.worker-call.
+// MEMFS staging for wasm-backed handlers. A worker's emscripten MEMFS cannot
+// see host paths, and the consumer must copy file bytes into it first. A
+// repeat stageFiles call is safe.
 
 const EEXIST = 20;
 
 const ensureUint8 = (value, name) => {
   if (value instanceof Uint8Array) return value;
-  // A bare ArrayBuffer has a byteLength but no .buffer, so it misses the
-  // typed-array arm below. fetch().arrayBuffer() hands one back, and the
-  // fingerprint walk in handler-runtime already counts an ArrayBuffer as
-  // bytes, so refusing it here would make the package disagree with itself.
+  // A bare ArrayBuffer, as from fetch().arrayBuffer(), has no .buffer and
+  // misses the typed-array arm below.
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (value && typeof value.byteLength === 'number' && typeof value.buffer !== 'undefined') {
     return new Uint8Array(value.buffer, value.byteOffset ?? 0, value.byteLength);
@@ -34,10 +23,8 @@ const ensureUint8 = (value, name) => {
 };
 
 const mkdirP = (FS, dir) => {
-  // mkdirTree came in with emscripten 1.39. It makes every level of the path,
-  // and a repeat call is safe. An older build has only mkdir, which makes one
-  // level and throws EEXIST if the directory is already there. Most consumers
-  // pass a directory of one level, so the older path is enough for them.
+  // mkdirTree makes every level. A build without it has only mkdir, which
+  // makes one level, enough for the usual one-level directory.
   if (typeof FS.mkdirTree === 'function') {
     FS.mkdirTree(dir);
     return;

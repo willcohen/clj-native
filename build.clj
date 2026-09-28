@@ -5,8 +5,8 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns build
-  "tools.build for the jar of this project. This is NOT the consumer-facing
-   build API, which is net.willcohen.native.build under src/bb."
+  "tools.build tasks for the jar of this project. The consumer build API is
+   net.willcohen.native.build."
   (:require [clojure.tools.build.api :as b]))
 
 (def lib 'net.willcohen/native)
@@ -14,7 +14,7 @@
 (def class-dir "target/classes")
 (def jar-file (format "target/%s-%s.jar" (name lib) version))
 
-;; delay to defer artifact resolution until a task actually runs
+;; delay: resolve artifacts only when a task runs.
 (def basis (delay (b/create-basis {:project "deps.edn"})))
 
 (defn clean [_]
@@ -25,10 +25,8 @@
                 :lib lib
                 :version version
                 :basis @basis
-                ;; write-pom fills the pom's single <sourceDirectory> from the
-                ;; first entry and prints "Skipping paths:" for the rest.
-                ;; Passing only src/clj says the same thing without the noise;
-                ;; jar content comes from copy-dir below, not from this key.
+                ;; The pom takes one dir and warns about the rest. copy-dir
+                ;; fills the jar.
                 :src-dirs ["src/clj"]
                 :pom-data [[:licenses
                             [:license
@@ -42,12 +40,9 @@
                            [:scm
                             [:url "https://github.com/willcohen/clj-native"]]]}))
 
-;; tools.build's own defaults (clojure.tools.build.tasks.copy/default-ignores,
-;; which is private) plus every .mjs. Six of the thirteen .mjs under src/cljc
-;; are gitignored squint output, so including them would make jar content
-;; depend on whatever `bb build:js` last left on disk. The other seven are
-;; hand-written but equally inert on the JVM: no consumer loads a clj-native
-;; .mjs off the classpath, and npm is the delivery path for the JS surface.
+;; The private tools.build default-ignores plus every .mjs. The squint output
+;; is gitignored, so the jar would hold whatever build:js last left, and no
+;; JVM consumer loads a .mjs. npm ships the JS.
 (def ^:private jar-ignores [".*~$" "^#.*#$" "^\\.#.*" "^.DS_Store$" ".*\\.mjs$"])
 
 (defn jar [_]

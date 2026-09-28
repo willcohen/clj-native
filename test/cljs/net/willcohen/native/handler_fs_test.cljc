@@ -4,13 +4,8 @@
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 (ns net.willcohen.native.handler-fs-test
-  "Coverage for handler-fs's MEMFS staging.
-
-   stageFiles takes the module as an argument, so a recording stand-in for
-   module.FS is enough: the suite reads back what was written and under which
-   path, which is the whole contract. Both mkdir shapes are covered, because
-   the older emscripten path (single mkdir plus an EEXIST catch) is the one a
-   consumer on a pinned toolchain takes and it would otherwise never run."
+  "Tests of handler-fs's MEMFS staging against a stand-in module.FS that
+   records each call."
   (:require [cljs.test :refer [deftest is testing]]
             ["ffi-wasm/handler-fs" :refer [stageFiles]]
             ["ffi-wasm/test-runner" :as tr]))
@@ -18,9 +13,9 @@
 (def ^:private EEXIST 20)
 
 (defn- fake-fs
-  "A stand-in module whose FS records every call. `mkdir-kind` picks which
-   emscripten shape it presents: :tree exposes mkdirTree, :legacy exposes only
-   mkdir and throws EEXIST on a repeat, :hostile throws a non-EEXIST errno."
+  "A stand-in module whose FS records every call. `mkdir-kind` :tree exposes
+   mkdirTree, :legacy only a mkdir that throws EEXIST on a repeat, and
+   :hostile a mkdir that throws EACCES."
   [mkdir-kind]
   (let [writes (atom [])
         mkdirs (atom [])
@@ -83,8 +78,7 @@
       (testing "a plain array is copied element-wise"
         (is (= [5 6 7] (vec (js/Array.from (get by-path "/d/arr.dat"))))))
       (testing "a bare ArrayBuffer is bytes too, though it has no .buffer"
-        ;; fetch().arrayBuffer() hands one back, and handler-runtime's
-        ;; fingerprint walk already counts an ArrayBuffer as a byte carrier.
+        ;; fetch().arrayBuffer() returns one.
         (is (= [3 4] (vec (js/Array.from (get by-path "/d/ab.dat")))))))))
 
 (deftest stage-files-rejects-a-value-that-is-not-bytes
@@ -95,6 +89,7 @@
       (is (thrown-with-msg? js/Error #"bad\.dat"
                             (stageFiles module #js {"bad.dat" "text"} "/d"))))))
 
+;; An emscripten with no mkdirTree takes this path, as on a pinned toolchain.
 (deftest stage-files-on-an-older-emscripten-tolerates-eexist
   (let [{:keys [module mkdirs]} (fake-fs :legacy)]
     (stageFiles module #js {"a.dat" (js/Uint8Array. #js [1])} "/d")

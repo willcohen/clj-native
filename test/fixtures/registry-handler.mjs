@@ -4,11 +4,8 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: the smallest worker-router handler module. The
-// workload-pool registry suite registers this under two lib-keys with
-// different :args payloads; ping echoes the payload's tag back, which
-// proves the registry's fold delivered each library's own init payload
-// into the one joint pool.
+// Test fixture: the smallest worker-router handler module. ping echoes the
+// :args tag, so a test can tell which library's init payload arrived.
 export function create(initArgs) {
   const tag = (initArgs && initArgs.tag) || '';
   return {

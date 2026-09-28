@@ -5,22 +5,12 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.http
-  "Platform HTTP transport for wasm and native libraries. These libraries get
-   their networking from the host. One example is a C runtime that issues
-   blocking range GETs or fetch callbacks.
+  "Blocking java.net.http transport for wasm and native libraries that get
+   their networking from the host. A consumer binding calls fetch or
+   range-request from inside its own callback.
 
-   This namespace uses java.net.http only. It does requests and nothing else.
-
-   Callback marshaling stays in each consumer binding. That binding calls fetch
-   or range-request from inside its own callback. The callback is a dt-ffi
-   upcall stub on the FFI path, or a GraalVM ProxyExecutable on the polyglot
-   path. Refer to net.willcohen.native.callbacks for the FFI path.
-
-   A request is a map {:url :method :headers :body :decorate}. :decorate is the
-   auth seam. It is an optional function from request to request, and fetch
-   applies it before dispatch. Thus :decorate can add auth headers. It can also
-   block on a token refresh, because the JVM caller is a real thread. The JS
-   side blocks a caller with Atomics instead."
+   :decorate in a request map is the auth hook. fetch applies it to the
+   request first, and it may block, for example on a token refresh."
   (:require [clojure.string :as str]
             [clojure.tools.logging :as log])
   (:import [java.net URI]
@@ -31,16 +21,10 @@
 (set! *warn-on-reflection* true)
 
 (def ^:private connect-timeout-ms
-  "Cap on the time to make the TCP/TLS connection. java.net.http has no connect
-   timeout by default. Thus an unreachable host blocks the caller thread while
-   the OS continues to retry. The caller here is often a thread that a wasm
-   runtime waits for.
-
-   This namespace has no matching default for the whole request, and that is
-   deliberate. HttpRequest.timeout counts body reception too. Thus a default
-   would stop a healthy multi-megabyte download on a slow link. The JS bridge
-   carries an idle timer to prevent that exact bug. A caller that wants a total
-   cap passes :timeout-ms."
+  "Connect timeout. java.net.http has none, so an unreachable host would
+   block the caller thread. There is no default total timeout, because
+   HttpRequest.timeout includes the body and would stop a slow large
+   download."
   10000)
 
 (defonce ^:private http-client
@@ -51,15 +35,8 @@
         (.build))))
 
 (defn- parse-headers
-  "Lower-case every header name. Then combine repeated field lines.
-
-   RFC 9110 lets a recipient join repeated field lines of one name. The joined
-   form is a single comma-separated value. Thus a repeated Link or Vary keeps
-   all of its entries.
-
-   Set-Cookie is the documented exception. Its values contain commas of their
-   own, and a comma join corrupts them. Thus Set-Cookie keeps the first value
-   only. That is what every name did before this change."
+  "Lower-case header names and join repeated values with \", \" (RFC 9110).
+   Set-Cookie keeps its first value, because its values contain commas."
   [^java.net.http.HttpHeaders http-headers]
   (into {}
         (for [[k vs] (.map http-headers)]
@@ -91,24 +68,17 @@
     (.build built)))
 
 (defn fetch
-  "Send an HTTP request. The request map has these keys:
+  "Send an HTTP request. Keys:
      :url         Required.
-     :method      A keyword or a string. The default is :get.
-     :headers     A map of name to value.
-     :body        A String or a byte[], for POST and PUT.
-     :timeout-ms  An optional total cap. Refer to connect-timeout-ms.
-     :decorate    An optional function from request to request. fetch applies
-                  it first.
+     :method      Keyword or string. Default :get.
+     :headers     Map of name to value.
+     :body        String or byte[].
+     :timeout-ms  Optional total timeout.
+     :decorate    Optional fn from request to request, applied first.
 
-   Returns {:status :headers :body-bytes}. On a transport failure, returns
-   {:status 0 :headers {} :body-bytes nil} and logs the cause at warn level.
-
-   A repeated header becomes one comma-separated value, because the caller is
-   a C library that reads one string for each name. Set-Cookie is the
-   exception, and it keeps its first value only. Refer to parse-headers.
-
-   Status 0 is the one signal a caller gets for every transport failure. Thus
-   the log line is the only place where the cause survives."
+   Returns {:status :headers :body-bytes}, with headers as parse-headers
+   gives them. On a transport failure, logs the cause at warn and returns
+   {:status 0 :headers {} :body-bytes nil}."
   [{:keys [decorate url] :as request}]
   (try
     (let [request (cond-> (dissoc request :decorate)
@@ -124,14 +94,10 @@
       {:status 0 :headers {} :body-bytes nil})))
 
 (defn range-request
-  "Send a GET to :url with a `Range: bytes=offset-(offset+size-1)` header.
-   Takes the same request map as fetch, and also :offset and :size. :decorate
-   still applies.
-
-   Throws on a :size below 1. Without that check, the arithmetic emits a
-   reversed range such as `bytes=100-99`. A server can answer such a range
-   with status 200 and the whole body. The caller then sees a success status
-   with bytes that it never requested. That result is worse than a failure."
+  "fetch :size bytes of :url from :offset with a Range GET. Takes the fetch
+   request map plus :offset and :size. Throws unless :offset >= 0 and
+   :size >= 1, because a server can answer a reversed range with 200 and
+   the whole body."
   [{:keys [offset size headers] :as request}]
   (when-not (and (number? offset) (number? size) (nat-int? (long offset)) (pos? (long size)))
     (throw (ex-info "range-request needs a non-negative :offset and a :size of at least 1"

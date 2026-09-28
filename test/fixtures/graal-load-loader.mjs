@@ -4,16 +4,9 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture for the `load` loader contract bootstrap-graal-module! prefers.
-// It reports what the options carried, so the suite checks the byte encoding as
-// well as the promise-to-future bridge.
-//
-// `load` is deliberately not declared async: an async function always returns a
-// promise, and one of the cases under test is a loader that returns the module
-// itself. options.mode selects the case:
-//   'ok'     resolve with a module-shaped object, after a real await
-//   'throw'  reject, so the error path runs
-//   'sync'   return the module directly, with no promise at all
+// Test fixture for the `load` loader contract. The module reports what the
+// options carried. `load` is not async, so 'sync' mode can return the module
+// itself. 'ok' resolves after an await, and 'throw' rejects.
 
 function describe(options) {
   const db = options.dbBytes;

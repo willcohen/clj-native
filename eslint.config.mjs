@@ -4,10 +4,9 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Lints the hand-written .mjs only. The six ignored src files are squint
-// build outputs (gitignored); test/cljs and test/cljc .mjs are compiled
-// test mirrors. eslint therefore covers: the seven hand-written runtime
-// modules under src/cljc/net/willcohen/native/ and every test fixture.
+// Lints the hand-written .mjs and the test fixtures. The ignored src files are
+// gitignored squint outputs. test/cljs and test/cljc hold compiled test
+// mirrors.
 import js from '@eslint/js';
 import globals from 'globals';
 
@@ -30,15 +29,12 @@ export default [
     languageOptions: {
       ecmaVersion: 'latest',
       sourceType: 'module',
-      // These modules run across Node, browser pages, and workers; the
-      // union keeps host-specific globals (process, self, WebAssembly,
-      // SharedArrayBuffer) resolvable in every file.
+      // These modules run in Node, browser pages and workers.
       globals: { ...globals.browser, ...globals.node, ...globals.worker },
     },
     rules: {
-      // A catch binding named with a leading underscore is deliberately
-      // unused; an empty catch is the deliberate swallow idiom (each site
-      // carries a comment saying why).
+      // A catch binding that starts with '_' is unused on purpose, and so is
+      // an empty catch.
       'no-unused-vars': ['error', { caughtErrorsIgnorePattern: '^_' }],
       'no-empty': ['error', { allowEmptyCatch: true }],
     },

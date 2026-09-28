@@ -4,11 +4,8 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: an HTTP echo server running in its own worker thread. The
-// http-bridge's syncFetch blocks its calling thread on Atomics.wait; if the
-// fixture server shared that event loop it could never accept the fetch
-// worker's connection. Hosting it in a separate thread mirrors production,
-// where the sync caller is an emscripten pthread and the server is external.
+// Test fixture: an HTTP echo server in its own worker thread, since syncFetch
+// blocks the calling thread in Atomics.wait.
 import { parentPort } from 'node:worker_threads';
 import http from 'node:http';
 
@@ -16,9 +13,7 @@ const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
-    // Redirect fixtures exercise redirect:'follow'. Check the more specific
-    // chain paths before the generic /redirect (startsWith would match both).
-    // /redirect-chain -> /redirect-chain-2 -> /query?redirected=2 (two 302 hops).
+    // Match the chain paths before /redirect, since startsWith matches both.
     if (req.url.startsWith('/redirect-chain-2')) {
       res.setHeader('location', '/query?redirected=2');
       res.statusCode = 302;
@@ -31,15 +26,12 @@ const server = http.createServer((req, res) => {
       res.end();
       return;
     }
-    // /redirect -> single 302 to a path that echoes its own url, letting the
-    // test confirm the final response is the target, not the empty 3xx.
     if (req.url.startsWith('/redirect')) {
       res.setHeader('location', '/query?redirected=1');
       res.statusCode = 302;
       res.end();
       return;
     }
-    // /large?bytes=N -> N raw bytes, to drive the transport-buffer overflow path.
     if (req.url.startsWith('/large')) {
       const n = Number(new URL(req.url, 'http://x').searchParams.get('bytes')) || 0;
       res.setHeader('content-type', 'application/octet-stream');
@@ -47,10 +39,8 @@ const server = http.createServer((req, res) => {
       res.end(Buffer.alloc(n, 0x78));  // 0x78 = 'x'
       return;
     }
-    // /slow?chunks=N&delay=M -> N 10-byte chunks M ms apart, so total transfer
-    // time exceeds a short requestTimeoutMs while each gap stays under it. Proves
-    // the worker's timeout is an idle timer (reset per chunk), not a whole-request
-    // cap that would abort a healthy slow transfer.
+    // N 10-byte chunks M ms apart: each gap stays under requestTimeoutMs while
+    // the total goes over it.
     if (req.url.startsWith('/slow')) {
       const u = new URL(req.url, 'http://x');
       const chunks = Number(u.searchParams.get('chunks')) || 3;

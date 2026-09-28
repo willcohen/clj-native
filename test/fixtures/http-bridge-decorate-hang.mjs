@@ -4,9 +4,8 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: a decorator that never resolves. The worker's request timeout
-// must abort it so the blocked Atomics.wait caller unblocks with a status-0
-// transport failure instead of deadlocking forever.
+// Test fixture: a decorator that never resolves. The worker's
+// requestTimeoutMs must abort it.
 export default function decorate() {
   return new Promise(() => {});
 }

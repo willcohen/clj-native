@@ -4,21 +4,9 @@
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 (ns net.willcohen.native.dispatch-test
-  "Dual-runtime coverage for dispatch.cljc's cross-platform surface:
-   the argtype->ccall-type mapping and the hook-registration contract.
-   One body runs under JVM clojure.test (bb test:clj) and squint
-   cljs.test (bb test:cljs).
-
-   The JVM lane requires the ns directly; the cljs lane self-references
-   the package (ffi-wasm/dispatch, ffi-wasm/test-runner) via node's
-   package self-resolution (clj-native's own package.json name is
-   ffi-wasm with an exports map), which is cleaner than reaching into
-   the src tree by relative path and dodges squint's namespace->file
-   resolution (which would look for the module next to this test file).
-
-   :number/:string keyword literals compile to JS strings under squint,
-   and argtype->ccall-type returns those same strings, so a single
-   `(= :number ...)` assertion holds in both lanes."
+  "Tests of dispatch.cljc under JVM clojure.test and squint cljs.test. The cljs
+   build imports ffi-wasm/* by package self-resolution, since squint would look
+   for the ns next to this file."
   (:require #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing]])
             [clojure.string :as string]
@@ -37,6 +25,8 @@
    :lib_count {:rettype :int32   :argtypes [[:ctx :pointer]]}
    :lib_free  {:rettype :void    :argtypes [[:handle :pointer]]}})
 
+;; squint compiles :number to the string "number", so one assertion holds on
+;; both platforms.
 (deftest argtype->ccall-type-maps-every-known-type
   (testing "number-typed argtypes collapse to :number"
     (doseq [t number-typed-argtypes]
@@ -47,8 +37,8 @@
     (is (= :string (d/argtype->ccall-type :string?)))))
 
 (deftest library-validates-fndefs-types-at-build-time
-  ;; An unknown type used to fall through argtype->ccall-type's default
-  ;; arm to :number silently. `library` now rejects it at assembly.
+  ;; argtype->ccall-type maps an unknown type to :number with no error, so
+  ;; `library` must reject it.
   (testing "a fn-def with supported types builds"
     (is (some? (d/library {:key :ok-lib :fndefs sample-fndefs}))))
   (testing "an unknown rettype throws at assembly, not at the first call"
@@ -95,10 +85,8 @@
 
 #?(:clj
    (deftest jvm-postprocess-treats-pointer?-exactly-like-pointer
-     ;; normalize-null-pointer, which the CLJS leg runs, nils a zero for both
-     ;; :pointer and :pointer?. The graal leg runs this fn instead, so a
-     ;; missing :pointer? arm here would give one backend a raw address and a
-     ;; zero where the other gives a TrackablePointer and nil.
+     ;; The CLJS backend nils a zero for both spellings, so a missing :pointer?
+     ;; arm here would make the backends disagree.
      (testing "a null address is nil under either spelling"
        (is (nil? (d/jvm-rettype-postprocess :pointer? 0))))
      (testing "a live address wraps under either spelling"
@@ -112,9 +100,8 @@
        (is (= 0 (d/jvm-rettype-postprocess :string-array? 0))))))
 
 (deftest validate-fn-def!-names-every-supported-type
-  ;; supported-types-msg is written out rather than derived, because (str
-  ;; :pointer) differs between the JVM and squint. Nothing but this test stops
-  ;; the literal drifting from the set it describes.
+  ;; supported-types-msg is a literal, since (str :pointer) differs between
+  ;; the JVM and squint. This test keeps it in step with the set.
   (let [msg (try
               (d/library {:key :msg-lib
                           :fndefs {:lib_bad {:rettype :int128 :argtypes []}}})
@@ -122,9 +109,7 @@
               (catch #?(:clj Exception :cljs :default) e
                 #?(:clj (.getMessage e) :cljs (.-message e))))]
     (is (some? msg) "an unsupported rettype has to throw for this to mean anything")
-    ;; Split into whole tokens rather than substring-matching: ":string" is a
-    ;; prefix of ":string-array", so an includes? check stays green when the
-    ;; standalone :string goes missing.
+    ;; Match whole tokens, since ":string" is a prefix of ":string-array".
     (let [tokens (set (string/split msg #"[ ,]+"))]
       (is (contains? tokens ":pointer") "the token split has to produce bare types")
       (doseq [t d/supported-types]
@@ -147,9 +132,7 @@
          (reset! impl :graal)
          (with-redefs [net.willcohen.native.dispatch/jvm-graal-call
                        (fn [& _] 99)]
-           ;; :lib_count is :int32, which postprocess passes through, so the
-           ;; stub's own value is what a graal route returns. some? would also
-           ;; hold for anything else that came back.
+           ;; Postprocess passes an :int32 through, so the stub's value returns.
            (is (= 99 (d/call! lib :lib_count [7]))
                "same library value now routes to graal")))
        (testing "the FFI leg gives a C string for a :string? argument, and nil for nil"
@@ -160,8 +143,7 @@
                                                      :argtypes [[:key :string?] [:n :int32]]}}
                                   :impl-atom impl
                                   :ffi-impl-ns 'net.willcohen.native.dispatch-test})]
-           ;; The C string lives until the call returns, thus the stub reads
-           ;; it during the call.
+           ;; The C string lives until the call returns, so read it in the stub.
            (with-redefs [net.willcohen.native.platform/call-native-fn
                          (fn [_ns fn-key [s n]]
                            (swap! calls conj [fn-key [(some-> s dt-ffi/c->string) n]])
@@ -178,12 +160,8 @@
 
 #?(:cljs
    (deftest ^:async call!-rejects-an-unknown-fn-key
-     ;; The JVM arm of this lives in the test above, which cannot run here
-     ;; because it redefines the FFI leaf. The guard itself is shared code,
-     ;; but its shape is not: call! is ^:async, so squint turns the throw into
-     ;; a REJECTED PROMISE. A caller that only wraps the call in try/catch
-     ;; without awaiting it sees nothing at all, which is why this pins the
-     ;; rejection rather than a throw.
+     ;; call! is ^:async, so squint turns the throw into a rejected promise. A
+     ;; try/catch with no await sees nothing.
      (let [lib     (d/library {:key :cljs-unknown-lib :fndefs sample-fndefs})
            outcome (await (-> (d/call! lib :lib_nonexistent [])
                               (.then (fn [_] "resolved"))
@@ -206,11 +184,8 @@
     (is (= "" (d/normalize-null-pointer :string "")))))
 
 (deftest ^:async result-check-hook-fires-through-check-result
-  ;; check-result reads the result-check hook from the library VALUE.
-  ;; The check here records its args and changes the result. The test then
-  ;; asserts that the change happened. This proves that check-result finds
-  ;; the hook in the value and calls it with the documented
-  ;; [library fn-key fn-def opts result] signature.
+  ;; check-result reads the hook from the library value and calls it with
+  ;; [library fn-key fn-def opts result].
   (let [seen (atom nil)
         lib  (d/library {:key :dispatch-check-lib
                          :fndefs sample-fndefs
@@ -232,8 +207,7 @@
 
 #?(:cljs
    (deftest ^:async cljs-leg-sends-an-int64-argument-as-a-bigint
-     ;; A WASM_BIGINT module rejects a JS number for an i64 parameter. The
-     ;; fake pool records the arguments that reach the handler ccall.
+     ;; A WASM_BIGINT module rejects a JS number for an i64 parameter.
      (let [seen (atom nil)
            fake #js {:worker (fn [_idx]
                                (js-obj "i64-lib"

@@ -4,26 +4,12 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: a one-test cljs.test namespace whose outcome is chosen by
-// argv[2] (pass | fail | error | teardown | teardown-fail | teardown-ns), run
-// under the real test_runner.mjs so the process exit code is the thing under
-// test. test_runner reads squint's report counters by the string keys "fail"
-// and "error"; if squint renames either, every CLJS suite in clj-native AND
-// clj-proj exits 0 no matter what failed. Driven by test_runner_test.clj,
-// which runs on the JVM so its own verdict does not depend on the runner it
-// is checking.
+// Test fixture: a one-test cljs.test namespace under the real test_runner.mjs.
+// argv[2] picks the outcome, and test_runner_test.clj checks the exit code.
 //
-// The teardown modes cover the other half of the runner's contract: it tells
-// a teardown fn apart from a namespace name by type, so consumers reach it
-// two different ways. One passes a shutdown fn and no names; another passes
-// one name and no teardown. The teardown here resolves on a later tick and
-// prints only then, so a runner that failed to await it would exit first and
-// print nothing.
-//
-// Written by hand rather than compiled from .cljc so it stays readable next
-// to what squint actually emits: `register_test_BANG_` takes a fn carrying
-// {name, ns} metadata, and `is` expands to a `report` call with a "pass" or
-// "fail" type.
+// Written by hand to stay readable. It follows squint output:
+// register_test_BANG_ takes a fn with {name, ns} metadata, and `is` expands to
+// a `report` call.
 
 import * as squint_core from 'squint-cljs/core.js';
 import * as t from 'squint-cljs/src/squint/test.js';
@@ -40,6 +26,7 @@ if (!MODES.includes(mode)) {
 
 const shouldPass = mode !== 'fail' && mode !== 'teardown-fail';
 
+// Prints on a later tick, so a runner that does not await it prints nothing.
 function teardown() {
   return new Promise((resolve) => {
     setTimeout(() => {

@@ -4,17 +4,10 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: the smallest thing graal_wasm.clj can talk to. Exposes the
-// `initialize(opts)` -> onSuccess(module) contract that
-// bootstrap-graal-module! drives, and hands back an emscripten-shaped Module
-// backed by a real WebAssembly.Memory, so the JVM code under test reaches
-// genuine wasm memory through polyglot rather than a JS stand-in.
-//
-// The module bytes are written out below instead of compiled, so this suite
-// needs neither emcc nor wabt. Everything emscripten normally generates in JS
-// (the HEAP views, getValue/setValue, the UTF-8 pair) is JS here too; only the
-// memory and the allocator are wasm, which is exactly the boundary wasm.cljc
-// crosses.
+// Test fixture: an emscripten-shaped Module over a real WebAssembly.Memory,
+// behind the `initialize(opts)` -> onSuccess(module) contract. The wasm bytes
+// are written out, so the suite needs no emcc or wabt. Only the memory and the
+// allocator are wasm.
 
 // (module
 //   (memory 2)
@@ -61,9 +54,7 @@ const MODULE_BYTES = new Uint8Array([
   0x02, 0x00, 0x0b, //        $free, empty body
 ]);
 
-// Hand-rolled UTF-8, in the shape emscripten emits: GraalVM's JS has no
-// TextEncoder/TextDecoder (they are WHATWG, not ECMAScript), so the pair the
-// string round-trip depends on has to be written out.
+// GraalJS has no TextEncoder/TextDecoder, so the UTF-8 pair is written out.
 function utf8Decode(heap, ptr) {
   let str = '';
   let i = ptr;
@@ -130,8 +121,7 @@ function makeModule() {
   const { memory, malloc, free } = instance.exports;
   const buffer = memory.buffer;
 
-  // Plain properties, not getters: this memory has no grow path, so the views
-  // never need the refresh emscripten does after a growth.
+  // Plain properties: this memory never grows, so the views need no refresh.
   const M = {
     HEAP8: new Int8Array(buffer),
     HEAPU8: new Uint8Array(buffer),
@@ -146,9 +136,7 @@ function makeModule() {
   M._malloc = (size) => malloc(size);
   M._free = (ptr) => free(ptr);
 
-  // emscripten's type tags. "*" is "i32" on wasm32, which is what makes the
-  // 4-byte pointer slots in pointers->wasm-array and string-list-to-native-array
-  // line up.
+  // "*" is "i32" on wasm32, a 4-byte pointer slot.
   M.getValue = (ptr, type) => {
     switch (type) {
       case '*':
@@ -176,11 +164,8 @@ function makeModule() {
   M.UTF8ToString = (ptr) => (ptr ? utf8Decode(M.HEAPU8, ptr) : '');
   M.stringToUTF8 = (str, ptr, maxBytes) => utf8Encode(str, M.HEAPU8, ptr, maxBytes);
 
-  // A stand-in for emscripten's ccall, which reads its two list arguments as
-  // JS arrays. A host array arrives here with no length, no index access and
-  // no array methods, so a caller that passes one sends nothing at all -- and
-  // the call still returns a value. This stand-in reports that state instead
-  // of hiding it: it records null lists and answers -1.
+  // emscripten's ccall reads its two lists as JS arrays, and a host array
+  // sends nothing. This stand-in records such a list as null and answers -1.
   M.__ccalls = [];
   M.ccall = (name, rettype, argtypes, args) => {
     const types = Array.isArray(argtypes) ? Array.from(argtypes) : null;
@@ -197,9 +182,8 @@ function makeModule() {
         const fn = globalThis[vals[0]];
         return typeof fn === 'function' ? fn(vals[1]) : -1;
       }
-      // A char* result. As emscripten ccall does, rettype "string" gives
-      // UTF8ToString of the address, which is "" for NULL and for an empty
-      // string alike. Rettype "number" gives the address itself.
+      // As in emscripten, rettype "string" gives "" for NULL and for an empty
+      // string. Rettype "number" gives the address.
       case 'str_null':
       case 'str_empty':
       case 'str_abc': {

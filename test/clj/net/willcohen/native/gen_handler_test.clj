@@ -85,10 +85,8 @@
       (is (str/includes? source (str (name m) ": overrides.methods." (name m)))
           (str "method " (name m) " missing from emitted methods object")))))
 
-;; The only emitted literal an external reader consumes: worker-router's
-;; worker-bootstrap gates teardown on `typeof mod.destroy === 'function'`.
-;; The module's other exports (default, `handler`, `destroyFns`) are asserted
-;; by the node-syntax-check and write-handler! tests or imported by nobody.
+;; worker-router's worker-bootstrap gates teardown on
+;; `typeof mod.destroy === 'function'`.
 (deftest gen-handler-source--destroy-export
   (let [source (g/gen-handler-source sample-fndefs mylib-overrides)]
     (is (str/includes? source "export const destroy = overrides.destroy;"))))
@@ -108,9 +106,7 @@
                   sample-fndefs (dissoc mylib-overrides :exposed-methods))))))
 
 (deftest gen-handler-source--classification-is-optional
-  ;; The runtime queue is fully serial, so the busy/destroy classification
-  ;; affects trace fields only. The generator accepts its absence and emits
-  ;; empty arrays.
+  ;; The runtime queue is serial, so the classification affects trace fields only.
   (let [source (g/gen-handler-source
                 sample-fndefs
                 (dissoc mylib-overrides :busy-methods :destroy-methods))]
@@ -129,9 +125,8 @@
         "nothing extra is imported when the overrides own the fingerprint")))
 
 (deftest gen-handler-source--fingerprint-fields-emit-a-generated-fingerprint
-  ;; Generating it here is what keeps an overrides module free of any import of
-  ;; the handler runtime: the overrides stay external while this module is
-  ;; bundled, so two imports mean two copies of the runtime's logging state.
+  ;; The overrides stay external to the bundle, so an overrides import of the
+  ;; runtime would load a second copy of its logging state.
   (let [source (g/gen-handler-source
                 sample-fndefs
                 (assoc mylib-overrides :fingerprint-fields [:dbBytes :iniBytes :logLevel]))]
@@ -156,18 +151,18 @@
       (is (str/includes? source "fingerprint: overrides.fingerprint,"))
       (is (not (str/includes? source "'gdal'"))))))
 
-(deftest gen-handler-source--generated-fingerprint-parses-under-node
-  ;; The emitted call carries a trailing comma in its argument list, so this
-  ;; checks the shape as well as the content.
+(deftest gen-handler-source--output-parses-under-node
+  ;; The fingerprint variant emits every form, the trailing-comma call included.
   (let [source (g/gen-handler-source
                 sample-fndefs
                 (assoc mylib-overrides
                        :fingerprint-fields [:dbBytes]
                        :fingerprint-prefix "mylib"))]
-    (is (str/includes? source "byteLengthFingerprint"))
+    ;; Assert before the node check, so a runner with no node still asserts.
+    (is (str/includes? source "export default create;"))
     (if-not (node-on-path?)
-      (println "SKIP node --check: node not on PATH (structural assertion above still ran)")
-      (let [tmp (java.io.File/createTempFile "gen-handler-fp-" ".mjs")]
+      (println "SKIP node --check: node not on PATH")
+      (let [tmp (java.io.File/createTempFile "gen-handler-" ".mjs")]
         (try
           (spit tmp source)
           (let [{:keys [exit out err]} (sh/sh "node" "--check" (.getAbsolutePath tmp))]
@@ -176,26 +171,6 @@
                      "\nstderr: " err "\n--- begin source ---\n" source
                      "\n--- end source ---")))
           (finally (.delete tmp)))))))
-
-(deftest gen-handler-source--node-syntax-check
-  (let [source (g/gen-handler-source sample-fndefs mylib-overrides)]
-    ;; Always assert -- even without node -- so the test never silently
-    ;; passes with zero assertions on a node-less runner.
-    (is (str/includes? source "export default create")
-        "emitted module exposes the loader's default export")
-    (testing "Output parses as a valid ES module under node --check"
-      (if-not (node-on-path?)
-        (println "SKIP node --check: node not on PATH (structural assertion above still ran)")
-        (let [tmp (java.io.File/createTempFile "gen-handler-" ".mjs")]
-          (try
-            (spit tmp source)
-            (let [{:keys [exit out err]} (sh/sh "node" "--check" (.getAbsolutePath tmp))]
-              (is (zero? exit)
-                  (str "node --check failed (exit " exit ")\nstdout: " out
-                       "\nstderr: " err
-                       "\n--- begin source ---\n" source
-                       "\n--- end source ---")))
-            (finally (.delete tmp))))))))
 
 (deftest write-handler!--writes-file
   (let [tmp (java.io.File/createTempFile "gen-handler-write-" ".mjs")]

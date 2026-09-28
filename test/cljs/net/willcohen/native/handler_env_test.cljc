@@ -4,12 +4,8 @@
 ;; See LICENSE for license information.
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 (ns net.willcohen.native.handler-env-test
-  "Coverage for handler-env's environment classifier.
-
-   classifyEnvironment takes the globals object as an argument, so every
-   branch runs against a stand-in and the suite never mutates the real
-   globals. detectEnvironment and the two captured booleans are then checked
-   against the runtime the suite actually runs in, which is Node."
+  "Tests of handler-env's environment classifier. classifyEnvironment takes the
+   globals object, so the suite never mutates the real globals."
   (:require [cljs.test :refer [deftest is testing]]
             ["ffi-wasm/handler-env"
              :refer [classifyEnvironment detectEnvironment isNode isBrowser]]

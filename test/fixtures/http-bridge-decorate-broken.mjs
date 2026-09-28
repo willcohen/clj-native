@@ -4,6 +4,6 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: a decorator module that throws at import time. createSyncFetch
-// must REJECT rather than fall back to serving requests unauthenticated.
+// Test fixture: a decorator module that throws at import. createSyncFetch
+// must reject.
 throw new Error('decorator import blew up');

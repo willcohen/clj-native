@@ -1,22 +1,8 @@
-# CI for clj-native: bb lint, bb test:clj and bb test:cljs on Linux and
-# macOS, and bb test:bb (the babashka build helpers) on Linux.
+# On temurin, the GraalVM polyglot engine of test:clj warns about JVMCI
+# and runs interpreted, which is expected.
 #
-# Lane requirements, all deliberate:
-# - lint needs a JDK + clojure CLI (lint:deps indexes two classpaths) AND
-#   node/npm (lint:js runs eslint over the hand-written .mjs).
-# - test:clj needs node too: it compiles test_runner.mjs (squint) and
-#   drives fixtures through it, and the wasm suite stands up a real
-#   GraalVM Polyglot Context. On a stock temurin JDK the polyglot engine
-#   warns about JVMCI and runs interpreted; that is expected, not a
-#   failure. This lane is the one most likely to behave differently on a
-#   CI runner. Watch it on the first green build.
-# - test:cljs is pure node once squint compiles.
-# - test:bb needs only bb.
-#
-# No Windows job: lazy_context_test shells `clojure` as a subprocess,
-# and ProcessBuilder does not resolve a bare `clojure` to clojure.cmd on
-# Windows. A Windows lane needs a wrapper script (or an explicit
-# clojure.cmd invocation) around that subprocess call.
+# No Windows job: lazy_context_test runs `clojure` as a subprocess, and
+# ProcessBuilder does not resolve it to clojure.cmd.
 
 name: CI
 

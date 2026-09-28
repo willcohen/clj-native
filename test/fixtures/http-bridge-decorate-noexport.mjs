@@ -4,7 +4,6 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Test fixture: a module that imports cleanly but exports no decorator
-// function. A decorateUrl that resolves to a non-function is as much an auth
-// drop as an import failure, so createSyncFetch must REJECT here too.
+// Test fixture: a module that imports cleanly but exports no decorator.
+// createSyncFetch must reject.
 export const notADecorator = 42;

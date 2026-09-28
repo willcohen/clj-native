@@ -6,40 +6,24 @@
 
 #?(:clj
    (ns net.willcohen.native.macros
-     "Surface-generation helpers for libraries that bind a C library. Those
-      libraries use the clj-native dispatch infrastructure.
+     "Helpers for the wrapper macros of C-library bindings on clj-native
+      dispatch. Each consumer keeps its own macro, which knows the shape of
+      one wrapper fn. This namespace supplies the name mappings, the fndefs
+      walk and the JVM load-time intern loop.
 
-      A consumer keeps its own macro, because only the consumer knows the
-      shape of one wrapper fn. This namespace supplies the parts that do
-      not differ:
-        - The two name mappings
-        - The argument symbols of a fndefs entry
-        - The walk over fndefs
-        - The JVM load-time intern loop
-
-      The .cljc extension lets CLJS consumers `:require` this namespace
-      directly. squint 0.11.187 and later auto-load .cljc macros.
-
-      The JVM polyglot lock macro lives next to the Context that it locks.
-      Refer to net.willcohen.native.graal-wasm/with-graal-lock."
+      CLJS consumers can `:require` this .cljc directly, because squint
+      0.11.187 and later auto-load .cljc macros."
      (:require [clojure.string :as string]))
    :cljs
    (ns net.willcohen.native.macros
-     "Surface-generation helpers for libraries that bind a C library. Refer
-      to the JVM namespace docstring for context. This branch drops
-      intern-library-fns!, because a CLJS consumer macro emits its surface at
-      compile time. It adds underscore->camelCase, for the aliases that JS
-      callers want."
+     "Helpers for the wrapper macros of C-library bindings. This branch has
+      no intern-library-fns!, because a CLJS consumer macro emits its defns
+      at compile time. It adds underscore->camelCase for JS aliases."
      (:require [clojure.string :as string])))
 
 (defn c-name->clj-name
-  "Convert a C-style underscore name keyword to a hyphenated symbol. This
-   function is cross-platform, and it does string manipulation only. It is
-   public, so consumer wrappers and CLJS-side wrapper generators can share
-   the canonical mapping. No consumer must write that mapping again.
-
-   This mapping suits a library with C names that are already lower-case
-   with underscores. For a mixed-case C API, use camel-name->clj-name."
+  "Map a snake_case C name keyword to a hyphenated symbol. For a mixed-case
+   C API, use camel-name->clj-name."
   [c-fn-keyword]
   (symbol (string/replace (name c-fn-keyword) "_" "-")))
 
@@ -52,12 +36,9 @@
   (and (not= ch (string/upper-case ch)) (= ch (string/lower-case ch))))
 
 (defn- word-start?
-  "Returns true when the upper-case character at `i` opens a new word.
-
-   The character opens a word when the character before it is not
-   upper-case. It also opens a word when it is the last capital of a run,
-   and a lower-case letter comes after that run. The second test prevents
-   the conversion of GDALGetDriverCount into g-d-a-l-get-driver-count."
+  "True when the capital at `i` opens a word: the character before it is
+   not a capital, or it ends a capital run before a lower-case letter. The
+   second test splits GDALGet into gdal-get."
   [s i]
   (let [prev (subs s (dec i) i)
         nxt  (when (< (inc i) (count s)) (subs s (inc i) (+ i 2)))]
@@ -65,19 +46,9 @@
         (and (some? nxt) (lower-char? nxt)))))
 
 (defn camel-name->clj-name
-  "Convert a mixed-case C name keyword to a hyphenated symbol.
-
-   This function puts a hyphen before each upper-case letter that opens a
-   word. It then lower-cases the result. Thus GDALGetDriverCount becomes
-   gdal-get-driver-count, and OGR_L_GetName becomes ogr-l-get-name. An
-   upper-case run stays in one piece, which keeps an acronym such as
-   PROJJSON readable. An underscore becomes a hyphen, and it never doubles
-   one.
-
-   This function is cross-platform, and it uses no regular expression.
-   That is deliberate. The JVM replaces every match, while JS replaces
-   only the first match. JS replaces every match only with a global
-   pattern. Thus a regex here would behave differently in the two lanes."
+  "Map a mixed-case C name keyword to a lower-case hyphenated symbol.
+   GDALGetDriverCount gives gdal-get-driver-count, and OGR_L_GetName gives
+   ogr-l-get-name. A capital run such as PROJJSON stays whole."
   [c-fn-keyword]
   (let [s (name c-fn-keyword)
         n (count s)]
@@ -96,12 +67,8 @@
                      false))))))))
 
 (defn fn-def-arg-syms
-  "Return the argument symbols of a fndefs entry, in C signature order.
-
-   Each :argtypes entry is [arg-name type]. The name becomes one
-   parameter symbol of a generated wrapper. A name that repeats inside
-   one signature gets a numeric suffix, because two identical parameter
-   symbols would shadow."
+  "The parameter symbols of a fndefs entry, from its :argtypes names in C
+   order. A repeated name gets a numeric suffix."
   [fn-def]
   (first
    (reduce (fn [[syms seen] [arg-name _]]
@@ -113,16 +80,13 @@
            (:argtypes fn-def))))
 
 (defn library-fns-form
-  "Build a `do` form that defines the public wrapper fns of a library.
+  "A `do` form of the public wrapper defns for `fndefs`.
 
-   `name-fn` maps a fndefs key to the public symbol. It can return nil, and
-   then library-fns-form omits that entry from the surface. `emit-fn` gets
-   that symbol with the key and the fn-def, and returns one whole defn
-   form. `alias-name-fn` and `alias-emit-fn` add an optional second walk.
-   That second walk is how a library gives its fns a second spelling.
-
-   name-fn and emit-fn run when the consumer macro expands. Thus a consumer
-   passes plain functions, and keeps its own syntax-quoted templates."
+   `name-fn` (default c-name->clj-name) maps a fndefs key to the public
+   symbol, or to nil to skip the entry. `emit-fn` takes the symbol, the key
+   and the fn-def, and returns one defn form. `alias-name-fn` and
+   `alias-emit-fn` add an optional second walk for a second spelling. All
+   of them run at macro-expansion time."
   [fndefs {:keys [name-fn emit-fn alias-name-fn alias-emit-fn]}]
   (let [walk (fn [nf ef]
                (when (and nf ef)
@@ -135,18 +99,14 @@
 
 #?(:clj
    (defn intern-library-fns!
-     "Intern one public wrapper fn for each fndefs entry into `ns-sym`.
+     "Intern one wrapper fn per fndefs entry into `ns-sym` at load time,
+      because the JVM macro cannot see the fndefs shape at expansion.
+      `name-fn` maps a key to the public symbol, or to nil to skip it.
+      `make-fn` takes the key and the fn-def, and returns the fn.
 
-      The JVM reader cannot see the fndefs shape while the consumer macro
-      expands. Thus intern-library-fns! builds the surface when the
-      namespace loads. `name-fn` maps a fndefs key to the public symbol.
-      It can return nil, and then intern-library-fns! omits that entry.
-      `make-fn` gets the key and the fn-def, and returns the fn to intern.
-
-      Call intern-library-fns! from inside the consumer macro only. Never
-      call it directly. A direct call gives clj-kondo nothing to expand.
-      Every caller of a generated fn then reads as an unresolved var, and
-      that noise hides real dead code."
+      Call it only from inside the consumer macro. A direct call gives
+      clj-kondo no macro to expand, so every generated var reads as
+      unresolved."
      [ns-sym fndefs name-fn make-fn]
      (doseq [[fn-key fn-def] fndefs]
        (when-let [fn-name (name-fn fn-key)]
@@ -155,10 +115,8 @@
 
 #?(:cljs
    (defn underscore->camelCase
-     "Convert a snake_case string to camelCase. This function is JS-side
-      only. Consumer macros call it when they emit camelCase aliases for
-      JavaScript callers. It lives here and not in each consumer, so all
-      libraries share the canonical mapping."
+     "Convert a snake_case string to camelCase, for the JS aliases that a
+      consumer macro emits."
      [s]
      (let [parts (.split s "_")]
        (apply str (first parts)

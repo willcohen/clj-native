@@ -4,36 +4,25 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Heap helpers for wasm-backed handlers. This module puts emscripten's heap
-// views, getValue, setValue, the UTF-8 helpers and the string-array walk into
-// one methods object. The consumer spreads that object into the `methods` map
-// of its handler. The module binds late through getModule, so the consumer can
-// build the object before init() resolves the module.
+// Emscripten heap views, getValue, setValue, the UTF-8 helpers and a
+// string-array walk as one methods object. A handler spreads it into its
+// `methods`. getModule binds late, and the object can exist before init()
+// loads the module.
 //
-// An offset is an index into the typed-array view. It is not a byte address.
-// A caller that holds a byte pointer must divide it by the size of one
-// element: ptr / 4 for heap32, ptr / 8 for heapf64. An offset past the end of
-// the view causes a RangeError.
+// An offset is a typed-array index: pass ptr / 4 for heap32 and ptr / 8 for
+// heapf64. A heap*_set past the end throws RangeError.
+// A heap*_get past the end returns a short array.
 //
-// There is no heap64 or heapu64 pair. Emscripten emits HEAP64 and HEAPU64 only
-// under WASM_BIGINT. Add the pair here if a consumer builds with that flag.
-//
-// heap*_get returns a typed array, not a plain array. structuredClone keeps
-// typed arrays and uses the transferable path, which is faster for bulk binary
-// data. A caller that needs a plain array applies Array.from at the call site.
-//
-// Every method is async, because handler-runtime requires async bodies. The
-// work itself is synchronous against the loaded module.
+// No heap64 pair yet. HEAP64 needs WASM_BIGINT, the emscripten default since
+// 4.0.0. Add the pair when a consumer needs it. heap*_get returns a typed
+// array, which structured clone copies as one block. Every
+// method is async because handler-runtime requires it.
 
-// The methods that have no value to return all answer with this one object.
-// Object.freeze makes it safe to share: an ES module is strict mode, so a
-// caller that writes to the result gets an error. Without the freeze, that
-// write would change the answer that every later call gives.
+// Shared result for methods with nothing to return. The freeze makes a write
+// to it throw instead of changing every later result.
 const ok = Object.freeze({ ok: true });
 
-// A pointer slot is 4 bytes because emcc-link builds every module with
-// --target=wasm32-unknown-emscripten. A MEMORY64 build would widen this, and
-// read_string_array below is the only place that walks raw slots.
+// emcc-link builds wasm32. A MEMORY64 build would widen the pointer slot.
 const POINTER_SIZE = 4;
 
 export const heapHelpers = (getModule) => {
@@ -69,14 +58,10 @@ export const heapHelpers = (getModule) => {
     },
     utf8_byte_length: async (str) => m().lengthBytesUTF8(str),
 
-    // Walk a NUL-terminated `char* const*` into an array of strings. A null
-    // list pointer gives []. Reads slots with getValue and '*', matching the
-    // JVM twin at graal-wasm/string-array-pointer->strs.
-    //
-    // The heap-length bound is load-bearing. An out-of-range typed-array read
-    // in JS gives undefined, and undefined is not 0, so an unterminated walk
-    // never meets its terminator and spins the worker forever. Nothing here
-    // allocates, so the heap cannot grow mid-walk and one length read holds.
+    // The JVM twin is graal-wasm/string-array-pointer->strs. The heap bound
+    // makes an unterminated array throw: a read past the end gives undefined,
+    // which would read as the terminator. Nothing here allocates, so one length
+    // read holds.
     read_string_array: async (ptr) => {
       const out = [];
       if (!ptr) return out;
@@ -102,8 +87,7 @@ export const heapHelpers = (getModule) => {
 
   for (const [name, prop] of heaps) {
     out[`${name}_get`] = async (offset, length) => {
-      // slice() copies. subarray() would keep a view on the wasm heap, and
-      // that view goes stale after _free.
+      // slice() copies. A subarray() view goes stale after _free.
       return m()[prop].slice(offset, offset + length);
     };
     out[`${name}_set`] = async (offset, values) => {
@@ -115,14 +99,9 @@ export const heapHelpers = (getModule) => {
   return out;
 };
 
-// The plain ccall method. It sends the four arguments to the module and
-// returns what the C function returns. A handler whose library needs no
-// marshaling can put this method directly in its methods object.
-//
-// Some handlers must allocate memory for out-parameters, copy coordinate
-// arrays in and out, or walk a returned list of structs. That work is specific
-// to the calling conventions of the library, so such a handler writes its own
-// ccall in its overrides module.
+// A plain ccall method for a library that needs no marshaling. A handler that
+// must allocate out-parameters or copy arrays writes its own ccall in its
+// overrides module.
 export const ccallMethod = (getModule) => async (fnName, returnType, argTypes, args) => {
   const mod = getModule();
   if (!mod) throw new Error('handler-heap: getModule() returned null (called before init?)');

@@ -6,16 +6,8 @@
 
 (ns net.willcohen.native.pool-stub-test
   "Pins the JVM stub block of pool.cljc against the CLJS surface it stands in
-   for.
-
-   The stub makes a JVM call to a pool fn fail loudly under its own name. A
-   missing stub gives an unresolved var or an arity error instead, and the gap
-   is invisible in normal use, because every consumer call site sits inside
-   #?(:cljs ...).
-
-   The CLJS surface comes from reading the source with :features #{:cljs}, and
-   not from a regex, so the reader picks the same branch that squint
-   compiles."
+   for. A missing stub goes unseen in use, since every consumer call site sits
+   inside #?(:cljs ...)."
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [net.willcohen.native.pool])
@@ -25,17 +17,12 @@
 
 (def ^:private pool-ns 'net.willcohen.native.pool)
 
-;; The JVM version of this fn does nothing and returns nil, on purpose. The
-;; diagnostic substrate is JS-only, so a consumer can call it with no platform
-;; branch. Refer to the note at the definition.
+;; A no-op on the JVM, so a consumer can call it with no platform branch.
 (def ^:private non-throwing 'set-log-config!)
 
 (defn- read-cljs-forms
-  "Read every top-level form of `resource-path` with the :cljs branch of each
-   reader conditional selected.
-
-   A cljs read meets tagged literals such as #js. Nothing here evaluates a
-   form, thus an unknown tag can pass its value through unchanged."
+  "Read every top-level form of `resource-path` with the :cljs branch selected,
+   as squint sees it. An unknown tag such as #js passes its value through."
   [resource-path]
   (with-open [rdr (PushbackReader. (io/reader (io/resource resource-path)))]
     (let [eof  (Object.)
@@ -89,8 +76,7 @@
           (ns-publics pool-ns))))
 
 (deftest cljs-surface-read-is-not-vacuous
-  ;; Without this, a read that silently produced nothing would make every
-  ;; other assertion below pass against an empty set.
+  ;; An empty read would make every other assertion pass.
   (testing "the :cljs read finds a real surface"
     (is (< 25 (count @cljs-surface))
         "expected the CLJS branch to define more than 25 public fns"))
@@ -118,9 +104,8 @@
                ", the JVM stub has " (sort-by str jvm-arities))))))
 
 (deftest every-stub-throws-with-its-own-name
-  ;; A block of thirty hand-written stubs invites a copy-paste that throws
-  ;; under a neighbour's name. That defect still throws, so only the name in
-  ;; the ex-data catches it.
+  ;; A copy-pasted stub still throws, under a neighbor's name, so only the
+  ;; ex-data name catches it.
   (doseq [[sym stub-arities] (sort-by key @jvm-surface)
           :when (not= non-throwing sym)
           arity stub-arities

@@ -5,9 +5,8 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.build
-  "Library-agnostic build primitives for clj-native consumers. Consumers
-  invoke these from their own bb task bodies. Each consumer supplies the
-  config for its own library, such as versions, flags and dep lists."
+  "Build primitives that a clj-native consumer calls from its bb tasks.
+  The consumer supplies the config of its library. Babashka only."
   (:require [babashka.fs :as fs]
             [babashka.http-client :as http]
             [babashka.tasks :as tasks]
@@ -16,9 +15,8 @@
             [clojure.string :as str]))
 
 (defn detect-host-platform
-  "Returns {:os :darwin|:linux|:windows :arch :aarch64|:amd64}. This fn is
-  public for consumer build scripts. It is bb-only, like everything in this
-  namespace."
+  "Returns {:os :darwin|:linux|:windows|:unknown
+            :arch :aarch64|:amd64|:unknown}."
   []
   (let [os-name (System/getProperty "os.name")
         os-arch (System/getProperty "os.arch")
@@ -34,10 +32,9 @@
     {:os os :arch arch}))
 
 (defn safe-parallel-jobs
-  "Calculate a safe -j value from the available memory. A heavy C++ build
-  runs out of memory at high parallelism on a low-memory CI runner. Returns
-  one job for each 3GB of available memory, with the CPU count as the
-  maximum."
+  "A make -j value: one job per 3 GB of memory (available on Linux, total
+  on macOS), from 1 to the CPU count, so a C++ build fits a small CI
+  runner."
   []
   (let [{:keys [os]} (detect-host-platform)
         available-gb (try
@@ -141,9 +138,8 @@
           (finally (fs/delete-tree tmp)))))))
 
 (defn- cmd-prefix
-  "Return the emscripten wrapper prefix for a build type, or an empty vector.
-  :wasm uses the emconfigure, emmake and emcmake wrappers. :native runs the
-  tools directly."
+  "The command prefix of `tool`: the emscripten wrapper for :wasm, the bare
+  tool for :native."
   [type tool]
   (case type
     :wasm (case tool
@@ -168,41 +164,25 @@
                     {:env-var k :value v}))))
 
 (defn build-autotools-library
-  "Build a library with a configure, make and make install toolchain.
+  "Build a library with configure, make and make install. Throws first
+  when CFLAGS or CXXFLAGS has no -O level (check-cflags!).
 
   Required keys:
-    :type          :native or :wasm. :wasm wraps the tools with emconfigure
-                   and emmake.
-    :build-dir     The build directory. For an out-of-tree build, this is a
-                   fresh directory below the source tree, and
-                   build-autotools-library deletes and creates it again. For
-                   an in-tree build (:in-tree? true), this is the source
-                   directory itself.
-    :install-dir   The --prefix target. build-autotools-library cleans it
-                   before the install.
-    :configure-args The arguments after ./configure, for example
-                   [\"--disable-shared\"].
+    :type             :native, or :wasm to wrap the tools in emconfigure
+                      and emmake.
+    :build-dir        Deleted and created again, unless :in-tree?.
+    :install-dir      The --prefix. Deleted before the build.
+    :configure-args   For example [\"--disable-shared\"].
 
   Optional keys:
-    :env           A map of more env vars, such as CC, CXX and CFLAGS.
-    :configure-script The path to the configure script, relative to
-                      :build-dir. The default is \"../configure\" for an
-                      out-of-tree build. Override it to \"./configure\" for
-                      an in-tree build such as zlib.
-    :in-tree?      The build happens in :build-dir, which is the source
-                   directory. build-autotools-library does no delete-tree of
-                   build-dir. It runs 'make distclean' first when a Makefile
-                   exists.
-    :post-configure  A fn of no arguments. build-autotools-library calls it
-                     after configure and before make. It is useful for a
-                     library-specific Makefile patch, as with zlib on WASM.
-    :parallel-jobs An int. The default comes from safe-parallel-jobs.
-    :skip-if-exists The path to an artifact. When that path exists,
-                    build-autotools-library skips the build.
-
-  A library-specific autogen.sh, a source patch, or deep Makefile surgery
-  belongs to the caller. Do that work before you invoke this fn, or supply
-  :post-configure to run it between configure and make."
+    :env              More env vars, such as CC and CFLAGS.
+    :configure-script Relative to :build-dir. Default \"../configure\", or
+                      \"./configure\" with :in-tree?.
+    :in-tree?         :build-dir is the source dir. Runs make distclean
+                      first when a Makefile exists.
+    :post-configure   A fn of no args, called between configure and make.
+    :parallel-jobs    Default from safe-parallel-jobs.
+    :skip-if-exists   Skip the build when this path exists."
   [{:keys [type build-dir install-dir configure-args env
            configure-script in-tree? post-configure parallel-jobs skip-if-exists]
     :or {parallel-jobs (safe-parallel-jobs)
@@ -236,36 +216,23 @@
   "Build a library with CMake.
 
   Required keys:
-    :type          :native or :wasm. :wasm wraps the tools with emcmake and
-                   emmake.
-    :src-dir       The directory that contains CMakeLists.txt.
-    :build-dir     The out-of-tree build directory. build-cmake-library
-                   cleans it and creates it again.
-    :cmake-args    The CMake flags, including -DCMAKE_INSTALL_PREFIX=...
-                   and so on.
+    :type           :native, or :wasm to wrap the tools in emcmake and
+                    emmake.
+    :src-dir        The directory with CMakeLists.txt.
+    :build-dir      The out-of-tree build directory.
+    :cmake-args     Every CMake flag, with the install prefix and each dep
+                    path.
 
   Optional keys:
-    :env           A map of more env vars, such as CC, CXX and
-                   CMAKE_VERBOSE_MAKEFILE.
-    :install?      Run the install step after the build. The default is
-                   true.
-    :clean?        Delete :build-dir before the configure step. The default
-                   is true. Pass false to keep the tree across invocations,
-                   for an incremental rebuild of a heavy build. cmake reads
-                   its cache again, and make rebuilds only what changed.
-    :parallel-jobs An int. The default comes from safe-parallel-jobs.
-    :skip-if-exists The path to an artifact. When that path exists,
-                    build-cmake-library skips the build.
-    :cache-file    The path to an initial-cache.cmake file. This adds the -C
-                   flag.
-    :pre-configure A fn of no arguments. build-cmake-library calls it after
-                   it creates :build-dir, and before cmake runs. It is
-                   useful for a write of initial-cache.cmake into
-                   :build-dir, or for a library-specific CMakeLists patch.
-
-  The consumer constructs :cmake-args, with every dep pointer such as
-  -DSQLite3_INCLUDE_DIR and -DZLIB_LIBRARY. This fn does no library
-  introspection."
+    :env            More env vars.
+    :install?       Default true.
+    :clean?         Delete :build-dir first. Default true. False keeps the
+                    cache for an incremental rebuild.
+    :parallel-jobs  Default from safe-parallel-jobs.
+    :skip-if-exists Skip the build when this path exists.
+    :cache-file     An initial cache, passed as -C.
+    :pre-configure  A fn of no args, called after :build-dir exists and
+                    before cmake."
   [{:keys [type src-dir build-dir cmake-args env install? clean? parallel-jobs
            skip-if-exists cache-file pre-configure]
     :or {install? true
@@ -294,15 +261,9 @@
         (apply tasks/shell {:dir (str build-dir) :extra-env env} install-cmd)))))
 
 (def ^:private emscripten-incoming-module-js-api-default
-  "An exact copy of the emscripten default INCOMING_MODULE_JS_API, from its
-  src/settings.js. A -sINCOMING_MODULE_JS_API flag replaces that default
-  completely, and it does not extend the default. Thus this list must name
-  every property that a consumer gives the module at run time.
-
-  This list is identical to the emscripten default. Thus the node and browser
-  module-property reads stay byte-for-byte unchanged. emcc-link appends
-  `wasmBinary` only. Refer to :incoming-module-js-api. Sync this list with
-  the emscripten settings.js again at each toolchain bump."
+  "A copy of the emscripten default INCOMING_MODULE_JS_API, from
+  src/settings.js. The flag replaces the default, so emcc-link passes this
+  whole list. Sync it at each emscripten bump."
   ["ENVIRONMENT" "arguments" "canvas" "dynamicLibraries" "elementPointerLock"
    "instantiateWasm" "locateFile" "monitorRunDependencies" "noExitRuntime"
    "noInitialRun" "onAbort" "onExit" "onRuntimeInitialized" "postRun"
@@ -337,15 +298,9 @@
       (str/replace #"-windows-gnu$" "-w64-mingw32")))
 
 (defn zig-toolchain!
-  "Write the tool wrappers for the zig target of `dir` into bin-dir.
-  Returns :env (CC, CXX, AR, RANLIB, and LD for Windows), :host (for
-  configure --host) and :cmake-args. The CMake args find nothing on the
-  build machine, so give CMake each dependency by its path.
-
-  zig links libc++, libc++abi, libunwind and compiler-rt (Apache-2.0 WITH
-  LLVM-exception) into the lib and libc dynamically, so the lib holds no
-  libstdc++ or libgcc. A Windows lib imports the UCRT of Windows 10 and
-  later."
+  "Write zig wrappers for the resource `dir` into bin-dir. Returns :env for
+  configure or CMake, :host for configure --host, and :cmake-args that
+  search no dir of the build machine."
   [dir bin-dir]
   (let [target   (or (zig-targets dir)
                      (throw (ex-info (str "No zig target for " dir)
@@ -376,9 +331,8 @@
                   (str "-DCMAKE_CXX_COMPILER=" (tool "c++"))
                   (str "-DCMAKE_AR=" (tool "ar"))
                   (str "-DCMAKE_RANLIB=" (tool "ranlib"))
-                  ;; ONLY searches nothing but the root. With no root, CMake
-                  ;; searches the build machine. bin-dir holds only the
-                  ;; wrappers.
+                  ;; With no root, ONLY mode still searches the build
+                  ;; machine. bin-dir holds only the wrappers.
                   (str "-DCMAKE_FIND_ROOT_PATH=" (fs/absolutize bin-dir))
                   "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER"
                   "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY"
@@ -389,7 +343,7 @@
                   "-DPKG_CONFIG_USE_CMAKE_PREFIX_PATH=OFF"]}))
 
 (def ^:private glibc-libs
-  "The glibc libraries, from the host, that a lib for a glibc dir may need."
+  "The host glibc libraries that a glibc lib may need."
   #{"libc.so.6" "libm.so.6" "libpthread.so.0" "libdl.so.2" "librt.so.1"
     "libutil.so.1" "libresolv.so.2" "ld-linux-x86-64.so.2" "ld-linux-aarch64.so.1"})
 
@@ -514,97 +468,49 @@
     (println "OK" (str lib) "loads only system libraries and has no run path")))
 
 (defn- js-string-list
-  "Render a seq of names as the bracketed, double-quoted list that the emcc
-  -s flags expect, for example [\"ccall\",\"getValue\"]."
+  "Render names as an emcc -s list, for example [\"ccall\",\"getValue\"]."
   [coll]
   (str "[" (str/join "," (map (fn [s] (str "\"" s "\"")) coll)) "]"))
 
 (defn emcc-link
-  "Link compiled objects into a WASM module with em++.
+  "Link objects into a WASM module with em++. Writes the .js and .wasm into
+  :build-dir. Throws on a non-zero exit.
 
   Required keys:
-    :build-dir        The working directory. emcc runs there, and it writes
-                      the output there.
-    :output-name      For example \"mylib.js\". emcc produces a .js file and
-                      a .wasm file.
-    :objects          A list of object files and static libs, in dependency
-                      order.
-    :exported-functions A list of C function names, each with a leading
-                      underscore.
+    :build-dir          em++ runs here.
+    :output-name        For example \"mylib.js\".
+    :objects            Object files and static libs, in link order.
+    :exported-functions C names, each with a leading underscore.
 
   Optional keys:
-    :exported-runtime-methods For example [\"ccall\" \"cwrap\" \"getValue\"].
-    :pthreads?        Adds -pthread, USE_PTHREADS and SHARED_MEMORY. The
-                      default is false.
-    :fetch?           Adds -sFETCH=1. The default is the value of
-                      :pthreads?, which keeps the historical coupled
-                      behavior. Pass false with :pthreads? true for threads
-                      with no Fetch API. Pass true alone for FETCH with no
-                      threads.
-    :stack-size       Integer bytes for -sSTACK_SIZE. The default is
-                      1048576. The inline note below says why the 64K
-                      emscripten default is unsafe for a C++-heavy module.
-    :pthread-pool-size Integer for -sPTHREAD_POOL_SIZE. The default is 1.
-                      emcc-link emits it only with :pthreads? true. The
-                      inline note below says what the one spare worker is
-                      for.
-    :pthread-pool-delay-load? Adds -sPTHREAD_POOL_DELAY_LOAD=1. The default
-                      is true, and emcc-link emits it only with :pthreads?
-                      true. At false, module init calls
-                      addRunDependency('loading-workers'), which can outlast
-                      the worker-router bootstrap timeout. Refer to the
-                      inline note below.
-    :environment      For example \"web,worker,node\". The default comes
-                      from :pthreads?.
-    :force-filesystem? Adds -sFORCE_FILESYSTEM=1. The default is false. Set
-                      it when the C library reaches the filesystem only
-                      through paths that the consumer stages at run time,
-                      such as handler-fs stageFiles into MEMFS. emcc
-                      otherwise drops the FS runtime, because no compiled
-                      call site references it.
-    :extra-flags      More emcc flags, for example [\"-I\" \"src/include\"].
-                      These land before :objects.
-    :link-flags       More emcc flags, placed immediately before :objects
-                      and after :extra-flags. The default is []. The two
-                      lists differ by position only. Use this one where the
-                      order against the object list matters, as with a -L
-                      search path or a --whole-archive pair.
-    :module-name      The EXPORT_NAME value. The default is \"Module\".
-    :allow-memory-growth? The default is true.
-    :allow-table-growth?  The default is true.
-    :maximum-memory   Integer bytes for -sMAXIMUM_MEMORY. The default is
-                      2147483648 (2 GiB) when :pthreads? is true, and nil
-                      otherwise. Pthreads with SHARED_MEMORY otherwise
-                      clamps the WebAssembly.Memory maximum to the initial
-                      value. That blocks growth at run time, even with
-                      ALLOW_MEMORY_GROWTH=1.
-    :modularize?      The default is true, and it produces MODULARIZE=1 with
-                      EXPORT_ES6=1.
-    :optimization     For example \"-O2\", which is the default.
-    :incoming-module-js-api A list of the Module.* properties that the
-                      module can read at run time. emcc-link emits it as
-                      -sINCOMING_MODULE_JS_API, which replaces the
-                      emscripten default list completely.
-
-                      The default is the emscripten default with
-                      \"wasmBinary\" added. Thus an embedding host, such as
-                      a GraalVM polyglot loader, can give the module its
-                      wasm bytes through Module.wasmBinary. Without
-                      \"wasmBinary\", emscripten aborts at init with
-                      \"`Module.wasmBinary` was supplied but `wasmBinary`
-                      not included in INCOMING_MODULE_JS_API\". A node or
-                      browser build fetches the .wasm itself, thus this
-                      does not affect it. Pass [] to suppress the flag and
-                      use the untouched emscripten default.
-
-  emcc writes the output .js and .wasm files in :build-dir. That is the whole
-  result. The return value is the babashka.process result of the em++ run,
-  and no caller should read it. tasks/shell throws on a non-zero exit here,
-  so a return carries no exit status to check.
-
-  Note: the library-specific parts come from the consumer fndefs and the
-  build output. Those parts are :exported-functions and the order of
-  :objects. This fn does not know what is inside the WASM module."
+    :exported-runtime-methods For example [\"ccall\" \"cwrap\"].
+    :pthreads?          -pthread, USE_PTHREADS and SHARED_MEMORY. Default
+                        false.
+    :fetch?             -sFETCH=1. Default :pthreads?.
+    :stack-size         Bytes. Default 1048576.
+    :pthread-pool-size  Default 1. Only with :pthreads?.
+    :pthread-pool-delay-load? Default true. Only with :pthreads?.
+    :environment        Default \"web,worker,node\", plus \",shell\" without
+                        :pthreads?.
+    :force-filesystem?  Keep the FS runtime, which emcc drops when no
+                        compiled call site uses it. Set it when the consumer
+                        stages files at run time. Default false.
+    :extra-flags        emcc flags, placed before :link-flags.
+    :link-flags         emcc flags, placed right before :objects. Use it
+                        where order against the objects matters, as with -L
+                        or --whole-archive.
+    :module-name        EXPORT_NAME. Default \"Module\".
+    :allow-memory-growth? Default true.
+    :allow-table-growth?  Default true.
+    :maximum-memory     Bytes. Default 2 GiB with :pthreads?, else unset.
+                        SHARED_MEMORY otherwise caps the memory at its
+                        initial size.
+    :modularize?        MODULARIZE=1 with EXPORT_ES6=1. Default true.
+    :optimization       Default \"-O2\".
+    :incoming-module-js-api The Module.* properties the module reads.
+                        Default: the emscripten default plus \"wasmBinary\",
+                        through which a GraalVM host gives the wasm bytes.
+                        [] omits the flag."
   [{:keys [build-dir output-name objects exported-functions
            exported-runtime-methods pthreads? environment extra-flags
            module-name allow-memory-growth? allow-table-growth?
@@ -627,11 +533,8 @@
          incoming-module-js-api (conj emscripten-incoming-module-js-api-default
                                       "wasmBinary")}
     :as opts}]
-  ;; `worker` is necessary even for a single-threaded build. worker-router
-  ;; runs every handler module inside a Web Worker. Thus the emscripten
-  ;; module must permit the worker environment. Without it, the module aborts
-  ;; on pool spawn with "worker environment detected but not enabled at build
-  ;; time".
+  ;; worker-router runs each module in a Web Worker, so even a
+  ;; single-threaded build needs `worker`.
   (let [environment (or environment (if pthreads? "web,worker,node" "web,worker,node,shell"))
         fetch? (if (contains? opts :fetch?) (boolean (:fetch? opts)) pthreads?)
         maximum-memory (if (some? maximum-memory)
@@ -655,26 +558,10 @@
                                  (js-string-list incoming-module-js-api))])
                          ["-s" (str "ENVIRONMENT=" environment)]
                          (when allow-memory-growth? ["-s" "ALLOW_MEMORY_GROWTH=1"])
-                         ;; GROWABLE_ARRAYBUFFERS=0 keeps the wasm memory on a
-                         ;; plain ArrayBuffer. At 1, memory.buffer is a RESIZABLE
-                         ;; ArrayBuffer. Chrome and Firefox each reject
-                         ;; TextDecoder.decode on a view over a resizable buffer.
-                         ;; UTF8ArrayToString decodes exactly such a view. Thus
-                         ;; every string-returning C function throws in a browser.
-                         ;; Node accepts it, thus a node-only suite stays green and
-                         ;; hides this.
-                         ;;
-                         ;; emscripten 6.0.2 is the one release that carries the
-                         ;; hazard. It defaulted the setting to 1, and its
-                         ;; UTF8ToString did not copy. 6.0.3 reverted the default
-                         ;; to 0 and made the decode copy from a resizable buffer.
-                         ;; Thus the flag is a no-op from 6.0.3 on.
-                         ;;
-                         ;; It stays because this layer cannot assert that floor.
-                         ;; A consumer supplies its own emscripten through the
-                         ;; mkCrossShells :extraDevInputs, and its
-                         ;; clj-native.inputs.nixpkgs.follows discards the pin in
-                         ;; this repo's flake.lock.
+                         ;; At 1 the memory is resizable, and Chrome and Firefox
+                         ;; (not node) reject TextDecoder.decode on it, so each
+                         ;; string return throws. Only emscripten 6.0.2 defaults
+                         ;; to 1, and a consumer can bring its own emscripten.
                          (when allow-memory-growth? ["-s" "GROWABLE_ARRAYBUFFERS=0"])
                          (when allow-table-growth? ["-s" "ALLOW_TABLE_GROWTH=1"])
                          (when maximum-memory ["-s" (str "MAXIMUM_MEMORY=" maximum-memory)])
@@ -682,27 +569,16 @@
                            ["-s" "MODULARIZE=1"
                             "-s" "EXPORT_ES6=1"
                             "-s" (str "EXPORT_NAME=\"" module-name "\"")])
-                         ;; STACK_SIZE. The 64K emscripten default is too small
-                         ;; for a C++-heavy codepath, such as a templated
-                         ;; transform or deep recursion. A stack overflow corrupts
-                         ;; the dlmalloc state silently. It can then surface later
-                         ;; as a mutex-deadlock abort or a heap-corrupt abort. 1 MB
-                         ;; is a defensible default for any C++ wasm. The stack of
-                         ;; each pthread defaults to STACK_SIZE when
-                         ;; DEFAULT_PTHREAD_STACK_SIZE is 0, which is also the
-                         ;; default.
+                         ;; Deep C++ code can overflow the 64K default, and that
+                         ;; corrupts dlmalloc with no error. Each pthread stack
+                         ;; also gets STACK_SIZE.
                          ["-s" (str "STACK_SIZE=" stack-size)]
                          (when fetch? ["-s" "FETCH=1"])
-                         ;; PTHREAD_POOL_SIZE=1 with PTHREAD_POOL_DELAY_LOAD=1. One
-                         ;; worker spawns in advance, and it handles the rare
-                         ;; wasm-side pthread_create. One example is a libcxx
-                         ;; <thread> with a transitive reference from a cache.
-                         ;; DELAY_LOAD=1 spawns that worker lazily. Thus module init
-                         ;; does NOT call `addRunDependency('loading-workers')`, and
-                         ;; the worker-router bootstrap stays below its 30s timeout.
-                         ;; A consumer must still disable the transitive
-                         ;; pthread_create at the source, for example with
-                         ;; -DSQLITE_MAX_WORKER_THREADS=0, to keep that path cold.
+                         ;; One pool worker serves a rare pthread_create, as from
+                         ;; libcxx <thread>. DELAY_LOAD keeps 'loading-workers'
+                         ;; out of init, which would outlast the worker-router
+                         ;; bootstrap timeout. Disable such calls at the source too, as
+                         ;; with -DSQLITE_MAX_WORKER_THREADS=0.
                          (when pthreads?
                            (concat
                             ["-s" "USE_PTHREADS=1"
@@ -713,23 +589,14 @@
     (apply tasks/shell {:dir (str build-dir)} cmd)))
 
 (defn emcc-compile
-  "Compile a single C or C++ source to an object file with `emcc -c`. This
-  builds a module-local translation unit, such as a host-callback stub. That
-  unit then links ahead of the library archives in the emcc-link :objects.
-
-  Required keys:
-    :source   The path to the .c or .cpp source.
-    :output   The path to the .o output.
+  "Compile the C or C++ file :source to the object file :output with
+  `emcc -c`. Throws on a non-zero exit.
 
   Optional keys:
-    :include-dirs  A seq of directories. Each one becomes -I<dir>. One
-                   example is the directory of a generated cpl_config.h.
-    :optimization  The default is \"-O3\".
-    :pthreads?     Adds -pthread. Match the threading model of the link.
-    :extra-flags   More emcc flags.
-
-  emcc writes the object file at :output. As with emcc-link, the return value
-  is the babashka.process result and no caller should read it."
+    :include-dirs  Each one becomes -I<dir>.
+    :optimization  Default \"-O3\".
+    :pthreads?     Adds -pthread. Match the link.
+    :extra-flags   More emcc flags."
   [{:keys [source output include-dirs optimization pthreads? extra-flags]
     :or {include-dirs [] optimization "-O3" pthreads? false extra-flags []}}]
   (let [cmd (vec (concat ["emcc" "-c" (str source) "-o" (str output)
@@ -740,11 +607,7 @@
     (apply tasks/shell cmd)))
 
 (defn- leading-comment-block
-  "Return the unbroken run of `;;` lines at the top of `source`, rendered as
-  `//` lines. Returns nil when the file opens with anything else.
-
-  squint drops every Clojure comment, thus a copyright and SPDX header in a
-  .cljc never reaches its .mjs. carry-header! puts it back."
+  "The run of `;;` lines at the top of `source` as `//` lines, or nil."
   [source]
   (let [lines (take-while (fn [l] (str/starts-with? l ";;"))
                           (str/split-lines source))]
@@ -753,9 +616,8 @@
            "\n\n"))))
 
 (defn- carry-header!
-  "Prepend the leading comment block of `src-file` to `out-file`. Does
-  nothing when the source has no such block, or when the output carries it
-  already. This fn is idempotent, thus a rebuild does not stack headers."
+  "Prepend the leading comment block of `src-file` to `out-file`, unless
+  `out-file` starts with it already."
   [src-file out-file]
   (when-let [header (leading-comment-block (slurp (fs/file src-file)))]
     (let [body (slurp (fs/file out-file))]
@@ -763,24 +625,14 @@
         (spit (fs/file out-file) (str header body))))))
 
 (defn squint-compile!
-  "Compile a single .cljc to a .mjs adjacent to it. The compile runs in
-  `dir`. This fn prints the squint stdout and stderr, throws on a non-zero
-  exit, and prints a ready line. The squint:* and squint:test:* bb tasks
-  share it, here and in each consumer.
+  "Compile the .cljc `file` to the .mjs beside it, in `dir`. Throws on a
+  non-zero exit. Copies the leading `;;` header onto the .mjs, since squint
+  drops comments and the license header must ship.
 
-  squint emits no Clojure comment, thus the copyright and SPDX header of the
-  .cljc would not reach the .mjs that npm ships. squint-compile! copies the
-  leading `;;` block of the source onto the output as `//` lines. The header
-  of each tree therefore travels with its own artifacts.
-
-  opts (optional map):
-    :binary  The path to a squint executable. A relative path resolves
-             against `dir`. The default is `npx squint`, which resolves
-             node_modules/.bin/squint below `dir`. A task can compile in a
-             tree with no node_modules of its own, such as a test directory.
-             That task passes the path back into the install of the source
-             tree. Thus the compiled test and the code under test share one
-             squint-cljs ESM instance, and they do not resolve two."
+  opts:
+    :binary  A squint executable, relative to `dir`. Default `npx squint`.
+             A test tree with no node_modules passes the squint of the
+             source tree, so test and code share one squint-cljs instance."
   ([dir file] (squint-compile! dir file nil))
   ([dir file opts]
    (let [cmd (if-let [binary (:binary opts)]
@@ -805,24 +657,19 @@
       (str (nth (iterate fs/parent (fs/path (.toURI resource))) 6)))))
 
 (defn stage-test-deps!
-  "Copy the shipped clj-native helper .mjs files into the test dist
-  directory of a consumer. Then a cljs.test mirror imports them by relative
-  path, and not through an npm symlink chain.
+  "Copy the clj-native test helper .mjs files into the test dist dir of a
+  consumer, for import by relative path. An npm symlink would load a second
+  squint-cljs instance, and deftest and run-tests would then see different
+  registries. Throws when a file is missing.
 
-  The symlink route pulls a second squint-cljs ESM instance into the module
-  graph. That splits the cljs.test registry: deftest registers in one
-  instance, and run-tests reads the other. The copy keeps every test import
-  inside one instance. Each copy still imports 'squint-cljs/...' as a bare
-  specifier, which the test node_modules of the consumer resolves.
+  opts:
+    :dist        Default \"test/cljc/dist\".
+    :files       Default platform_state.mjs and test_runner.mjs.
+    :native-src  The dir with the built .mjs. Default: the loaded checkout.
+                 Required when clj-native loads from a jar.
 
-  opts (optional map):
-    :dist        The target directory. The default is \"test/cljc/dist\".
-    :files       The file names to stage. The default is platform_state.mjs
-                 and test_runner.mjs, the two test-support modules.
-    :native-src  The directory that holds the built clj-native .mjs. The
-                 default is the checkout that this namespace loaded from. A
-                 consumer that runs from the published jar must pass it, for
-                 example a node_modules/ffi-wasm path."
+  Each copy still imports squint-cljs by bare specifier, so the consumer's
+  test node_modules must have it."
   ([] (stage-test-deps! nil))
   ([opts]
    (let [dist (fs/path (or (:dist opts) "test/cljc/dist"))
@@ -846,36 +693,22 @@
                    ": " (str/join ", " files))))))
 
 (def npm-package-name
-  "The npm name that this package publishes under. It is the prefix of every
-  bare specifier in export-specifier-rewrites. check-exports-sync! pins it to
-  package.json."
+  "The npm package name. check-exports-sync! pins it to package.json."
   "ffi-wasm")
 
 (def shipped-module-files
-  "The file names of every compiled .mjs that the npm tarball ships. This is
-  the module inventory of the package, stated as data. Thus a consumer build
-  task can stage or rewrite the whole set, and it transcribes nothing.
-
-  A transcribed copy rots when someone adds a module. check-exports-sync!
-  pins this list to the files map and the exports map in package.json, and it
-  fails build:js on any drift."
+  "Each compiled .mjs that the npm tarball ships. check-exports-sync! pins
+  it to package.json."
   ["dispatch.mjs" "fetch_worker.mjs" "handler_env.mjs" "handler_fs.mjs"
    "handler_heap.mjs" "handler_paths.mjs" "handler_runtime.mjs"
    "http_bridge.mjs" "macros.mjs" "platform_state.mjs" "pool.mjs"
    "test_runner.mjs" "workload_pool.mjs"])
 
 (defn export-specifier-rewrites
-  "Map every bare specifier that this package exports, such as
-  \"ffi-wasm/pool\", to its module file name behind target-prefix.
-
-  A consumer can copy shipped-module-files adjacent to its own assets. That
-  consumer passes the prefix that reaches the copies. The prefix is \"./\"
-  for the same directory, and \"./ffi-wasm/\" for a subdirectory. It then
-  gives the result to rewrite-import-specifiers!. Thus a module graph with no
-  importmap, such as a module worker, resolves the imports.
-
-  The export subpath is the file name with dashes in place of underscores,
-  and with no extension. check-exports-sync! pins that rule to package.json."
+  "Map each bare specifier this package exports, such as \"ffi-wasm/pool\",
+  to `target-prefix` plus its file name. For rewrite-import-specifiers! on
+  copies of shipped-module-files, where no importmap applies. The subpath is
+  the file name with dashes for underscores and no extension."
   [target-prefix]
   (into {}
         (map (fn [f]
@@ -887,17 +720,10 @@
         shipped-module-files))
 
 (defn rewrite-import-specifiers!
-  "Rewrite the ESM import specifiers in the file at `target`, from
-  `rewrites`. `rewrites` maps a specifier string to a replacement string.
-
-  This fn covers the three shapes that squint and hand-written modules emit:
-  the static `from \"x\"`, the dynamic `import(\"x\")`, and
-  `import.meta.resolve(\"x\")`. The whitespace before the opening quote is
-  optional, because a minified bundle emits `from\"x\"`.
-
-  Each import keeps its own quote character. Thus a rewrite on squint output
-  stays byte-identical outside the specifier itself. This fn writes only
-  after a change, and it returns true when it wrote."
+  "Rewrite the import specifiers in the file at `target` by `rewrites`, a
+  map of specifier to replacement. Covers `from \"x\"`, `import(\"x\")` and
+  `import.meta.resolve(\"x\")`, with or without a space before the quote,
+  and keeps each quote character. Returns true when it wrote the file."
   [target rewrites]
   (let [escape-re (fn [s] (str/replace s (re-pattern "[.*+?^${}()|\\[\\]\\\\]") "\\\\$0"))
         content (slurp (fs/file target))
@@ -920,11 +746,9 @@
       true)))
 
 (def consumer-squint-edn
-  "The canonical squint.edn for the squint source directory of a consumer.
-  This namespace owns it, because every line is a contract of this package.
-  The contract covers the npm name, the src/cljc layout, and the macros.cljc
-  that the files list ships. ensure-consumer-squint-edn! stamps it into a
-  consumer tree."
+  "The squint.edn that ensure-consumer-squint-edn! writes into a consumer.
+  It lives here because its path depends on the npm name and layout of this
+  package."
   (str ";; GENERATED by clj-native's ensure-consumer-squint-edn! from the\n"
        ";; consumer's own `bb squint`; edit it there, not here.\n"
        ";; Adds the npm-installed ffi-wasm source tree to squint's :paths so\n"
@@ -936,10 +760,8 @@
        "{:paths [\".\" \"node_modules/ffi-wasm/src/cljc\"]}\n"))
 
 (defn ensure-consumer-squint-edn!
-  "Write consumer-squint-edn into `dir` when the file is missing or
-  different. Returns true when it wrote. A consumer calls this at the start
-  of its primary squint task. Thus the copy in its tree cannot drift from the
-  canonical text."
+  "Write consumer-squint-edn into `dir` when the squint.edn there differs.
+  Returns true when it wrote. Call it at the start of the squint task."
   [dir]
   (let [f (fs/file (str dir) "squint.edn")
         current (when (fs/exists? (fs/path (str dir) "squint.edn")) (slurp f))]
@@ -949,11 +771,8 @@
       true)))
 
 (defn check-exports-sync!
-  "Pin npm-package-name, shipped-module-files and the export subpath rule
-  behind export-specifier-rewrites to package.json. This fn reads the
-  package.json at the repo root that this namespace loaded from. It throws
-  with the exact drift when the two disagree. It runs ahead of build:js, thus
-  a stale inventory cannot ship."
+  "Throw with the drift when npm-package-name, shipped-module-files or the
+  export subpath rule disagrees with the package.json of the checkout."
   []
   (let [root (or (clj-native-root)
                  (throw (ex-info (str "check-exports-sync! needs a checkout; "
@@ -965,9 +784,8 @@
                        (filter #(str/ends-with? % ".mjs"))
                        (map #(str (fs/file-name %)))
                        set)
-        ;; "." is the package entry point. "./package.json" is a plain file
-        ;; subpath that strict-exports tooling asks for. Neither one is a
-        ;; shipped module, thus neither belongs in the module inventory.
+        ;; "." is the entry point and "./package.json" a plain file. Neither
+        ;; is a shipped module.
         export-pairs (->> (dissoc (get pkg "exports") "." "./package.json")
                           (map (fn [[sub target]] [(subs sub 2) (str (fs/file-name target))]))
                           set)

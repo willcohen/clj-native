@@ -5,25 +5,11 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.test-runner
-  "cljs.test runner footer for clj-native consumers.
+  "cljs.test runner that always exits the process.
 
    The clj-native worker pool keeps the Node event loop alive after
-   cljs.test/run-tests resolves. Thus a `(when (pos? ...) (.exit 1))`
-   footer hangs on success. A bb timeout masks that hang as exit 124.
-   The helper here always exits: 0 when all tests pass, and 1 on any
-   failure or error. JVM consumers ignore this namespace, because the
-   cognitect test-runner already does the process exit.
-
-   The optional first-argument teardown is for consumers with their own
-   runtime state. That state stays alive after cljs.test/run-tests
-   resolves. A worker pool shutdown and custom watchers are two examples.
-
-   Squint ^:async metadata does not propagate to inline functions in
-   argument position. Thus the teardown must be a top-level ^:async
-   defn, or any function that returns a Promise. The inner await then
-   compiles correctly.
-
-   Usage at the bottom of a cljs.test mirror:
+   cljs.test/run-tests resolves, so a runner that exits only on failure
+   hangs on success. JVM consumers do not need this namespace.
 
      (ns my-test
        (:require #?(:cljs [cljs.test :as t])
@@ -31,7 +17,7 @@
 
      #?(:cljs (tr/run-tests-and-exit! \"my-test\"))
 
-   With teardown (for example, a library's worker pool):
+   With a teardown:
 
      (defn ^:async shutdown! [] (await (.shutdown mylib)))
      #?(:cljs (tr/run-tests-and-exit! shutdown! \"my-test\"))"
@@ -39,30 +25,12 @@
 
 #?(:cljs
    (defn run-tests-and-exit!
-     "Invoke cljs.test/run-tests for the given namespace name strings.
-      With zero arguments, this runs all registered tests. Await any
-      returned Promise. Then call process.exit with 0 when all tests
-      pass, or 1 on any failure or error.
+     "Run cljs.test/run-tests on the named namespaces, or on all with no
+      names. Exit 0 when all pass, and 1 on a failure, an error or a
+      rejection.
 
-      An optional teardown function comes FIRST. It takes zero
-      arguments, and it is either synchronous or returns a Promise.
-      Every argument after the teardown is a namespace name.
-      run-tests-and-exit! separates the two by type, and the argument
-      count does not matter. Thus the two calls below are each
-      complete:
-
-        (run-tests-and-exit! shutdown!)      ; teardown, all tests
-        (run-tests-and-exit! \"my.ns-test\")   ; one namespace, no teardown
-
-      The teardown runs after run-tests resolves and before
-      process.exit. Use the teardown when the consumer process keeps
-      the event loop alive. Worker pools and file-system watchers are
-      two examples, and an explicit shutdown is necessary for them.
-
-      cljs.test/run-tests returns a synchronous result map when no test
-      is ^:async. If at least one test is ^:async, it returns a Promise
-      that resolves to a result map. Promise.resolve normalizes the two
-      paths."
+      An optional zero-argument teardown fn comes first. It runs before
+      the exit and can return a Promise."
      [& args]
      (let [first-arg (first args)
            teardown  (when (fn? first-arg) first-arg)

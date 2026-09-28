@@ -771,36 +771,23 @@
       true)))
 
 (defn check-exports-sync!
-  "Throw with the drift when npm-package-name, shipped-module-files or the
-  export subpath rule disagrees with the package.json of the checkout."
-  []
-  (let [root (or (clj-native-root)
-                 (throw (ex-info (str "check-exports-sync! needs a checkout; "
-                                      "a jar classpath carries no package.json")
-                                 {})))
-        pkg (json/parse-string (slurp (str (fs/path root "package.json"))))
-        pkg-name (get pkg "name")
-        files-mjs (->> (get pkg "files")
-                       (filter #(str/ends-with? % ".mjs"))
-                       (map #(str (fs/file-name %)))
-                       set)
-        ;; "." is the entry point and "./package.json" a plain file. Neither
-        ;; is a shipped module.
-        export-pairs (->> (dissoc (get pkg "exports") "." "./package.json")
-                          (map (fn [[sub target]] [(subs sub 2) (str (fs/file-name target))]))
-                          set)
-        expected-files (set shipped-module-files)
-        expected-pairs (->> (export-specifier-rewrites "")
-                            (map (fn [[spec f]] [(subs spec (inc (count npm-package-name))) f]))
-                            set)]
-    (when-not (and (= pkg-name npm-package-name)
-                   (= files-mjs expected-files)
-                   (= export-pairs expected-pairs))
-      (throw (ex-info "build.clj module inventory disagrees with package.json"
-                      {:name {:package-json pkg-name :build-clj npm-package-name}
-                       :files-only-in-package-json (sort (remove expected-files files-mjs))
-                       :files-only-in-build-clj (sort (remove files-mjs expected-files))
-                       :exports-only-in-package-json (sort (map vec (remove expected-pairs export-pairs)))
-                       :exports-only-in-build-clj (sort (map vec (remove export-pairs expected-pairs)))})))
-    (println (str "package.json inventory in sync: " (count expected-files)
-                  " modules, " (count expected-pairs) " exports"))))
+  "Throw with the drift when the file `package-json` disagrees with
+  npm-package-name and shipped-module-files: its name, main, each exports
+  entry and its files, all by full path."
+  [package-json]
+  (let [pkg  (json/parse-string (slurp (str package-json)))
+        dir  "src/cljc/net/willcohen/native/"
+        main (str dir "handler_runtime.mjs")
+        want {"name"    npm-package-name
+              "main"    main
+              "exports" (into {"." (str "./" main) "./package.json" "./package.json"}
+                              (map (fn [[spec f]] [(str "." (subs spec (count npm-package-name))) f]))
+                              (export-specifier-rewrites (str "./" dir)))
+              ;; squint reads macros.cljc to expand the macros.
+              "files"   (sort (cons (str dir "macros.cljc") (map #(str dir %) shipped-module-files)))}
+        have  (update (select-keys pkg (keys want)) "files" sort)
+        drift (into {} (remove (fn [[k v]] (= v (get have k)))) want)]
+    (when (seq drift)
+      (throw (ex-info "package.json disagrees with the module inventory of net.willcohen.native.build"
+                      {:build-clj drift :package-json (select-keys have (keys drift))})))
+    (println (str "package.json inventory in sync: " (count shipped-module-files) " modules"))))

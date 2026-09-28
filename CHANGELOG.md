@@ -31,7 +31,7 @@
   each other.
 - HTTP bridge: a late response no longer loses the next request, and a
   crashed fetch worker keeps the count of its users.
-- A crashed Node worker exits 1.
+- A crashed Node worker and a drained test run exit 1.
 
 ## [0.0.1] - 2026-07-30
 

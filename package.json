@@ -35,9 +35,7 @@
     "src/cljc/net/willcohen/native/macros.mjs",
     "src/cljc/net/willcohen/native/test_runner.mjs",
     "src/cljc/net/willcohen/native/http_bridge.mjs",
-    "src/cljc/net/willcohen/native/fetch_worker.mjs",
-    "README.md",
-    "LICENSE"
+    "src/cljc/net/willcohen/native/fetch_worker.mjs"
   ],
   "scripts": {
     "prepack": "bb build:js"

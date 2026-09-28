@@ -27,7 +27,9 @@
   (testing "a failed assertion exits 1 via the \"fail\" counter"
     (is (= 1 (probe-exit "fail"))))
   (testing "a thrown test body exits 1 via the \"error\" counter"
-    (is (= 1 (probe-exit "error")))))
+    (is (= 1 (probe-exit "error"))))
+  (testing "a test that never settles exits 1 when the event loop drains"
+    (is (= 1 (probe-exit "hang")))))
 
 (deftest a-teardown-and-a-namespace-name-are-told-apart-by-type
   (testing "a lone teardown fn runs every registered test, then the teardown"

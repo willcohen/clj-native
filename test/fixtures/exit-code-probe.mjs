@@ -18,7 +18,7 @@ import * as tr from 'ffi-wasm/test-runner';
 const NS = 'net.willcohen.native.exit-code-probe';
 const mode = process.argv[2];
 
-const MODES = ['pass', 'fail', 'error', 'teardown', 'teardown-fail', 'teardown-ns'];
+const MODES = ['pass', 'fail', 'error', 'hang', 'teardown', 'teardown-fail', 'teardown-ns'];
 if (!MODES.includes(mode)) {
   console.error(`exit-code-probe: expected one of ${MODES.join('|')}, got ${mode}`);
   process.exit(2);
@@ -43,6 +43,7 @@ t.register_test_BANG_(
       if (mode === 'error') {
         throw new Error('exit-code-probe: deliberate throw');
       }
+      if (mode === 'hang') return new Promise(() => {});
       console.log('TEST-RAN');
       t.report({
         type: shouldPass ? 'pass' : 'fail',

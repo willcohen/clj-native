@@ -312,6 +312,25 @@ Import {
                             (nb/check-windows-lib! "windows-amd64" (lib "windows-amd64" "y.dll" "-lws2_32")))
           "a DLL outside the allowlist"))))
 
+(deftest check-exports-sync-compares-full-paths
+  (let [copy   (str (fs/path (fs/create-temp-dir) "package.json"))
+        pkg    (slurp "package.json")
+        check! (fn [from to]
+                 (is (str/includes? pkg from))
+                 (spit copy (str/replace pkg from to))
+                 (nb/check-exports-sync! copy))]
+    (is (nil? (check! "" "")))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (check! "\"./src/cljc/net/willcohen/native/pool.mjs\"" "\"./src/cljc/net/willcohen/nativ/pool.mjs\""))
+        "a wrong dir in an export")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (check! "\"main\": \"src/cljc/net/willcohen/native/handler_runtime.mjs\""
+                         "\"main\": \"src/cljc/net/willcohen/native/pool.mjs\""))
+        "a wrong main")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (check! "\"src/cljc/net/willcohen/native/macros.cljc\",\n" ""))
+        "macros.cljc left out of files")))
+
 (deftest stage-test-deps-copies-each-helper-or-throws
   (let [src  (fs/create-temp-dir)
         dist (str (fs/path (fs/create-temp-dir) "dist"))

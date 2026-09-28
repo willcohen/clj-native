@@ -97,7 +97,7 @@ the macros."
   check:exports
   {:doc "Check the module inventory of net.willcohen.native.build against package.json.
 Drift fails build:js, and through prepack each npm pack."
-   :task (nb/check-exports-sync!)}
+   :task (nb/check-exports-sync! "package.json")}
 
   build:js
   {:doc "Compile each shipped CLJC module to JS."

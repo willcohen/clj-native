@@ -28,7 +28,9 @@
        "(flush)"))
 
 (deftest dispatch-and-pooled-work-leave-the-shared-context-unbuilt
-  (let [{:keys [exit out err]} (sh/sh "clojure" "-M" "-e" probe)]
+  (let [{:keys [exit out err]} (sh/sh (str (System/getProperty "java.home") "/bin/java")
+                                     "-cp" (System/getProperty "java.class.path")
+                                     "clojure.main" "-e" probe)]
     (is (= 0 exit) (str err "\n" out))
     (is (str/includes? out "lazy=true") out)
     (is (str/includes? out "pooled-untouched=true") out)))

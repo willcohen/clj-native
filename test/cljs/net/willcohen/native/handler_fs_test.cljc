@@ -65,11 +65,9 @@
 
 (deftest stage-files-rejects-a-value-that-is-not-bytes
   (let [{:keys [module]} (fake-fs)]
-    (is (thrown-with-msg? js/Error #"not Uint8Array or coercible"
-                          (stageFiles module #js {"bad.dat" 42} "/d")))
-    (testing "the failing name is in the message, so the caller knows which one"
-      (is (thrown-with-msg? js/Error #"bad\.dat"
-                            (stageFiles module #js {"bad.dat" "text"} "/d"))))))
+    (is (thrown-with-msg? js/Error #"bad\.dat is not Uint8Array or coercible"
+                          (stageFiles module #js {"bad.dat" 42} "/d"))
+        "the message names the failing file")))
 
 (deftest stage-files-guards-its-arguments
   (let [{:keys [module]} (fake-fs)

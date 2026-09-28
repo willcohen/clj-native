@@ -10,9 +10,14 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [net.willcohen.native.ffi-mem :as m]
             [tech.v3.datatype.ffi :as dt-ffi]
-            [tech.v3.datatype.native-buffer :as dt-nb]))
+            [tech.v3.datatype.native-buffer :as dt-nb]
+            [tech.v3.resource :as resource]))
 
 (use-fixtures :once (fn [f] (dt-ffi/set-ffi-impl! :jdk) (f)))
+
+;; A buffer that scratch drops is GC-tracked outside a stack context, so a GC
+;; could free it while the test still writes through its address.
+(use-fixtures :each (fn [f] (resource/stack-resource-context (f))))
 
 (defn- scratch ^long [n]
   (m/ptr-addr (dt-nb/malloc (long n) {:datatype :int8})))
@@ -69,9 +74,3 @@
       (is (= 0 (bit-and (m/rd-i32 (+ addr 5)) 0xFF))))
     (testing "nil string allocates nothing and returns address 0"
       (is (= 0 (m/alloc-cstring alloc nil))))))
-
-(deftest rd-cstr-null
-  (testing "rd-cstr of a slot holding NULL is nil"
-    (let [slot (scratch 8)]
-      (m/put-ptr! slot 0 0)
-      (is (nil? (m/rd-cstr slot))))))

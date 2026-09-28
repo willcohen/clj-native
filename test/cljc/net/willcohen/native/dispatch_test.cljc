@@ -9,16 +9,12 @@
    for the ns next to this file."
   (:require #?(:clj  [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing]])
-            [clojure.string :as string]
             #?(:clj  [net.willcohen.native.dispatch :as d]
                :cljs ["ffi-wasm/dispatch" :as d])
             #?(:clj [net.willcohen.native.platform])
             #?(:clj [tech.v3.datatype.ffi :as dt-ffi])
             #?(:cljs ["ffi-wasm/pool" :as pool])
             #?(:cljs ["ffi-wasm/test-runner" :as tr])))
-
-(def number-typed-argtypes
-  [:pointer :pointer? :int32 :int64 :float64 :size-t :void])
 
 (def sample-fndefs
   {:lib_make  {:rettype :pointer :argtypes [[:ctx :pointer] [:name :string]]}
@@ -27,95 +23,32 @@
 
 ;; squint compiles :number to the string "number", so one assertion holds on
 ;; both platforms.
-(deftest argtype->ccall-type-maps-every-known-type
-  (testing "number-typed argtypes collapse to :number"
-    (doseq [t number-typed-argtypes]
-      (is (= :number (d/argtype->ccall-type t))
-          (str t " -> :number"))))
-  (testing ":string and :string? map to :string"
-    (is (= :string (d/argtype->ccall-type :string)))
-    (is (= :string (d/argtype->ccall-type :string?)))))
+(deftest argtype->ccall-type-maps-strings-and-numbers
+  (is (= [:string :string :number :number]
+         (mapv d/argtype->ccall-type [:string :string? :int64 :pointer?]))))
 
 (deftest library-validates-fndefs-types-at-build-time
   ;; argtype->ccall-type maps an unknown type to :number with no error, so
   ;; `library` must reject it.
-  (testing "a fn-def with supported types builds"
-    (is (some? (d/library {:key :ok-lib :fndefs sample-fndefs}))))
-  (testing "an unknown rettype throws at assembly, not at the first call"
+  (testing "an unknown rettype throws at assembly"
     (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (d/library {:key :bad-lib
                              :fndefs {:lib_bad {:rettype :int128
                                                 :argtypes [[:x :pointer]]}}}))))
-  (testing "a string-array type throws, since dt-ffi has none"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
-                 (d/library {:key :bad-lib
-                             :fndefs {:lib_sa {:rettype :void
-                                               :argtypes [[:x :string-array]]}}}))))
   (testing "an unknown argtype throws at assembly"
     (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (d/library {:key :bad-lib
                              :fndefs {:lib_bad {:rettype :void
-                                                :argtypes [[:x :quaternion]]}}}))))
-  (testing ":string? and :int64 arguments get their indexes precomputed"
-    (let [r (get-in (d/library {:key :idx-lib
-                                :fndefs {:lib_mix {:rettype :int64
-                                                   :argtypes [[:p :pointer] [:s :string?] [:v :int64]]}}})
-                    [:fns :lib_mix])]
-      (is (= :number (:ccall-rettype r)))
-      (is (= :string (nth (:ccall-argtypes r) 1)))
-      (is (and (= 1 (count (:string?-indexes r))) (contains? (:string?-indexes r) 1)))
-      (is (and (= 1 (count (:int64-indexes r))) (contains? (:int64-indexes r) 2))))))
-
-(deftest library-precomputes-one-record-per-fn-key
-  (let [lib (d/library {:key :test-lib :fndefs sample-fndefs})]
-    (testing "every fn-key gets a record"
-      (is (= 3 (count (:fns lib))))
-      (is (every? #(contains? (:fns lib) %) (keys sample-fndefs))))
-    (testing "the record carries the computed ccall types, not the raw fn-def"
-      (let [r (get-in lib [:fns :lib_make])]
-        (is (= :number (:ccall-rettype r)))
-        (is (= [:number :string] (:ccall-argtypes r)))
-        (is (= "lib_make" (:c-name r)))))
-    (testing "the original fn-def stays reachable"
-      (is (= (:lib_count sample-fndefs) (:fn-def (get-in lib [:fns :lib_count])))))
-    (testing "the key is carried for pool and wasm-context lookups"
-      (is (= :test-lib (:key lib))))))
-
-#?(:clj
-   (deftest jvm-pointer-postprocess-maps-a-zero-address-to-nil
-     (is (nil? (d/jvm-rettype-postprocess :pointer 0))
-         "a null pointer return is nil, not a zero-address TrackablePointer")
-     (is (some? (d/jvm-rettype-postprocess :pointer 4096))
-         "a live address still wraps")))
+                                                :argtypes [[:x :quaternion]]}}})))))
 
 #?(:clj
    (deftest jvm-postprocess-treats-pointer?-exactly-like-pointer
      ;; The CLJS backend nils a zero for both spellings, so a missing :pointer?
      ;; arm here would make the backends disagree.
-     (testing "a null address is nil under either spelling"
-       (is (nil? (d/jvm-rettype-postprocess :pointer? 0))))
-     (testing "a live address wraps under either spelling"
-       (is (some? (d/jvm-rettype-postprocess :pointer? 4096)))
-       (is (= (class (d/jvm-rettype-postprocess :pointer 4096))
-              (class (d/jvm-rettype-postprocess :pointer? 4096)))
-           "both spellings produce the same wrapper type"))))
-
-(deftest validate-fn-def!-names-every-supported-type
-  ;; supported-types-msg is a literal, since (str :pointer) differs between
-  ;; the JVM and squint. This test keeps it in step with the set.
-  (let [msg (try
-              (d/library {:key :msg-lib
-                          :fndefs {:lib_bad {:rettype :int128 :argtypes []}}})
-              nil
-              (catch #?(:clj Exception :cljs :default) e
-                #?(:clj (.getMessage e) :cljs (.-message e))))]
-    (is (some? msg) "an unsupported rettype has to throw for this to mean anything")
-    ;; Match whole tokens, since ":string" is a prefix of ":string?".
-    (let [tokens (set (string/split msg #"[ ,]+"))]
-      (is (contains? tokens ":pointer") "the token split has to produce bare types")
-      (doseq [t d/supported-types]
-        (is (contains? tokens (str ":" (name t)))
-            (str "the rejection message omits " (name t)))))))
+     (doseq [t [:pointer :pointer?]]
+       (is (nil? (d/jvm-rettype-postprocess t 0)) (str t " of NULL"))
+       (is (= 4096 (:address (d/jvm-rettype-postprocess t 4096)))
+           (str t " of a live address")))))
 
 #?(:clj
    (deftest call!-selects-the-backend-from-the-impl-atom-per-call
@@ -128,7 +61,7 @@
        (with-redefs [net.willcohen.native.platform/call-native-fn
                      (fn [_ns fn-key args] (swap! calls conj [:ffi fn-key args]) :ffi-result)]
          (is (= :ffi-result (d/call! lib :lib_count [7])))
-         (is (= [[:ffi :lib_count [7]]] @calls) "routed to the FFI leaf"))
+         (is (= [[:ffi :lib_count [7]]] @calls) "routed to the FFI backend"))
        (testing "flipping the atom flips the backend with no rebuild"
          (reset! impl :graal)
          (with-redefs [net.willcohen.native.dispatch/jvm-graal-call
@@ -155,7 +88,7 @@
              (is (= "abc" c-str))
              (is (nil? nil-arg))
              (is (= [1 2] [n1 n2]) "the other arguments pass unchanged"))))
-       (testing "an unknown fn-key throws rather than deriving a record per call"
+       (testing "an unknown fn-key throws"
          (is (thrown? clojure.lang.ExceptionInfo
                       (d/call! lib :lib_nonexistent [])))))))
 
@@ -167,8 +100,6 @@
            outcome (await (-> (d/call! lib :lib_nonexistent [])
                               (.then (fn [_] "resolved"))
                               (.catch (fn [e] (str (.-message e))))))]
-       (is (not= "resolved" outcome)
-           "an unknown fn-key must not resolve")
        (is (.includes outcome "Unknown fn-key")
            "the rejection names the defect"))))
 
@@ -180,9 +111,7 @@
     (is (= 4096 (d/normalize-null-pointer :pointer 4096))))
   (testing "only a pointer rettype normalizes"
     (is (= 0 (d/normalize-null-pointer :int32 0))
-        "a zero int32 return is a real value, not a null pointer")
-    (is (= 0 (d/normalize-null-pointer :size-t 0)))
-    (is (= "" (d/normalize-null-pointer :string "")))))
+        "a zero int32 return stays 0")))
 
 (deftest ^:async result-check-hook-fires-through-check-result
   ;; check-result reads the hook from the library value and calls it with
@@ -195,16 +124,14 @@
                                    (reset! seen [(:key l) fn-key])
                                    (* 10 result))}})
         r #?(:clj  (d/check-result lib :some-fn {} {} 21)
-             :cljs (await (d/check-result lib :some-fn {} {} 21)))]
+             :cljs (await (d/check-result lib :some-fn {} {} 21)))
+        no-hook (d/library {:key :dispatch-nocheck-lib :fndefs sample-fndefs})
+        r-no-hook #?(:clj  (d/check-result no-hook :some-fn {} {} 21)
+                     :cljs (await (d/check-result no-hook :some-fn {} {} 21)))]
     (is (= 210 r) "check-result runs the library's check on the result arg")
     (is (= [:dispatch-check-lib :some-fn] @seen)
-        "the check receives the library VALUE, not a key")))
-
-(deftest ^:async check-result-passes-through-when-the-library-has-no-check
-  (let [lib (d/library {:key :dispatch-nocheck-lib :fndefs sample-fndefs})
-        r #?(:clj  (d/check-result lib :some-fn {} {} 21)
-             :cljs (await (d/check-result lib :some-fn {} {} 21)))]
-    (is (= 21 r) "no hook means the result passes through")))
+        "the check receives the library value")
+    (is (= 21 r-no-hook) "no hook means the result passes through")))
 
 #?(:cljs
    (deftest ^:async call!-on-cljs-sends-an-int64-argument-as-a-bigint

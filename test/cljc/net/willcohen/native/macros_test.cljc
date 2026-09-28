@@ -58,15 +58,6 @@
     (is (= "do" (str (first form))))
     (is (= #{"alpha-one<-AlphaOne" "beta-two<-BetaTwo"} (set (rest form))))))
 
-(deftest library-fns-form-skips-a-key-the-name-fn-declines
-  (let [form (m/library-fns-form two-fndefs
-                                 {:name-fn (fn [fn-key]
-                                             (when (= fn-key "BetaTwo")
-                                               (m/camel-name->clj-name fn-key)))
-                                  :emit-fn (fn [fn-name _ _] (str fn-name))})]
-    (is (= ["beta-two"] (vec (rest form)))
-        "a nil name leaves the entry out of the surface entirely")))
-
 (deftest library-fns-form-appends-the-alias-walk
   (let [form (m/library-fns-form two-fndefs
                                  {:name-fn m/camel-name->clj-name

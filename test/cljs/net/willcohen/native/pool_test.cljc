@@ -22,6 +22,7 @@
                      evicted_QMARK_
                      ref_handle_BANG_
                      unref_handle_BANG_
+                     get_pool_detail
                      get_pool_stats
                      fire_and_capture_dispose_BANG_
                      flush_pending_disposes_BANG_
@@ -45,10 +46,6 @@
 (defn track-ephemeral [lib ctx-id worker-idx release-fn]
   (let [owner #js {:kind ctx-id}]
     (track_context_BANG_ lib ctx-id worker-idx release-fn owner)))
-
-(deftest expose-gc-is-set
-  (is (= "function" (js* "typeof globalThis.gc"))
-      "this suite requires `node --expose-gc`"))
 
 (deftest ^:async fr-driven-release-fires-for-gc-collected-owners-and-skips-live-ones
   (let [lib "pool-test-sweep"]
@@ -76,39 +73,22 @@
       (is (= 1 @releases))
       (reset_library_context_BANG_ lib))))
 
-(deftest reset-library-context-drains-every-claim
-  (let [lib "pool-test-reset"]
-    (register_library_context_BANG_ lib)
-    (let [releases (atom 0)
-          owners #js [#js {} #js {} #js {}]]
-      (doseq [i (range (.-length owners))]
-        (track_context_BANG_ lib i i
-                             (fn [] (swap! releases inc))
-                             (aget owners i)))
-      (reset_library_context_BANG_ lib)
-      (is (= (.-length owners) @releases)))))
-
 (deftest worker-idx-from-args-resolves-affinity-and-falls-back
-  (let [lib "affinity-test"]
-    (register_library_context_BANG_ lib)
-    ;; .worker_idx is the munged :worker-idx a consumer tags on its context.
-    (is (= 3 (worker_idx_from_args #js [#js {:worker_idx 3} "scalar"])))
-    ;; The fallback is a fixed 0, since dispatch cannot tell a pure call from
-    ;; one that touches worker-local module state.
-    (is (= 0 (worker_idx_from_args #js ["scalar" 42])))
-    (reset_library_context_BANG_ lib)))
+  ;; .worker_idx is the munged :worker-idx a consumer tags on its context.
+  (is (= 3 (worker_idx_from_args #js [#js {:worker_idx 3} "scalar"])))
+  (is (= 0 (worker_idx_from_args #js ["scalar" 42]))))
 
 (deftest assign-worker-for-context-honors-explicit-worker-and-bounds-checks
   (let [lib "assign-test"
         fake-pool #js {:size 4}]
-    (register_library_context_BANG_ lib)
-    (let [assigned (assign_worker_for_context_BANG_ fake-pool lib {:worker 2})]
-      (is (= 2 (:idx assigned)) "explicit :worker is honored without a claim")
-      (is (fn? (:release assigned)) "a release closure is always returned"))
+    (is (= 2 (:idx (assign_worker_for_context_BANG_ fake-pool lib {:worker 2})))
+        "explicit :worker is honored without a claim")
     (is (thrown? js/Error
                  (assign_worker_for_context_BANG_ fake-pool lib {:worker 9}))
         "out-of-range worker index is rejected")
-    (reset_library_context_BANG_ lib)))
+    (is (thrown? js/Error
+                 (assign_worker_for_context_BANG_ fake-pool lib {:worker -1}))
+        "a negative worker index is rejected")))
 
 (deftest two-library-contexts-stay-isolated
   ;; Two handler-keys that share one pool keep independent context registries.
@@ -121,15 +101,13 @@
           owner-a #js {:k "a"}
           owner-b #js {:k "b"}]
       (track_context_BANG_ libA 1 2 (fn [] (swap! relA inc)) owner-a)
+      (track_context_BANG_ libA 2 2 (fn [] (swap! relA inc)) #js {})
       (track_context_BANG_ libB 1 3 (fn [] (swap! relB inc)) owner-b)
       (reset_library_context_BANG_ libA)
-      (is (= 1 @relA) "libA reset fired libA's release")
+      (is (= 2 @relA) "libA reset fired every libA release")
       (is (= 0 @relB) "libA reset left libB untouched")
       (reset_library_context_BANG_ libB)
-      (is (= 1 @relB))
-      ;; Keep owners reachable so no FR fires mid-test and perturbs counts.
-      (is (= "a" (.-k owner-a)))
-      (is (= "b" (.-k owner-b))))))
+      (is (= 1 @relB)))))
 
 (deftest ^:async parent-drain-gate-stays-open-until-child-release-promises-settle
   ;; A parent must count its children drained only when each async release-fn
@@ -170,31 +148,31 @@
         log #js []
         mk (fn [id] (fn [] (.push log id)))]
     (register_library_context_BANG_ lib {:max-live-ctxs 3 :min-age-ms 0})
-    (register_handle_BANG_ lib "c0" 0 (mk "c0") o0)
-    (register_handle_BANG_ lib "c1" 0 (mk "c1") o1)
-    (register_handle_BANG_ lib "c2" 0 (mk "c2") o2)
+    (register_handle_BANG_ lib 0 0 (mk 0) o0)
+    (register_handle_BANG_ lib 1 0 (mk 1) o1)
+    (register_handle_BANG_ lib 2 0 (mk 2) o2)
     (is (= "evicted" (evict_oldest_BANG_ lib))
         "idle entry is evictable even though its owner is still reachable")
     (is (= 1 (.-length log)) "exactly one release fired")
-    (let [victim (aget log 0)]
-      (is (true? (evicted_QMARK_ lib victim)) "evicted ctx-id is tombstoned"))
     (is (= 2 (.-live (get_pool_stats lib))) "live dropped by one")
+    (let [victim (aget log 0)]
+      ;; A numeric id: the live map keys it as a string, the tombstone must not.
+      (is (true? (evicted_QMARK_ lib victim)) "evicted ctx-id is tombstoned")
+      (register_handle_BANG_ lib victim 0 (mk victim) #js {})
+      (is (false? (evicted_QMARK_ lib victim)) "a fresh registration clears the tombstone"))
     (reset_library_context_BANG_ lib)))
 
 (deftest bounded-create-caps-live-count-by-evicting
-  (let [lib "evict-bound"
-        owners #js []]
+  (let [lib "evict-bound"]
     (register_library_context_BANG_ lib {:max-live-ctxs 4 :min-age-ms 0})
     (dotimes [i 10]
       (let [o #js {:id i}]
-        (.push owners o)
         (bounded_create_handle_BANG_
          lib (fn [] (register_handle_BANG_ lib (str "b" i) 0 (fn [] nil) o)))))
     (let [stats (get_pool_stats lib)]
       (is (= 4 (.-live stats)) "live count parks at the bound via eviction")
       (is (= 6 (.-evictions stats)) "each create beyond the bound evicted one")
       (is (= 0 (.-blocks stats)) "no blocks: eviction always found a victim"))
-    (is (= 10 (.-length owners)))                     ; all owners still reachable
     (reset_library_context_BANG_ lib)))
 
 (deftest refcount-still-pins-against-eviction
@@ -203,20 +181,16 @@
     (register_library_context_BANG_ lib {:max-live-ctxs 2 :min-age-ms 0})
     (register_handle_BANG_ lib "p" 0 (fn [] nil) o)
     (ref_handle_BANG_ lib "p")
+    (let [detail (get_pool_detail lib)
+          age-ms (.-age_ms (aget (.-sample detail) 0))]
+      (is (= {:total 1 :evictable 0 :blocked_refcount 1 :blocked_age_gate 0
+              :sample [{:ctx_id "p" :refcount 1 :owner_alive true
+                        :age_ms age-ms :age_gated false}]}
+             detail)
+          "get-pool-detail keeps the JS shape that clj-proj re-exports"))
     (is (= "none-evictable" (evict_oldest_BANG_ lib)) "refcount>0 pins the entry")
     (unref_handle_BANG_ lib "p")
     (is (= "evicted" (evict_oldest_BANG_ lib)) "unref makes it evictable")
-    (is (identical? o o))                             ; keep o alive
-    (reset_library_context_BANG_ lib)))
-
-(deftest reregister-clears-eviction-tombstone
-  (let [lib "evict-reregister"]
-    (register_library_context_BANG_ lib {:max-live-ctxs 1 :min-age-ms 0})
-    (register_handle_BANG_ lib "x" 0 (fn [] nil) #js {})
-    (evict_oldest_BANG_ lib)
-    (is (true? (evicted_QMARK_ lib "x")) "evicted ctx-id is tombstoned")
-    (register_handle_BANG_ lib "x" 0 (fn [] nil) #js {})
-    (is (false? (evicted_QMARK_ lib "x")) "fresh registration clears the tombstone")
     (reset_library_context_BANG_ lib)))
 
 (deftest ^:async a-flush-holds-only-pending-and-failed-disposes

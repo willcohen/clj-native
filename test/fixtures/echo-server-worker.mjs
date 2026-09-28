@@ -9,25 +9,15 @@
 import { parentPort } from 'node:worker_threads';
 import http from 'node:http';
 
+const redirects = { '/redirect-chain': '/redirect-chain-2', '/redirect-chain-2': '/query?redirected=2' };
+
 const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
-    // Match the chain paths before /redirect, since startsWith matches both.
-    if (req.url.startsWith('/redirect-chain-2')) {
-      res.setHeader('location', '/query?redirected=2');
-      res.statusCode = 302;
-      res.end();
-      return;
-    }
-    if (req.url.startsWith('/redirect-chain')) {
-      res.setHeader('location', '/redirect-chain-2');
-      res.statusCode = 302;
-      res.end();
-      return;
-    }
-    if (req.url.startsWith('/redirect')) {
-      res.setHeader('location', '/query?redirected=1');
+    const location = redirects[req.url];
+    if (location) {
+      res.setHeader('location', location);
       res.statusCode = 302;
       res.end();
       return;
@@ -37,13 +27,6 @@ const server = http.createServer((req, res) => {
       res.setHeader('x-pad', 'p'.repeat(pad));
       res.statusCode = 204;
       res.end();
-      return;
-    }
-    if (req.url.startsWith('/large')) {
-      const n = Number(new URL(req.url, 'http://x').searchParams.get('bytes')) || 0;
-      res.setHeader('content-type', 'application/octet-stream');
-      res.statusCode = 200;
-      res.end(Buffer.alloc(n, 0x78));  // 0x78 = 'x'
       return;
     }
     // `chunks` chunks of `size` bytes, `delay` ms apart: each gap stays under
@@ -79,10 +62,4 @@ const server = http.createServer((req, res) => {
 
 server.listen(0, '127.0.0.1', () => {
   parentPort.postMessage({ type: 'ready', port: server.address().port });
-});
-
-parentPort.on('message', (msg) => {
-  if (msg?.cmd === 'close') {
-    server.close(() => parentPort.postMessage({ type: 'closed' }));
-  }
 });

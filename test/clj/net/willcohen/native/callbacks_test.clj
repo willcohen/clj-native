@@ -5,27 +5,33 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.callbacks-test
-  "JVM smoke tests for upcall registration under the :jdk backend. The consumer
-   suites (clj-proj, clj-gdal) test callback invocation end to end."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  "JVM tests for upcall registration under the :jdk backend. They call each
+   stub back through a Panama downcall."
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [net.willcohen.native.callbacks :as cb]
             [net.willcohen.native.ffi-mem :as m]
             [tech.v3.datatype.ffi :as dt-ffi])
-  (:import [tech.v3.datatype.ffi Pointer]))
+  (:import [java.lang.foreign FunctionDescriptor Linker Linker$Option MemoryLayout
+            MemorySegment ValueLayout]
+           [java.lang.ref Reference]))
 
 (use-fixtures :once (fn [f] (dt-ffi/set-ffi-impl! :jdk) (f)))
 
-(deftest register-callback-produces-retained-pointer
-  (let [iface (cb/define-callback-interface :int64 [:int64])
-        {:keys [ptr inst]} (cb/register-callback! iface (fn [x] (* 2 (long x))))]
-    (is (instance? Pointer ptr))
-    (is (pos? (m/ptr-addr ptr)) "upcall stub has a real native address")
-    (is (some? inst) "instance is retained so the caller can keep it GC-alive")))
+(defn- call-long->long
+  "Call the C fn long(long) at the address of `ptr` with `x`."
+  [ptr x]
+  (let [l  ValueLayout/JAVA_LONG
+        mh (.downcallHandle (Linker/nativeLinker)
+                            (MemorySegment/ofAddress (m/ptr-addr ptr))
+                            (FunctionDescriptor/of l (into-array MemoryLayout [l]))
+                            (into-array Linker$Option []))]
+    (.invokeWithArguments mh (object-array [x]))))
 
-(deftest repeated-registration-yields-distinct-instances
-  (testing "a cached iface can back multiple independent callbacks"
-    (let [iface (cb/define-callback-interface :void [:pointer :int32 :pointer])
-          a (cb/register-callback! iface (fn [_ _ _] nil))
-          b (cb/register-callback! iface (fn [_ _ _] nil))]
-      (is (not (identical? (:inst a) (:inst b))))
-      (is (not= (m/ptr-addr (:ptr a)) (m/ptr-addr (:ptr b)))))))
+(deftest each-registered-callback-runs-its-own-fn
+  ;; One cached iface backs both callbacks.
+  (let [iface (cb/define-callback-interface :int64 [:int64])
+        a     (cb/register-callback! iface (fn [x] (* 2 (long x))))
+        b     (cb/register-callback! iface (fn [x] (* 3 (long x))))]
+    (is (= [42 63] [(call-long->long (:ptr a) 21) (call-long->long (:ptr b) 21)]))
+    ;; A collected :inst frees its stub, so hold both until the calls return.
+    (Reference/reachabilityFence [a b])))

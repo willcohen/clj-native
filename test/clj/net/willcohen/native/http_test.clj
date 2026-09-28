@@ -11,7 +11,7 @@
             [clojure.tools.logging.test :as lt]
             [net.willcohen.native.http :as http])
   (:import [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]
-           [java.net InetSocketAddress]
+           [java.net ConnectException InetSocketAddress]
            [java.util Arrays]))
 
 (def ^:private payload (.getBytes "ABCDEFGHIJ"))
@@ -57,7 +57,7 @@
 (deftest fetch-returns-status-headers-body
   (let [res (http/fetch {:url (str *base* "/plain")})]
     (is (= 200 (:status res)))
-    (is (map? (:headers res)))
+    (is (= "10" (get (:headers res) "content-length")))
     (is (= "ABCDEFGHIJ" (String. ^bytes (:body-bytes res))))))
 
 (deftest repeated-header-lines-combine-except-set-cookie
@@ -67,7 +67,7 @@
     (testing "a repeated Link keeps both entries, in order"
       (is (= "<https://a.example>; rel=next, <https://b.example>; rel=prev"
              (get h "link"))))
-    (testing "Set-Cookie keeps the first value rather than a corrupt comma join"
+    (testing "Set-Cookie keeps its first value"
       (is (= "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT" (get h "set-cookie"))))))
 
 (deftest range-request-returns-the-slice
@@ -99,7 +99,10 @@
 (deftest fetch-reports-a-transport-failure-as-status-0
   (testing "an unreachable host is status 0 with an empty header map"
     ;; Port 1 on loopback refuses at once, with no wait for the connect timeout.
-    (let [res (http/fetch {:url "http://127.0.0.1:1/nope"})]
-      (is (= 0 (:status res)))
-      (is (= {} (:headers res)))
-      (is (nil? (:body-bytes res))))))
+    (lt/with-log
+      (let [res (http/fetch {:url "http://127.0.0.1:1/nope"})]
+        (is (= 0 (:status res)))
+        (is (= {} (:headers res)))
+        (is (nil? (:body-bytes res)))
+        (is (lt/logged? 'net.willcohen.native.http :warn ConnectException
+                        #"HTTP request failed"))))))

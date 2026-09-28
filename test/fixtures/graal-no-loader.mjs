@@ -7,5 +7,4 @@
 // Test fixture: not a loader. `initialize` exists but is not a function, so
 // bootstrap-graal-module! must check for an executable member.
 
-export const setup = () => ({ ok: true });
 export const initialize = 'not a function';

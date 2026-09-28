@@ -54,66 +54,21 @@ const MODULE_BYTES = new Uint8Array([
   0x02, 0x00, 0x0b, //        $free, empty body
 ]);
 
-// GraalJS has no TextEncoder/TextDecoder, so the UTF-8 pair is written out.
+// GraalJS has no TextEncoder/TextDecoder. escape and unescape map a string
+// to and from a binary string of its UTF-8 bytes.
 function utf8Decode(heap, ptr) {
-  let str = '';
-  let i = ptr;
-  while (heap[i]) {
-    const u0 = heap[i++];
-    if (!(u0 & 0x80)) {
-      str += String.fromCharCode(u0);
-      continue;
-    }
-    const u1 = heap[i++] & 63;
-    if ((u0 & 0xe0) === 0xc0) {
-      str += String.fromCharCode(((u0 & 31) << 6) | u1);
-      continue;
-    }
-    const u2 = heap[i++] & 63;
-    const u = (u0 & 0xf0) === 0xe0
-      ? ((u0 & 15) << 12) | (u1 << 6) | u2
-      : ((u0 & 7) << 18) | (u1 << 12) | (u2 << 6) | (heap[i++] & 63);
-    if (u <= 0xffff) {
-      str += String.fromCharCode(u);
-    } else {
-      const ch = u - 0x10000;
-      str += String.fromCharCode(0xd800 | (ch >> 10), 0xdc00 | (ch & 0x3ff));
-    }
-  }
-  return str;
+  let bin = '';
+  for (let i = ptr; heap[i]; i++) bin += String.fromCharCode(heap[i]);
+  return decodeURIComponent(escape(bin));
 }
 
-function utf8Encode(str, heap, outIdx, maxBytesToWrite) {
-  if (maxBytesToWrite <= 0) return 0;
-  const startIdx = outIdx;
-  const endIdx = outIdx + maxBytesToWrite - 1; // the NUL slot
-  for (let i = 0; i < str.length; ++i) {
-    let u = str.charCodeAt(i);
-    if (u >= 0xd800 && u <= 0xdfff) {
-      u = (0x10000 + ((u & 0x3ff) << 10)) | (str.charCodeAt(++i) & 0x3ff);
-    }
-    if (u <= 0x7f) {
-      if (outIdx >= endIdx) break;
-      heap[outIdx++] = u;
-    } else if (u <= 0x7ff) {
-      if (outIdx + 1 >= endIdx) break;
-      heap[outIdx++] = 0xc0 | (u >> 6);
-      heap[outIdx++] = 0x80 | (u & 63);
-    } else if (u <= 0xffff) {
-      if (outIdx + 2 >= endIdx) break;
-      heap[outIdx++] = 0xe0 | (u >> 12);
-      heap[outIdx++] = 0x80 | ((u >> 6) & 63);
-      heap[outIdx++] = 0x80 | (u & 63);
-    } else {
-      if (outIdx + 3 >= endIdx) break;
-      heap[outIdx++] = 0xf0 | (u >> 18);
-      heap[outIdx++] = 0x80 | ((u >> 12) & 63);
-      heap[outIdx++] = 0x80 | ((u >> 6) & 63);
-      heap[outIdx++] = 0x80 | (u & 63);
-    }
-  }
-  heap[outIdx] = 0;
-  return outIdx - startIdx;
+function utf8Encode(str, heap, ptr, maxBytes) {
+  if (maxBytes <= 0) return 0;
+  const bin = unescape(encodeURIComponent(str));
+  const n = Math.min(bin.length, maxBytes - 1);
+  for (let i = 0; i < n; i++) heap[ptr + i] = bin.charCodeAt(i);
+  heap[ptr + n] = 0;
+  return n;
 }
 
 function makeModule() {
@@ -136,29 +91,27 @@ function makeModule() {
   M._malloc = (size) => malloc(size);
   M._free = (ptr) => free(ptr);
 
-  // "*" is "i32" on wasm32, a 4-byte pointer slot.
-  M.getValue = (ptr, type) => {
-    switch (type) {
-      case '*':
-      case 'i32': return M.HEAP32[ptr >> 2];
-      case 'i8': return M.HEAP8[ptr];
-      case 'i16': return M.HEAP16[ptr >> 1];
-      case 'float': return M.HEAPF32[ptr >> 2];
-      case 'double': return M.HEAPF64[ptr >> 3];
-      default: throw new Error(`wasm-heap-loader getValue: unsupported type ${type}`);
-    }
+  // type -> [view, shift]. "*" is "i32" on wasm32, a 4-byte pointer slot.
+  const views = {
+    '*': [M.HEAP32, 2],
+    i32: [M.HEAP32, 2],
+    i8: [M.HEAP8, 0],
+    i16: [M.HEAP16, 1],
+    float: [M.HEAPF32, 2],
+    double: [M.HEAPF64, 3],
   };
-
+  const viewOf = (type) => {
+    const v = views[type];
+    if (!v) throw new Error(`wasm-heap-loader: unsupported type ${type}`);
+    return v;
+  };
+  M.getValue = (ptr, type) => {
+    const [heap, shift] = viewOf(type);
+    return heap[ptr >> shift];
+  };
   M.setValue = (ptr, value, type) => {
-    switch (type) {
-      case '*':
-      case 'i32': M.HEAP32[ptr >> 2] = value; break;
-      case 'i8': M.HEAP8[ptr] = value; break;
-      case 'i16': M.HEAP16[ptr >> 1] = value; break;
-      case 'float': M.HEAPF32[ptr >> 2] = value; break;
-      case 'double': M.HEAPF64[ptr >> 3] = value; break;
-      default: throw new Error(`wasm-heap-loader setValue: unsupported type ${type}`);
-    }
+    const [heap, shift] = viewOf(type);
+    heap[ptr >> shift] = value;
   };
 
   M.UTF8ToString = (ptr) => (ptr ? utf8Decode(M.HEAPU8, ptr) : '');

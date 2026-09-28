@@ -18,12 +18,6 @@ import * as tr from 'ffi-wasm/test-runner';
 const NS = 'net.willcohen.native.exit-code-probe';
 const mode = process.argv[2];
 
-const MODES = ['pass', 'fail', 'error', 'hang', 'teardown', 'teardown-fail', 'teardown-ns'];
-if (!MODES.includes(mode)) {
-  console.error(`exit-code-probe: expected one of ${MODES.join('|')}, got ${mode}`);
-  process.exit(2);
-}
-
 const shouldPass = mode !== 'fail' && mode !== 'teardown-fail';
 
 // Prints on a later tick, so a runner that does not await it prints nothing.

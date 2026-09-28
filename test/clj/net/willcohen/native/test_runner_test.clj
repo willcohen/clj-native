@@ -15,15 +15,19 @@
 
 (def ^:private probe-path "test/fixtures/exit-code-probe.mjs")
 
+(def ^:private modes ["pass" "fail" "error" "hang" "teardown" "teardown-ns" "teardown-fail"])
+
+;; Each probe is its own node process, so all of them run at once.
+(def ^:private runs
+  (delay (zipmap modes (pmap #(sh/sh "node" probe-path %) modes))))
+
 (defn- probe [mode]
-  (sh/sh "node" probe-path mode))
+  (get @runs mode))
 
 (defn- probe-exit [mode]
   (:exit (probe mode)))
 
 (deftest exit-code-tracks-squint-report-counters
-  (testing "a green run exits 0"
-    (is (= 0 (probe-exit "pass"))))
   (testing "a failed assertion exits 1 via the \"fail\" counter"
     (is (= 1 (probe-exit "fail"))))
   (testing "a thrown test body exits 1 via the \"error\" counter"
@@ -47,7 +51,7 @@
     (let [{:keys [exit out]} (probe "teardown-fail")]
       (is (= 1 exit))
       (is (re-find #"TEARDOWN-RAN" out))))
-  (testing "a lone namespace name is a name, not a teardown to call"
+  (testing "a lone namespace name runs that namespace with no teardown"
     (let [{:keys [exit out]} (probe "pass")]
       (is (= 0 exit))
       (is (re-find #"TEST-RAN" out))

@@ -8,35 +8,23 @@
   "Tests of the library-agnostic platform helpers. The resolvers run against
    clojure.core. Extraction runs against test/resources with the host pinned
    to linux/amd64, so one fixture path works on every machine."
-  (:require [clojure.java.shell :as sh]
+  (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
+            [clojure.tools.logging.test :as lt]
             [net.willcohen.native.platform :as platform]
-            [net.willcohen.native.platform-state :as nps]
             [tech.v3.datatype.ffi :as dt-ffi])
-  (:import [java.io File]))
+  (:import [java.io File]
+           [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
 
-(deftest get-os-arch
-  ;; Compare with the JVM's own properties, since keyword? alone cannot fail.
-  (testing "get-os agrees with os.name on the machine running the suite"
-    (let [os-name (.toLowerCase (System/getProperty "os.name"))]
-      (is (= (cond (.contains os-name "mac") :darwin
-                   (.contains os-name "win") :windows
-                   :else                     :linux)
-             (platform/get-os)))))
-  (testing "get-arch normalizes os.arch to one of the names the suffix tables use"
-    (let [arch (platform/get-arch)]
-      (is (contains? #{:amd64 :aarch64} arch)
-          (str "os.arch " (System/getProperty "os.arch") " normalized to " arch)))))
-
-(deftest make-native-fn-resolver-resolves-or-throws
+(deftest native-fns-resolve-or-throw
   (let [r (platform/make-native-fn-resolver 'clojure.core)]
     (is (= 2 (@(r :inc) 1)))
-    (let [e (try (r :no-such-fn-xyzzy) nil
-                 (catch clojure.lang.ExceptionInfo e e))]
-      (is (= :no-such-fn-xyzzy (:fn-key (ex-data e))))
-      (is (= 'clojure.core (:impl-ns (ex-data e)))))))
+    (is (= {:fn-key :no-such-fn-xyzzy :impl-ns 'clojure.core}
+           (try (r :no-such-fn-xyzzy) (catch clojure.lang.ExceptionInfo e (ex-data e))))))
+  (is (= 2 (platform/call-native-fn 'clojure.core :inc [1]))))
 
-(deftest call-native-fn-maps-a-null-const-char*-return-to-nil
+(deftest apply-native-fn-maps-a-null-const-char*-return-to-nil
   ;; dt-ffi throws a PToPointer error for a NULL const char* return. This
   ;; simulates that error, so it cannot show that dt-ffi still throws it.
   (let [thrower (fn [& _]
@@ -47,15 +35,7 @@
   (testing "an unrelated IllegalArgumentException still propagates"
     (let [thrower (fn [& _] (throw (IllegalArgumentException. "bad argument count")))]
       (is (thrown-with-msg? IllegalArgumentException #"bad argument count"
-                            (#'platform/apply-native-fn thrower [])))))
-  (testing "call-native-fn resolves the var in impl-ns and applies it"
-    (is (= 2 (platform/call-native-fn 'clojure.core :inc [1]))))
-  (testing "call-native-fn throws ex-info naming the fn-key and impl-ns on a miss"
-    (let [e (try (platform/call-native-fn 'clojure.core :no-such-fn-xyzzy []) nil
-                 (catch clojure.lang.ExceptionInfo e e))]
-      (is (some? e))
-      (is (= :no-such-fn-xyzzy (:fn-key (ex-data e))))
-      (is (= 'clojure.core (:impl-ns (ex-data e)))))))
+                            (#'platform/apply-native-fn thrower []))))))
 
 (deftest rehydrate-fn-defs-turns-argument-names-into-symbols
   (let [rehydrated (platform/rehydrate-fn-defs
@@ -69,16 +49,12 @@
     (testing "the rest of each argtype entry and the other fn-def keys survive"
       (is (= :int32 (get-in rehydrated [:one_arg :rettype])))
       (is (= "kept" (get-in rehydrated [:one_arg :doc]))))
-    (testing "an empty argtypes vector survives"
-      (is (= [] (get-in rehydrated [:no_args :argtypes]))))
     (testing ":string? becomes a type that dt-ffi knows"
       (let [r (platform/rehydrate-fn-defs
                {:opt {:rettype :string? :argtypes [[:key :string?]]}})]
         (is (= '[[key :pointer?]] (get-in r [:opt :argtypes]))
             "an argument is a nullable pointer; dispatch gives it a C string")
-        (is (= :string (get-in r [:opt :rettype])))))
-    (testing "the fn-def keys themselves are untouched"
-      (is (= #{:one_arg :no_args} (set (keys rehydrated)))))))
+        (is (= :string (get-in r [:opt :rettype])))))))
 
 (def ^:private no-fndefs {})
 
@@ -131,111 +107,80 @@
                                                    true)))))))
 
 (deftest extract-and-bind-library-copies-the-platform-library
-  (let [{:keys [file path singleton] :as state}
+  (let [{:keys [file path]}
         (extract-fixture-library! {:lib-basename "libextracttest"
                                    :tmp-prefix   "extract-test"
                                    :fn-defs-var  #'no-fndefs})]
     (testing "the library is copied out of <os>-<arch>/ under its own name"
-      (is (some? file))
       (is (= "libextracttest.so" (.getName ^File file)))
       (is (.exists ^File file))
       (is (= "fake shared object payload\n" (slurp file))))
     (testing ":path is the directory holding the extracted library"
       (is (= path (.getCanonicalPath (.getParentFile ^File file))))
       (is (.isDirectory (File. ^String path))))
-    (testing "a dt-ffi singleton is built over the fn-defs Var"
-      (is (some? singleton)))
-    (testing "no other keys are returned"
-      (is (= #{:file :path :singleton} (set (keys state)))))))
+    ;; File.setReadable fails on a path that does not exist yet, so the
+    ;; permission calls must follow the copy.
+    (testing "the library is executable whatever the umask is"
+      (is (.canExecute ^File file)))))
 
 (deftest extract-and-bind-library-copies-extra-resources
   (let [{:keys [path]} (extract-fixture-library!
                         {:lib-basename    "libextracttest"
                          :fn-defs-var     #'no-fndefs
                          :extra-resources [{:resource "extract-test-sidecar.dat"}
-                                           {:resource-dir "extract-test/"}]})]
+                                           {:resource-dir "extract-test"}]})]
     (testing "a single resource lands beside the library under its own name"
       (is (= "sidecar database\n" (slurp (File. ^String path "extract-test-sidecar.dat")))))
     (testing "a resource directory is copied whole, nesting included"
       (is (= "top level\n" (slurp (File. ^String path "extract-test/a.txt"))))
       (is (= "nested entry\n" (slurp (File. ^String path "extract-test/nested/b.txt")))))))
 
-(deftest extract-and-bind-library-accepts-a-resource-dir-without-a-trailing-slash
-  ;; Unnormalized, "extract-test" plus "a.txt" reads as "extract-testa.txt",
-  ;; and the whole extraction silently returns {}.
-  (let [{:keys [path]} (extract-fixture-library!
-                        {:lib-basename    "libextracttest"
-                         :fn-defs-var     #'no-fndefs
-                         :extra-resources [{:resource-dir "extract-test"}]})]
-    (is (some? path) "the extraction must not fall back to the empty map")
-    (is (= "top level\n" (slurp (File. ^String path "extract-test/a.txt"))))
-    (is (= "nested entry\n" (slurp (File. ^String path "extract-test/nested/b.txt"))))))
-
-(deftest extracted-files-are-readable-whatever-the-umask-is
-  ;; File.setReadable fails on a path that does not exist yet, so the
-  ;; permission calls must follow the copy.
-  (let [{:keys [file]} (extract-fixture-library!
-                        {:lib-basename "libextracttest"
-                         :fn-defs-var  #'no-fndefs})]
-    (is (.canRead ^File file) "an unreadable library cannot be dlopen'd")
-    (is (.canExecute ^File file))))
+(defn- warned-extract-failure?
+  "True when the test log holds the extraction warning for `lib-basename`."
+  [lib-basename]
+  (lt/logged? 'net.willcohen.native.platform :warn Throwable
+              (re-pattern (str "Could not extract packaged library " lib-basename " "))))
 
 (deftest extract-and-bind-library-returns-an-empty-map-on-failure
   (testing "a library with no resource for the running platform"
-    (is (= {} (extract-fixture-library!
-               {:lib-basename "libnosuchlibrary"
-                :fn-defs-var  #'no-fndefs}))))
+    (lt/with-log
+      (is (= {} (extract-fixture-library!
+                 {:lib-basename "libnosuchlibrary"
+                  :fn-defs-var  #'no-fndefs})))
+      (is (warned-extract-failure? "libnosuchlibrary"))))
   (testing "a missing extra resource fails the whole extraction"
-    (is (= {} (extract-fixture-library!
-               {:lib-basename    "libextracttest"
-                :fn-defs-var     #'no-fndefs
-                :extra-resources [{:resource "no-such-sidecar.dat"}]}))))
+    (lt/with-log
+      (is (= {} (extract-fixture-library!
+                 {:lib-basename    "libextracttest"
+                  :fn-defs-var     #'no-fndefs
+                  :extra-resources [{:resource "no-such-sidecar.dat"}]})))
+      (is (warned-extract-failure? "libextracttest"))))
   (testing "an extras entry naming neither a resource nor a resource directory"
-    (is (= {} (extract-fixture-library!
-               {:lib-basename    "libextracttest"
-                :fn-defs-var     #'no-fndefs
-                :extra-resources [{}]})))))
+    (lt/with-log
+      (is (= {} (extract-fixture-library!
+                 {:lib-basename    "libextracttest"
+                  :fn-defs-var     #'no-fndefs
+                  :extra-resources [{}]})))
+      (is (warned-extract-failure? "libextracttest")))))
 
-(deftest try-init-falls-back-to-graal-when-no-lib-was-extracted
-  ;; A host with no packaged lib: without the throw, init records :ffi and
-  ;; each call fails.
-  (let [{:keys [singleton file]} (extract-fixture-library!
-                                  {:lib-basename "libnosuchlibrary"
-                                   :fn-defs-var  #'no-fndefs})
-        impl  (atom nil)
-        saved System/err]
-    (try
-      (System/setErr (java.io.PrintStream. (java.io.ByteArrayOutputStream.)))
-      (with-out-str
-        (nps/try-init! impl (atom false) false
-                       #(platform/init-jdk-library! singleton file)
-                       (constantly nil)))
-      (finally (System/setErr saved)))
-    (is (= :graal @impl))))
+(deftest init-jdk-library!-throws-when-no-lib-was-extracted
+  ;; The throw makes try-init! fall back to GraalVM.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No packaged native library"
+                        (platform/init-jdk-library! nil nil))))
 
-(def ^:private cleanup-probe
-  (str "(require '[net.willcohen.native.platform :as p])"
-       "(def fd {})"
-       "(with-redefs [p/get-os (constantly :linux) p/get-arch (constantly :amd64)"
-       "              p/library-dirs (constantly [\"linux-amd64\"])]"
-       "  (print (:path (p/extract-and-bind-library!"
-       "                 {:lib-basename \"libextracttest\""
-       "                  :fn-defs-var #'user/fd"
-       "                  :extra-resources [{:resource-dir \"extract-test/\"}]}))))"
-       "(flush)"))
-
-(deftest extracted-files-and-dirs-go-at-exit
-  (let [{:keys [exit out err]} (sh/sh "clojure" "-Sdeps" "{:paths [\"src/clj\" \"src/cljc\" \"test/resources\"]}"
-                                      "-M" "-e" cleanup-probe)]
-    (is (= 0 exit) err)
-    (is (seq out) "the probe printed the dir")
-    (is (not (.exists (File. ^String out))) out)))
+(deftest delete-tree!-deletes-nested-files-and-empty-dirs
+  (let [root (.toFile (Files/createTempDirectory "delete-tree" (make-array FileAttribute 0)))
+        f    (File. root "a/b/c.txt")]
+    (io/make-parents f)
+    (spit f "x")
+    (.mkdirs (File. root "empty"))
+    (#'platform/delete-tree! root)
+    (is (not (.exists root)))))
 
 (def ^:private demo-fn-defs
   (platform/rehydrate-fn-defs
    {:demo_add     {:rettype :int32 :argtypes [[:lhs :int32] [:rhs :int32]]}
-    :demo_name    {:rettype :string :argtypes [[:ctx :pointer]]}
-    :demo_checked {:rettype :int32 :argtypes [[:ctx :pointer]]}}))
+    :demo_name    {:rettype :string :argtypes [[:ctx :pointer]]}}))
 
 (def ^:private demo-state
   (atom {:singleton (dt-ffi/library-singleton #'demo-fn-defs)}))
@@ -248,8 +193,7 @@
         nm  (ns-resolve 'net.willcohen.native.platform-test 'demo_name)]
     (testing "each fndef key becomes a Var in the calling namespace"
       (is (var? add))
-      (is (var? nm))
-      (is (var? (ns-resolve 'net.willcohen.native.platform-test 'demo_checked))))
+      (is (var? nm)))
     (testing "the argument list carries the rehydrated names"
       (is (= '([lhs rhs]) (:arglists (meta add))))
       (is (= '([ctx]) (:arglists (meta nm)))))

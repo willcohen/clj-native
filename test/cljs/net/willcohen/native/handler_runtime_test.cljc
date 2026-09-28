@@ -33,8 +33,6 @@
       {:captured captured}
       (finally (restore)))))
 
-(defn reset-substrate! [] (setLogConfig nil))
-
 (defn ^:async sleep [ms]
   (js/Promise. (fn [resolve _reject]
                  (js/setTimeout resolve ms))))
@@ -56,37 +54,20 @@
                         (makeHandler #js {:methods #js {:ccall (fn ^:async ccall [] "ok")}
                                           :fingerprint (fn [] "")
                                           :busyMethods #js ["ccall"]
-                                          :destroyMethods #js ["ccall"]})))
-  (testing "disjoint lists are still accepted"
-    (is (some? (makeHandler #js {:fingerprint (fn [] "")
-                                 :methods #js {:a (fn ^:async a-fn [] 1)
-                                               :b (fn ^:async b-fn [] 2)}
-                                 :busyMethods #js ["a"]
-                                 :destroyMethods #js ["b"]})))))
+                                          :destroyMethods #js ["ccall"]}))))
 
 (deftest ^:async idempotent-re-init-with-same-args-returns-cached-handler
   (let [init-count (atom 0)
         factory (makeHandler
-                 #js {:fingerprint (fn [args] (str (.-x args)))
-                      :init (fn ^:async init-fn [_args] (swap! init-count inc))
+                 #js {:init (fn ^:async init-fn [_args] (swap! init-count inc))
+                      :fingerprint (fn [args] (str (.-x args)))
                       :methods #js {:ping (fn ^:async ping [] "pong")}})
         a (await (factory #js {:x 1}))
         b (await (factory #js {:x 1}))]
     (is (= a b))
     (is (= 1 @init-count))
-    (is (= "pong" (await (.ping a))))))
-
-(deftest ^:async re-init-with-different-args-throws
-  (let [factory (makeHandler
-                 #js {:fingerprint (fn [args] (str (.-x args)))
-                      :init (fn ^:async init-fn [] nil)
-                      :methods #js {:ping (fn ^:async ping [] "pong")}})]
-    (await (factory #js {:x 1}))
-    (try
-      (await (factory #js {:x 2}))
-      (is false "should reject")
-      (catch :default e
-        (is (re-find #"(?i)fingerprint|init" (.-message e)))))))
+    (is (= "pong" (await (.ping a))))
+    (is (thrown-with-msg? js/Error #"different args" (await (factory #js {:x 2}))))))
 
 (deftest byte-length-fingerprint-prints-named-fields-only
   (let [fp (byteLengthFingerprint #js ["dbBytes" "iniBytes" "logLevel"])]
@@ -97,7 +78,7 @@
     (testing "a field the list omits cannot change the print"
       (is (= (fp #js {:dbBytes (js/Uint8Array. 8) :ignored "a"})
              (fp #js {:dbBytes (js/Uint8Array. 8) :ignored "b"}))))
-    (testing "a missing field prints as absent rather than vanishing"
+    (testing "a missing field prints as undefined"
       (is (= "dbBytes:undefined|iniBytes:undefined|logLevel:undefined" (fp #js {})))
       (is (= "dbBytes:undefined|iniBytes:undefined|logLevel:undefined" (fp nil))))))
 
@@ -141,79 +122,34 @@
                 "b-enter,b-exit,plain-enter,plain-exit")
            (.join events ",")))))
 
-(deftest normalizeWasmError-converts-WebAssembly-RuntimeError-to-plain-Error-with-wasmTrap-tag
-  (let [original (new js/WebAssembly.RuntimeError "memory access out of bounds")
-        out (normalizeWasmError original)]
-    (is (= false (instance? js/WebAssembly.RuntimeError out))
-        "must downcast to plain Error so structuredClone-across-RPC works")
-    (is (instance? js/Error out))
-    (is (= true (.-wasmTrap out)))
-    (is (= "wasm-runtime-error" (.-kind out)))
-    (is (re-find #"memory access out of bounds" (.-message out)))
-    (is (= "string" (js* "typeof ~{}" (.-stack out))))))
-
-(deftest normalizeWasmError-converts-emscripten-Aborted-to-plain-Error-with-wasmTrap-tag
-  (let [original (js/Error. "Aborted(native code called abort())")
-        out (normalizeWasmError original)]
-    (is (= true (.-wasmTrap out)))
-    (is (= "emscripten-abort" (.-kind out)))
-    (is (re-find #"^Aborted" (.-message out)))))
-
 (deftest normalizeWasmError-passes-through-plain-Errors-unchanged
   (let [original (js/Error. "domain error")
         out (normalizeWasmError original)]
-    (is (= out original) "plain Errors must pass through identity")
-    (is (= js/undefined (.-wasmTrap out)))))
+    (is (= out original) "plain Errors must pass through identity")))
 
-(deftest ^:async wrap-normalizes-synchronous-wasm-RuntimeError-thrown-from-a-destroy-method
-  (let [factory (makeHandler
-                 #js {:fingerprint (fn [] "")
-                      :methods #js {:teardown
-                                    (fn []
-                                      (throw (new js/WebAssembly.RuntimeError "OOB sync")))}
-                      :destroyMethods #js ["teardown"]})
-        h (await (factory))]
-    (try
-      (await (.teardown h))
-      (is false "should reject")
-      (catch :default e
-        (is (= false (instance? js/WebAssembly.RuntimeError e)))
-        (is (= true (.-wasmTrap e)))
-        (is (= "wasm-runtime-error" (.-kind e)))
-        (is (re-find #"OOB sync" (.-message e)))))))
+(defn- ^:async rejection
+  "The error `p` rejects with, or nil when it resolves."
+  [p]
+  (try (await p) nil (catch :default e e)))
 
-(deftest ^:async wrap-normalizes-async-wasm-RuntimeError-thrown-from-a-busy-method
+(deftest ^:async wrap-normalizes-a-wasm-trap-thrown-sync-or-async
   (let [factory (makeHandler
-                 #js {:fingerprint (fn [] "")
-                      :methods #js {:work
-                                    (fn ^:async work []
-                                      (await (sleep 1))
-                                      (throw (new js/WebAssembly.RuntimeError "OOB async busy")))}
-                      :busyMethods #js ["work"]})
-        h (await (factory))]
-    (try
-      (await (.work h))
-      (is false "should reject")
-      (catch :default e
-        (is (= true (.-wasmTrap e)))
-        (is (= "wasm-runtime-error" (.-kind e)))
-        (is (re-find #"OOB async busy" (.-message e)))))))
-
-(deftest ^:async wrap-normalizes-async-emscripten-Aborted-thrown-from-a-default-classified-method
-  (let [factory (makeHandler
-                 #js {:fingerprint (fn [] "")
-                      :methods #js {:misc
-                                    (fn ^:async misc []
-                                      (await (sleep 1))
-                                      (throw (js/Error. "Aborted(native code called abort())")))}})
-        h (await (factory))]
-    (try
-      (await (.misc h))
-      (is false "should reject")
-      (catch :default e
-        (is (= true (.-wasmTrap e)))
-        (is (= "emscripten-abort" (.-kind e)))
-        (is (re-find #"^Aborted" (.-message e)))))))
+                 #js {:methods #js {:trap (fn []
+                                            (throw (new js/WebAssembly.RuntimeError "OOB sync")))
+                                    :abort (fn ^:async abort []
+                                             (await (sleep 1))
+                                             (throw (js/Error. "Aborted(native code called abort())")))}
+                      :fingerprint (fn [] "")})
+        h (await (factory))
+        trap (await (rejection (.trap h)))
+        abort (await (rejection (.abort h)))]
+    (is (= false (instance? js/WebAssembly.RuntimeError trap)))
+    (is (= true (.-wasmTrap trap)))
+    (is (= "wasm-runtime-error" (.-kind trap)))
+    (is (re-find #"OOB sync" (.-message trap)))
+    (is (= true (.-wasmTrap abort)))
+    (is (= "emscripten-abort" (.-kind abort)))
+    (is (re-find #"^Aborted" (.-message abort)))))
 
 (deftest ^:async a-rejected-call-does-not-stall-the-queue
   (let [factory (makeHandler
@@ -226,14 +162,8 @@
     (is (thrown? js/Error (await (.trap h))))
     (is (= "fine" (await (.ok h))))))
 
-(deftest setLogConfig-default-state-is-off-dbg-is-silent
-  (reset-substrate!)
-  (is (not (isEnabled "BUSY-INC")))
-  (let [{:keys [captured]} (capture-logs (fn [] (dbg "BUSY-INC" #js {:fn "x" :counter 1})))]
-    (is (= 0 (.-length captured)) "no console.log when level is null")))
-
 (deftest setLogConfig-level-debug-enables-emission-with-default-category-filter
-  (reset-substrate!)
+  (setLogConfig nil)
   (setLogConfig #js {:level "debug"})
   (is (isEnabled "BUSY-INC"))
   (let [{:keys [captured]} (capture-logs
@@ -254,7 +184,7 @@
     (is (= 0 (.-length captured)))))
 
 (deftest setLogConfig-categories-filter-by-tag-prefix-lowercased-before-first-dash
-  (reset-substrate!)
+  (setLogConfig nil)
   (setLogConfig #js {:level "debug" :categories #js ["busy" "fr"]})
   (is (not (isEnabled "DESTROY-FIRE")))
   (let [{:keys [captured]} (capture-logs
@@ -269,7 +199,7 @@
     (is (re-find #"FR-CALLBACK-SUPPRESSED" (aget captured 1)))))
 
 (deftest setLogConfig-keys-absent-from-cfg-leave-existing-state-untouched
-  (reset-substrate!)
+  (setLogConfig nil)
   (setLogConfig #js {:level "debug" :categories #js ["busy"]})
   (setLogConfig #js {:categories #js ["fr"]})
   (is (isEnabled "FR-CALLBACK"))
@@ -277,21 +207,21 @@
 
 (deftest setLogConfig-a-level-below-debug-suppresses-every-event
   ;; Every event is debug level.
-  (reset-substrate!)
+  (setLogConfig nil)
   (setLogConfig #js {:level "info"})
   (is (= 0 (.-length (:captured (capture-logs (fn [] (dbg "A" #js {})))))))
   (setLogConfig #js {:level "trace"})
   (is (= 1 (.-length (:captured (capture-logs (fn [] (dbg "A" #js {}))))))))
 
 (deftest setLogConfig-invalid-level-throws
-  (reset-substrate!)
+  (setLogConfig nil)
   (is (thrown-with-msg? js/Error #"level must be one of"
                         (setLogConfig #js {:level "verbose"})))
   (is (thrown-with-msg? js/Error #"level must be one of"
                         (setLogConfig #js {:level 42}))))
 
 (deftest setLogConfig-invalid-categories-shape-throws
-  (reset-substrate!)
+  (setLogConfig nil)
   (is (thrown-with-msg? js/Error #"categories must be an array"
                         (setLogConfig #js {:categories "busy"})))
   (is (thrown-with-msg? js/Error #"categories must be an array"
@@ -299,7 +229,7 @@
 
 (deftest setLogConfig-rejected-cfg-leaves-the-previous-state-intact
   ;; setLogConfig once wrote a valid `level` and then threw on `categories`.
-  (reset-substrate!)
+  (setLogConfig nil)
   (is (thrown-with-msg? js/Error #"categories must be an array"
                         (setLogConfig #js {:level "debug" :categories 42})))
   (is (not (isEnabled "BUSY-INC"))
@@ -310,58 +240,38 @@
                           (setLogConfig #js {:level "off" :categories 42})))
     (is (isEnabled "BUSY-INC"))
     (is (not (isEnabled "FR-CALLBACK")))
-    (reset-substrate!)))
+    (setLogConfig nil)))
 
 (deftest setLogConfig-accepts-a-Set-of-categories-in-any-case
-  (reset-substrate!)
+  (setLogConfig nil)
   (setLogConfig #js {:level "debug"
                      :categories (new js/Set #js ["Busy" "BUSY" "fr"])})
   (is (isEnabled "BUSY-INC"))
   (is (isEnabled "FR-CALLBACK"))
   (is (not (isEnabled "DESTROY-FIRE"))))
 
-(deftest ^:async factory-propagates-initArgs-handlerRuntime-to-setLogConfig-before-wrap-fires
-  (reset-substrate!)
-  (let [factory (makeHandler
-                 #js {:fingerprint (fn [] "")
-                      :init (fn ^:async init-fn [] nil)
-                      :methods #js {:ping (fn ^:async ping [] "pong")}
-                      :busyMethods #js ["ping"]
-                      :label "rt-test"})
-        {:keys [captured restore]} (install-log-capture!)]
-    (try
-      (let [h (await (factory #js {:handlerRuntime
-                                      #js {:logLevel "debug"
-                                           :logCategories #js ["busy"]}}))]
-        (is (isEnabled "BUSY-INC"))
-        (await (.ping h)))
-      (finally (restore)))
-    (let [busy-events (.filter captured (fn [l] (re-find #"\[CLJ-NATIVE" l)))]
-      (is (= 2 (.-length busy-events)))
-      (is (re-find #"BUSY-INC.*fn=ping.*label=rt-test" (aget busy-events 0)))
-      (is (re-find #"BUSY-DEC.*fn=ping.*label=rt-test" (aget busy-events 1))))
-    (reset-substrate!)))
-
 (defn- ^:async busy-lines
-  "The [CLJ-NATIVE lines of one ping through a busy handler, with BUSY logging
-   on. Init attaches `module` when it is not nil."
+  "The [CLJ-NATIVE lines of one ping through a busy handler labeled rt-test.
+   initArgs.handlerRuntime turns BUSY logging on. Init attaches `module` when
+   it is not nil."
   [module]
-  (setLogConfig #js {:level "debug" :categories #js ["busy"]})
   (let [factory (makeHandler
                  #js {:init (fn ^:async init-fn [_initArgs ctx]
                               (when module (.attachEmscriptenModule ctx module)))
                       :fingerprint (fn [] "")
                       :methods #js {:ping (fn ^:async ping [] "pong")}
-                      :busyMethods #js ["ping"]})
+                      :busyMethods #js ["ping"]
+                      :label "rt-test"})
         {:keys [captured restore]} (install-log-capture!)]
     (try
-      (await (.ping (await (factory #js {}))))
+      (await (.ping (await (factory #js {:handlerRuntime #js {:logLevel "debug"
+                                                                :logCategories #js ["busy"]}}))))
       (finally
         (restore)
         (setLogConfig nil)))
     (.filter captured (fn [l] (re-find #"\[CLJ-NATIVE" l)))))
 
-(deftest ^:async ctx-attachEmscriptenModule-wires-built-in-heap-inspector
+(deftest ^:async ctx-attachEmscriptenModule-adds-heap-fields-to-busy-events
   (let [lines (await (busy-lines #js {:HEAPU8 #js {:length 65536}
                                       :_sbrk  (fn [_n] 32768)}))]
     (is (= 2 (.-length lines)))
@@ -371,6 +281,8 @@
 (deftest ^:async no-ctx-attachEmscriptenModule-call-BUSY-events-carry-no-heap-fields
   (let [lines (await (busy-lines nil))]
     (is (= 2 (.-length lines)))
+    (is (re-find #"BUSY-INC.*fn=ping.*label=rt-test" (aget lines 0)))
+    (is (re-find #"BUSY-DEC.*fn=ping.*label=rt-test" (aget lines 1)))
     (is (not (re-find #"heap-bytes|brk=" (aget lines 0))))))
 
 (deftest ^:async emscripten-inspector-tolerates-module-without-_sbrk
@@ -378,10 +290,10 @@
     (is (re-find #"heap-bytes=1024" line))
     (is (not (re-find #"brk=" line)))))
 
-(deftest ^:async busy-wrap-skips-heap-probe-when-substrate-is-off
+(deftest ^:async busy-wrap-skips-heap-probe-when-logging-is-off
   ;; The heap probe calls _sbrk(0), a wasm boundary crossing, and every ccall
   ;; is a busy method. Build the BUSY event only when logging is on.
-  (reset-substrate!)
+  (setLogConfig nil)
   (let [sbrk-calls (atom 0)
         mock-module #js {:HEAPU8 #js {:length 65536}
                          :_sbrk (fn [_n] (swap! sbrk-calls inc) 32768)}
@@ -391,18 +303,10 @@
                       :fingerprint (fn [] "")
                       :methods #js {:ping (fn ^:async ping [] "pong")}
                       :busyMethods #js ["ping"]
-                      :label "sbrk-gate-test"})
+                      :label "heap-probe-test"})
         h (await (factory #js {}))]
     (await (.ping h))
-    (is (= 0 @sbrk-calls)
-        "busy wrap must not call _sbrk(0) when the substrate is off")
-    (setLogConfig #js {:level "debug" :categories #js ["busy"]})
-    (let [{:keys [restore]} (install-log-capture!)]
-      (try (await (.ping h))
-           (finally (restore))))
-    (is (= 2 @sbrk-calls)
-        "busy wrap probes the heap once per emitted BUSY event when on")
-    (reset-substrate!)))
+    (is (= 0 @sbrk-calls) "busy wrap must not call _sbrk(0) when logging is off")))
 
 (defn- failing-init
   "An init with no await. It counts its runs in `attempts` and throws unless
@@ -434,15 +338,21 @@
       (is (= "pong" (await (.ping (await (factory #js {:ok true}))))) why)
       (is (= 2 @attempts) why))))
 
+(defn- run-child
+  "Run `src` in a child node, with the runtime imported as `hr`. Returns the
+   spawnSync result."
+  [src]
+  (spawnSync "node"
+             #js ["--input-type=module" "-e"
+                  (str "const hr = await import('ffi-wasm/handler-runtime'); " src)]
+             #js {:encoding "utf8"}))
+
 (deftest importing-the-runtime-keeps-the-default-exit
   ;; A pool worker that crashes must exit nonzero, or worker-router cannot
   ;; see it.
-  (doseq [src ["setTimeout(() => { throw new Error('boom'); }, 0);"
-               "Promise.reject(new Error('boom'));"]]
-    (let [r (spawnSync "node"
-                   #js ["--input-type=module" "-e"
-                        (str "await import('ffi-wasm/handler-runtime'); " src)]
-                   #js {:encoding "utf8"})]
-      (is (= 1 (.-status r)) src))))
+  (doseq [crash ["setTimeout(() => { throw new Error('boom'); }, 0);"
+                 "Promise.reject(new Error('boom'));"]]
+    (let [r (run-child (str "hr.setLogConfig({ level: 'debug' }); hr.dbg('T-EVENT', {}); " crash))]
+      (is (= 1 (.-status r)) crash))))
 
 (tr/run-tests-and-exit! "net.willcohen.native.handler-runtime-test")

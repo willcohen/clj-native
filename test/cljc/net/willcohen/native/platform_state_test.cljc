@@ -59,7 +59,7 @@
        (is (= :ffi (silently #(ps/try-init! impl force false
                                             (fn [] (swap! ran conj :ffi))
                                             (fn [] (swap! ran conj :graal))))))
-       (is (= :ffi @impl) "the choice is recorded in impl-atom, not only returned")
+       (is (= :ffi @impl) "impl-atom holds the choice")
        (is (= [:ffi] @ran) "the graal bootstrap never ran"))))
 
 #?(:clj
@@ -82,6 +82,6 @@
                                               (fn [] (swap! ran conj :graal))))))
        (is (= :graal @impl))
        (is (= [:graal] @ran)
-           "the ffi path is skipped outright, not attempted and discarded"))))
+           "the ffi bootstrap never runs"))))
 
 #?(:cljs (tr/run-tests-and-exit! "net.willcohen.native.platform-state-test"))

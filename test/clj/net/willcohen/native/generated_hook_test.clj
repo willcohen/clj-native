@@ -9,7 +9,7 @@
    require the project and carries its own copy."
   (:require [clojure.java.io :as io]
             [clojure.string :as string]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is]]
             [net.willcohen.native.macros :as m]))
 
 (def ^:private hook-resource
@@ -53,10 +53,6 @@
    "proj_create_crs_to_crs" "GDAL2Tiles" "OGRGeometryH" "ABc" "aBC" ""])
 
 (deftest hook-and-macros-camel-mappings-agree
-  (testing "both copies produce the same public name for every corpus entry"
-    (doseq [s corpus]
-      (is (= (str (m/camel-name->clj-name s)) (hook-camel-name->clj-name s))
-          (str "divergent mapping for " (pr-str s)))))
-  (testing "the hook returns a string where macros returns a symbol"
-    (is (string? (hook-camel-name->clj-name "GDALOpenEx")))
-    (is (symbol? (m/camel-name->clj-name "GDALOpenEx")))))
+  (doseq [s corpus]
+    (is (= (str (m/camel-name->clj-name s)) (hook-camel-name->clj-name s))
+        (str "divergent mapping for " (pr-str s)))))

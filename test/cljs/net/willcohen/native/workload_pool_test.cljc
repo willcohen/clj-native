@@ -28,15 +28,13 @@
 
 (deftest init-workload-pool!-returns-a-single-pool-registry
   (let [reg (wp/init-workload-pool! {:size 2})]
-    (is (= :cljs (:runtime reg)))
     (is (= false @(:terminated? reg)))
     (is (= {:size 2} (:opts reg)) "opts passed through verbatim")
     (testing "single-pool state, empty until ensure-pool!/adopt-pool!"
       (is (= [] @(:handlers reg)))
       (is (nil? @(:pool reg)))
       (is (= false @(:owned? reg)))
-      (is (nil? @(:latch reg)))
-      (is (= 0 @(:generation reg))))))
+      (is (nil? @(:promise reg))))))
 
 (deftest register-handler!-ignores-workload-and-accumulates-in-order
   (let [reg (wp/init-workload-pool! {})
@@ -77,11 +75,6 @@
                                               {:pre-terminate (fn [] nil)}))
         "a :pre-terminate-only spec may still register after adoption")))
 
-(deftest current-context-throws-on-cljs-reserved-for-the-worker-side
-  ;; Per-worker state lives in Web Workers, out of synchronous reach.
-  (is (thrown-with-msg? js/Error #"not callable from the main thread"
-                        (wp/current-context :lib-a))))
-
 (deftest ^:async adopt-pool!-stores-an-external-pool-unowned
   (let [reg (wp/init-workload-pool! {})
         calls (atom [])
@@ -117,7 +110,8 @@
                          (.catch (fn [e] e))))]
       (is (some? err) "rejects: no registered spec carries a :module")
       (is (.includes (.-message err) "carries a :module"))
-      (is (nil? @(:latch reg)) "latch cleared so a later call can retry"))))
+      (is (identical? reg (wp/adopt-pool! reg (resolved-fake-pool (atom []))))
+          "the rejection left no pool, so adopt-pool! succeeds"))))
 
 (deftest ^:async ensure-pool!-folds-every-spec-into-one-real-pool-and-shutdown-recycles-it
   (let [reg (wp/init-workload-pool! {:size 1})
@@ -149,9 +143,8 @@
               "pre-terminate hooks ran in reverse registration order")
           (is (= true @(:terminated? reg)))
           (is (nil? @(:pool reg)))
-          (is (nil? @(:latch reg)))
-          (is (= false @(:owned? reg)))
-          (is (= 1 @(:generation reg)) "generation bumped"))
+          (is (nil? @(:promise reg)))
+          (is (= false @(:owned? reg))))
         (is (= :rejected (await (-> (pool/worker-call pl :lib-a "ping" #js [] 0)
                                     (.then (fn [_] :resolved))
                                     (.catch (fn [_] :rejected)))))
@@ -171,8 +164,7 @@
       (is (identical? reg ret))
       (is (= 0 (count @calls)) "adopted pool NOT terminated; its creator owns it")
       (is (= [:hook] @hook-calls) "hooks still ran")
-      (is (= true @(:terminated? reg)))
-      (is (= 1 @(:generation reg)) "generation bumped"))))
+      (is (= true @(:terminated? reg))))))
 
 (deftest ^:async shutdown-pool!-survives-a-rejecting-pre-terminate-hook
   (let [reg (wp/init-workload-pool! {})
@@ -198,7 +190,7 @@
                                (js/Promise.reject (js/Error. "terminate failed")))}]
     (reset! (:pool reg) fake)
     (reset! (:owned? reg) true)
-    (reset! (:latch reg) (js/Promise.resolve fake))
+    (reset! (:promise reg) (js/Promise.resolve fake))
     (let [ret (await (wp/shutdown-pool! reg))]
       (is (identical? reg ret) "a rejecting terminate still resolves to the registry")
       (is (= true @(:terminated? reg)))
@@ -207,7 +199,7 @@
 (deftest make-wiring!-starts-with-an-empty-registry-and-memo
   (let [wiring (wp/make-wiring!)]
     (is (nil? @(:registry wiring)) "no registry until a pass runs")
-    (is (nil? @(:latch wiring)) "no memo until a pass runs")
+    (is (nil? @(:promise wiring)) "no memo until a pass runs")
     ;; squint's nil? also passes for the undefined a tail `when` returns.
     ;; identical? compiles to ===.
     (is (identical? nil (wp/wiring-pool wiring))
@@ -260,7 +252,7 @@
       (is (= [:hook] @hooks) "the pre-terminate walk still ran")
       (is (= 0 (count @calls)) "the caller's pool was left up")
       (is (nil? @(:registry wiring)) "wiring cleared")
-      (is (nil? @(:latch wiring)) "memo cleared, so a later pass is fresh")
+      (is (nil? @(:promise wiring)) "memo cleared, so a later pass is fresh")
       (is (identical? nil (wp/wiring-pool wiring))
           "null rather than undefined after shutdown too"))))
 
@@ -284,7 +276,7 @@
                              (.then (fn [_] nil))
                              (.catch (fn [e] e))))]
     (is (some? err) "the pass rejects with the consumer's error")
-    (is (nil? @(:latch wiring)) "memo cleared so a later call retries")
+    (is (nil? @(:promise wiring)) "memo cleared so a later call retries")
     (is (nil? @(:registry wiring)) "the half-built registry is gone")
     (let [pl (await (wp/ensure-wired! wiring opts))]
       (is (= 2 @attempts) "the retry ran a fresh pass")

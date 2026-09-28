@@ -17,32 +17,24 @@
            [java.net JarURLConnection]
            [java.nio.file Files Path]))
 
+(set! *warn-on-reflection* true)
+
 (defn get-os
-  "Return :darwin, :linux, :windows or :android for this JVM."
+  "Return :darwin, :linux or :windows for this JVM."
   []
-  (let [vendor (string/lower-case (System/getProperty "java.vendor"))
-        os     (string/lower-case (System/getProperty "os.name"))]
-    (cond (string/includes? vendor "android") :android
-          (string/includes? os "mac")         :darwin
-          (string/includes? os "win")         :windows
-          :else                               :linux)))
+  (let [os (string/lower-case (System/getProperty "os.name"))]
+    (cond (string/includes? os "mac") :darwin
+          (string/includes? os "win") :windows
+          :else                       :linux)))
 
 (defn get-arch
-  "Return :amd64, :x86 or :aarch64 for this JVM. Another os.arch becomes a
-   keyword with `_` and `-` removed."
+  "Return :amd64 or :aarch64 for this JVM. Another os.arch becomes a keyword
+   with `_` and `-` removed."
   []
   (let [arch (System/getProperty "os.arch")]
     (case arch
-      "amd64"   :amd64
-      "x86_64"  :amd64
-      "x86-64"  :amd64
-      "i386"    :x86
-      "i486"    :x86
-      "i586"    :x86
-      "i686"    :x86
-      "i786"    :x86
-      "i886"    :x86
-      "aarch64" :aarch64
+      ("amd64" "x86_64" "x86-64") :amd64
+      "aarch64"                   :aarch64
       (keyword (string/replace arch #"[_-]" "")))))
 
 (defn- musl-maps?
@@ -69,34 +61,17 @@
    (let [dir (str (name os) "-" (name arch))]
      (if musl? [(str dir "-musl") dir] [dir]))))
 
-(defn init-ffi!
-  "Select the dt-ffi backend. :jdk (Panama) is the default and the only
-   backend."
-  ([] (init-ffi! :jdk))
-  ([backend] (dt-ffi/set-ffi-impl! backend)))
-
-(defn resolve-native-fn
-  "Return the dt-ffi Var for fndef key `k` in namespace symbol `impl-ns`,
-   or nil. dt-ffi interns these Vars at load time, so require `impl-ns` at
-   the call site even when its alias looks unused."
-  [impl-ns k]
-  (ns-resolve impl-ns (symbol (name k))))
-
 (defn make-native-fn-resolver
-  "Return a fn from fndef key to Var over `impl-ns`. Options:
-     :throw?   Throw ex-info on a missing fn instead of returning nil.
-     :memoize? Cache the Vars. Do not use it where a REPL can reload
-               `impl-ns`, because the cache keeps the old Vars."
-  ([impl-ns] (make-native-fn-resolver impl-ns nil))
-  ([impl-ns {:keys [throw? memoize?]}]
-   (let [resolve1 (fn [k]
-                    (or (resolve-native-fn impl-ns k)
-                        (when throw?
-                          (throw (ex-info (str "No native fn for " k)
-                                          {:fn-key k :impl-ns impl-ns})))))]
-     (if memoize? (memoize resolve1) resolve1))))
+  "Return a fn from fndef key to Var over `impl-ns`. It throws ex-info for a
+   key with no Var. dt-ffi interns these Vars at load time, so require
+   `impl-ns` at the call site even when its alias looks unused."
+  [impl-ns]
+  (fn [k]
+    (or (ns-resolve impl-ns (symbol (name k)))
+        (throw (ex-info (str "No native fn for " k)
+                        {:fn-key k :impl-ns impl-ns})))))
 
-(defn apply-native-fn
+(defn- apply-native-fn
   "Apply resolved dt-ffi fn `f` to `args`. A NULL const char* result gives
    nil."
   [f args]
@@ -113,9 +88,7 @@
   "Resolve and apply the dt-ffi var for `fn-key` in `impl-ns`. Throws
    ex-info when it is missing."
   [impl-ns fn-key args]
-  (if-let [f (resolve-native-fn impl-ns fn-key)]
-    (apply-native-fn f args)
-    (throw (ex-info "Native function not found" {:fn fn-key :impl-ns impl-ns}))))
+  (apply-native-fn ((make-native-fn-resolver impl-ns) fn-key) args))
 
 (defn init-jdk-library!
   "Select the :jdk backend and bind `singleton` to the canonical path of
@@ -127,30 +100,8 @@
     (throw (ex-info (str "No packaged native library was extracted for "
                          (name (get-os)) "-" (name (get-arch)))
                     {:os (get-os) :arch (get-arch)})))
-  (init-ffi! :jdk)
+  (dt-ffi/set-ffi-impl! :jdk)
   (dt-ffi/library-singleton-set! singleton (.getCanonicalPath file)))
-
-(defn reset-library!
-  "Reset dt-ffi library `singleton`, so the next init binds it again. nil
-   does nothing."
-  [singleton]
-  (when singleton
-    (dt-ffi/library-singleton-reset! singleton)))
-
-(defn libname-from-file
-  "The bare library name of `file`: strip a trailing version run, then the
-   extension, then a leading `lib`.
-
-     libproj.dylib -> proj      libz.so.1 -> z
-     glib-2.0.so -> glib-2.0    tifflib.dll -> tifflib
-
-   A version before the extension (libproj.25.dylib) is not handled. No
-   consumer passes one."
-  [^File file]
-  (-> (.getName file)
-      (.replaceFirst "([.][0-9]+)+$" "")
-      (.replaceFirst "[.][^.]+$" "")
-      (.replaceFirst "^lib" "")))
 
 (defn nullable-c-string
   "A C string of `s` for a :string? argument, or nil (NULL) for nil. Call
@@ -173,10 +124,8 @@
                  (cond-> (update fn-def :argtypes #(mapv dt-ffi-argtype %))
                    (= :string? (:rettype fn-def)) (assoc :rettype :string)))))
 
-(def default-library-suffixes
-  "Shared library extension for each OS keyword. A consumer overrides an
-   entry with :suffixes."
-  {:darwin ".dylib" :linux ".so" :windows ".dll" :android ".so"})
+(def ^:private library-suffixes
+  {:darwin ".dylib" :linux ".so" :windows ".dll"})
 
 (defn- copy-resource!
   "Copy classpath resource `resource-path` to `dest-file`, then make it rwx
@@ -215,7 +164,7 @@
               jar-file     (.getJarFile conn)
               entry-prefix (.getEntryName conn)]
           (->> (enumeration-seq (.entries jar-file))
-               (map #(.getName %))
+               (map #(.getName ^java.util.jar.JarEntry %))
                (filter #(and (.startsWith ^String % entry-prefix)
                              (not (.endsWith ^String % "/"))))
                (map #(subs % (count entry-prefix)))))
@@ -247,8 +196,8 @@
 (defn- extract-library-file!
   "Copy the packaged library, from the first of library-dirs that has it,
    into `dir`. Returns the destination File."
-  ^File [^File dir lib-basename suffixes]
-  (let [file-name (str lib-basename (get (merge default-library-suffixes suffixes) (get-os)))
+  ^File [^File dir lib-basename]
+  (let [file-name (str lib-basename (get library-suffixes (get-os)))
         resources (map #(str % "/" file-name) (library-dirs))
         resource  (or (first (filter io/resource resources)) (first resources))
         dest      (File. dir file-name)]
@@ -257,10 +206,10 @@
 
 (defn- extract-extra-resource!
   "Copy one :extra-resources entry into `dir`."
-  [^File dir {:keys [resource resource-dir dest] :as entry}]
+  [^File dir {:keys [resource resource-dir] :as entry}]
   (cond
     resource
-    (let [f (File. dir ^String (or dest (last-path-segment resource)))]
+    (let [f (File. dir ^String (last-path-segment resource))]
       (io/make-parents f)
       (copy-resource! resource f))
 
@@ -268,7 +217,7 @@
     ;; Force a trailing slash: "grids" and the relative "a.tif" would give
     ;; "gridsa.tif".
     (let [base (if (string/ends-with? resource-dir "/") resource-dir (str resource-dir "/"))
-          sub  (File. dir ^String (or dest (last-path-segment resource-dir)))]
+          sub  (File. dir ^String (last-path-segment resource-dir))]
       (.mkdirs sub)
       (doseq [rel (resource-dir-files base)]
         (let [f (File. sub ^String rel)]
@@ -281,8 +230,8 @@
 
 (defn extract-and-bind-library!
   "Extract a packaged native library and its extra resources into a new
-   temporary directory. Returns {:file :path :libname :singleton} for a
-   dt-ffi consumer.
+   temporary directory. Returns {:file :path :singleton} for a dt-ffi
+   consumer.
 
      :lib-basename     File name without extension, such as \"libproj\".
                        The resource is <os>-<arch>/<lib-basename><suffix>,
@@ -290,26 +239,23 @@
      :fn-defs-var      Var of the fndefs map, as rehydrate-fn-defs returns
                        it. A Var, because the dt-ffi singleton reads it late.
      :tmp-prefix       Temporary directory prefix. Default :lib-basename.
-     :suffixes         Extension overrides for each OS, merged over
-                       default-library-suffixes.
-     :extra-resources  Files the library needs at run time, copied next to
-                       it under the returned :path. Each entry is
+     :extra-resources  Files the library needs at run time. Each entry is
                        {:resource \"proj.db\"} or {:resource-dir \"grids/\"},
-                       with an optional :dest name.
+                       copied under the returned :path with the last
+                       segment of its path as its name.
 
    On failure, usually a missing resource for this platform, logs a warning
    that names the file and returns {}. The namespace stays loadable, and
    init-jdk-library! throws, so try-init! falls back to GraalVM.
 
    A shutdown hook deletes the directory."
-  [{:keys [lib-basename fn-defs-var tmp-prefix suffixes extra-resources]}]
+  [{:keys [lib-basename fn-defs-var tmp-prefix extra-resources]}]
   (try
     (let [dir      (make-temp-dir (or tmp-prefix lib-basename))
-          lib-file (extract-library-file! dir lib-basename suffixes)]
+          lib-file (extract-library-file! dir lib-basename)]
       (run! #(extract-extra-resource! dir %) extra-resources)
       {:file      lib-file
        :path      (.getCanonicalPath (.getParentFile lib-file))
-       :libname   (libname-from-file lib-file)
        :singleton (dt-ffi/library-singleton fn-defs-var)})
     (catch Exception e
       (log/warn e (str "Could not extract packaged library " lib-basename
@@ -317,28 +263,17 @@
                        "; init-jdk-library! will throw"))
       {})))
 
-(defn library-fn-finder
-  "Return the find-fn for define-library-fns!. It looks up a fndef key in
-   the singleton of `state-atom`, an extract-and-bind-library! result, at
-   call time, so the library can load after the Vars exist."
-  [state-atom]
-  (fn [fn-key]
-    (dt-ffi/library-singleton-find-fn (:singleton @state-atom) fn-key)))
-
 (defmacro define-library-fns!
   "Intern one Var for each fndef in the calling namespace, where a resolver
    over :ffi-impl-ns finds it.
 
    `fn-defs-sym` names the Var there that holds the fndefs. dt-ffi derefs it
    during expansion, so it must exist already. `state-atom-sym` names the Var
-   that holds the extract-and-bind-library! result. Optional
-   `check-error-sym` names a fn or macro of the fn-def and the unevaluated
-   call. It wraps each fndef with :check-error? true, and must resolve in
-   the calling namespace."
-  ([fn-defs-sym state-atom-sym]
-   `(define-library-fns! ~fn-defs-sym ~state-atom-sym nil))
-  ([fn-defs-sym state-atom-sym check-error-sym]
-   `(dt-ffi/define-library-functions
-      ~fn-defs-sym
-      (library-fn-finder ~state-atom-sym)
-      ~check-error-sym)))
+   that holds the extract-and-bind-library! result."
+  [fn-defs-sym state-atom-sym]
+  `(dt-ffi/define-library-functions
+     ~fn-defs-sym
+     ;; Deref the state at call time, so the library can load after the Vars exist.
+     (fn [fn-key#]
+       (dt-ffi/library-singleton-find-fn (:singleton @~state-atom-sym) fn-key#))
+     nil))

@@ -17,7 +17,8 @@
       The two wasm backends share the artifact, so both use the ccall types
       that `fn-record` precomputes. The FFI backend binds real symbols and
       ignores them."
-     (:require [net.willcohen.native.graal-wasm :as nw]
+     (:require [clojure.string :as string]
+               [net.willcohen.native.graal-wasm :as nw]
                [net.willcohen.native.platform :as nplatform]
                [tech.v3.resource :as resource]))
    :cljs
@@ -26,43 +27,33 @@
       value with `library` and passes it to `call!`, which routes a ccall
       through the worker-router pool in the :pool opt."
      (:require ["./pool.mjs" :as pool]
-               ["./handler_runtime.mjs" :as hrt])))
+               ["./handler_runtime.mjs" :as hrt]
+               [clojure.string :as string])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn argtype->ccall-type
-  "Map a fndefs type keyword to its ccall type keyword. An unknown type maps
-   to :number."
   [t]
   (case t
-    (:pointer :pointer? :string-array :string-array? :int32 :int64 :float64 :size-t :void) :number
     (:string :string?) :string
     :number))
 
 (def supported-types
   "The fndefs types that `library` accepts for :rettype and argtypes."
-  #{:pointer :pointer? :string-array :string-array? :int32 :int64 :float64
-    :size-t :void :string :string?})
+  #{:pointer :pointer? :int32 :int64 :float64 :size-t :void :string :string?})
 
-;; Written out, because (str :pointer) is ":pointer" on the JVM and "pointer"
-;; under squint. validate-fn-def!-names-every-supported-type pins it to the set.
+;; (str :pointer) is ":pointer" on the JVM and "pointer" under squint.
 (def ^:private supported-types-msg
-  (str ":pointer :pointer? :string-array :string-array? :int32 :int64 "
-       ":float64 :size-t :void :string :string?"))
+  (string/join " " (map #(str ":" (name %)) (sort supported-types))))
 
 (defn- validate-fn-def!
   "Throw ex-info when `fn-def` has a type outside supported-types."
   [fn-key fn-def]
-  (let [rettype (:rettype fn-def)]
-    (when-not (contains? supported-types rettype)
-      (throw (ex-info (str "Unsupported :rettype " rettype " in fn-def " fn-key
-                           ". Supported: " supported-types-msg)
-                      {:fn-key fn-key :rettype rettype})))
-    (doseq [[arg-name t] (:argtypes fn-def)]
-      (when-not (contains? supported-types t)
-        (throw (ex-info (str "Unsupported argtype " t " for arg " arg-name
-                             " in fn-def " fn-key ". Supported: " supported-types-msg)
-                        {:fn-key fn-key :arg arg-name :argtype t}))))))
+  (doseq [[arg-name t] (cons [":rettype" (:rettype fn-def)] (:argtypes fn-def))]
+    (when-not (contains? supported-types t)
+      (throw (ex-info (str "Unsupported type " t " for " arg-name
+                           " in fn-def " fn-key ". Supported: " supported-types-msg)
+                      {:fn-key fn-key :arg arg-name :type t})))))
 
 (defn normalize-null-pointer
   "nil for a :pointer or :pointer? result of 0, else `result`. A 0 address
@@ -83,12 +74,12 @@
 (defn- fn-record
   "The call data that `library` precomputes for one fn-def."
   [fn-key fn-def]
-  {:fn-key         fn-key
-   :c-name         #?(:clj (name fn-key) :cljs (str fn-key))
-   :fn-def         fn-def
-   :rettype        (:rettype fn-def)
-   :ccall-rettype  (argtype->ccall-type (:rettype fn-def))
-   :ccall-argtypes (mapv (fn [[_ t]] (argtype->ccall-type t)) (:argtypes fn-def))
+  {:fn-key          fn-key
+   :c-name          (name fn-key)
+   :fn-def          fn-def
+   :rettype         (:rettype fn-def)
+   :ccall-rettype   (argtype->ccall-type (:rettype fn-def))
+   :ccall-argtypes  (mapv (fn [[_ t]] (argtype->ccall-type t)) (:argtypes fn-def))
    :string?-indexes (type-indexes :string? (:argtypes fn-def))
    :int64-indexes   (type-indexes :int64 (:argtypes fn-def))})
 
@@ -100,11 +91,12 @@
     (vec (map-indexed (fn [i a] (if (contains? ix i) (f a) a)) args))))
 
 (defn library
-  "Build a library value for call!.
+  "Build a library value for call!. Treat it as opaque.
 
      :key         Library keyword. It keys pool affinity, context tracking,
                   eviction and the WasmContext lookup.
-     :fndefs      Map of fn-key to fn-def.
+     :fndefs      Map of fn-key to fn-def, each type one of supported-types.
+                  An unknown type throws here, at build time.
      :impl-atom   (JVM) Atom of :ffi or :graal, read at each call, so
                   force-graal! needs no rebuild.
      :ffi-impl-ns Symbol of the ns that holds the generated dt-ffi vars.
@@ -114,20 +106,12 @@
                   passes the full map to the result-wrapper as
                   :isolator-result.
 
-   Types for :rettype and argtypes: :pointer :pointer? :string-array
-   :string-array? :int32 :int64 :float64 :size-t :void :string :string?.
-   An unknown type throws here, at build time.
    :string? is a :string that can be nil (NULL), which dt-ffi's :string
    rejects. A NULL result is nil on the JVM and \"\" on CLJS, where ccall
    gives \"\" for both.
    :int64 is a Long on the JVM. The wasm backends send a BigInt, which a
    WASM_BIGINT module (the emscripten default since 4.0.0) needs. CLJS
-   returns the BigInt.
-
-   The returned value is API, and the dispatch suite pins it. :key,
-   :impl-atom, :ffi-impl-ns and :hooks pass through. :fns replaces :fndefs
-   and maps each fn-key to {:fn-key :c-name :fn-def :rettype :ccall-rettype
-   :ccall-argtypes :string?-indexes :int64-indexes}."
+   returns the BigInt."
   [{:keys [key fndefs impl-atom ffi-impl-ns hooks]}]
   {:key         key
    :impl-atom   impl-atom
@@ -153,18 +137,11 @@
 
 #?(:clj
    (defn- convert-arg-jvm
-     "A pointer record gives its :address. An atom of {:ptr p} gives the
-      address of p. nil gives 0. Anything else passes through."
+     "A pointer record gives its :address. nil gives 0. Anything else passes
+      through."
      [arg]
      (cond
        (and (record? arg) (contains? arg :address)) (:address arg)
-       (and (instance? clojure.lang.IDeref arg)
-            (map? @arg)
-            (contains? @arg :ptr))
-       (let [ptr (:ptr @arg)]
-         (if (and (record? ptr) (contains? ptr :address))
-           (:address ptr)
-           ptr))
        (nil? arg) 0
        :else arg)))
 
@@ -203,12 +180,12 @@
 #?(:clj
    (defn jvm-graal-call
      "ccall `c-fn-name` on the module of a bound *wasm-context*, else of
-      `library-key`. A \"string\" rettype reads through nw/ccall-string.
-      Throws an ex-info that names `c-fn-name` when the ccall throws."
+      `library-key`. A :string rettype reads through nw/ccall-string. Throws
+      an ex-info that names `c-fn-name` when the ccall throws."
      [library-key c-fn-name ccall-rettype ccall-argtypes converted-args]
      (let [module (graal-module library-key)]
        (try
-         (if (= "string" (name ccall-rettype))
+         (if (= :string ccall-rettype)
            (nw/ccall-string module c-fn-name ccall-argtypes converted-args)
            (nw/ccall module c-fn-name ccall-rettype ccall-argtypes converted-args))
          (catch Exception e
@@ -216,16 +193,16 @@
                            {:library-key library-key :c-fn-name c-fn-name} e)))))))
 
 #?(:clj
-   (defn- ffi-leg
+   (defn- call-ffi
      "The FFI backend of call!. Each :string? argument becomes a C string
       that lives until the call returns."
-     [lib rec fn-key args]
-     (let [ix (:string?-indexes rec)]
+     [lib rec args]
+     (let [ix (:string?-indexes rec)
+           call #(nplatform/call-native-fn (:ffi-impl-ns lib) (:fn-key rec) %)]
        (if (empty? ix)
-         (nplatform/call-native-fn (:ffi-impl-ns lib) fn-key args)
+         (call args)
          (resource/stack-resource-context
-          (nplatform/call-native-fn (:ffi-impl-ns lib) fn-key
-                                    (update-at-indexes ix nplatform/nullable-c-string args)))))))
+          (call (update-at-indexes ix nplatform/nullable-c-string args)))))))
 
 #?(:clj
    (defn- graal-int64-args
@@ -240,23 +217,16 @@
            (update-at-indexes ix #(nw/value-execute big-int [(str (long %))]) args))))))
 
 #?(:clj
-   (defn- graal-leg
+   (defn- call-graal
      "The GraalVM backend of call!."
      [lib rec args]
-     (let [rettype (:rettype rec)
-           raw (jvm-graal-call (:key lib)
-                               (:c-name rec)
-                               (:ccall-rettype rec)
-                               (:ccall-argtypes rec)
-                               (graal-int64-args (:key lib) rec (mapv convert-arg-jvm args)))
-           postprocessed (jvm-rettype-postprocess rettype raw)]
-       (if-let [result-wrapper (:result-wrapper (:hooks lib))]
-         (result-wrapper {:rettype rettype
-                          :result postprocessed
-                          :fn-def (:fn-def rec)
-                          :args args
-                          :platform :graal})
-         postprocessed))))
+     (jvm-rettype-postprocess
+      (:rettype rec)
+      (jvm-graal-call (:key lib)
+                      (:c-name rec)
+                      (:ccall-rettype rec)
+                      (:ccall-argtypes rec)
+                      (graal-int64-args (:key lib) rec (mapv convert-arg-jvm args))))))
 
 #?(:cljs
    (defn- convert-arg-cljs
@@ -277,109 +247,110 @@
      (update-at-indexes (:int64-indexes rec) js/BigInt args)))
 
 #?(:cljs
-   (defn ^:async cljs-leg
+   (defn- ctx-ids
+     "The .ctx_id of each argument that has one. A consumer result-wrapper
+      sets it; the pool refcount and eviction read it."
+     [args]
+     (vec (keep (fn [a] (when (and (object? a) (some? (.-ctx_id a))) (.-ctx_id a)))
+                args))))
+
+#?(:cljs
+   (defn- check-not-evicted!
+     "Throw when an LRU eviction freed the native handle of one of `ids`."
+     [library-key ids]
+     (doseq [cid ids]
+       (when (pool/evicted? library-key cid)
+         (throw (ex-info (str "context " cid " was evicted (LRU); recreate it")
+                         {:library-key library-key :ctx-id cid :evicted true}))))))
+
+#?(:cljs
+   (defn- ccall-args
+     "The worker-call args of a ccall: the C fn name, the return type, the
+      arg types, `args`, and an object of each non-nil entry of `extras`."
+     [rec args extras]
+     (let [extra (js-obj)]
+       (doseq [[k v] extras]
+         (when (some? v) (aset extra (str k) v)))
+       #js [(:c-name rec)
+            (str (:ccall-rettype rec))
+            (mapv str (:ccall-argtypes rec))
+            args
+            extra])))
+
+#?(:cljs
+   (defn- ^:async isolate
+     "The map that the :context-isolator hook returns for a fn-def with
+      :isolate-context?, else nil. The flag also stops recursion on the
+      sub-dispatches of the isolator."
+     [lib rec args worker-idx pool-ref]
+     (when (:isolate-context? (:fn-def rec))
+       (when-let [iso (:context-isolator (:hooks lib))]
+         (hrt/dbg "ISOLATE-FIRE" #js {:lib (str (:key lib)) :c-fn (:c-name rec) :worker worker-idx})
+         (await (iso {:fn-key (:fn-key rec)
+                      :fn-def (:fn-def rec)
+                      :args args
+                      :worker-idx worker-idx
+                      :library-key (:key lib)
+                      :library lib
+                      :pool pool-ref}))))))
+
+#?(:cljs
+   (defn- ^:async call-cljs
      "The CLJS worker backend of call!."
      [lib rec args opts]
      (let [library-key (:key lib)
-           hooks (:hooks lib)
-           fn-key (:fn-key rec)
-           c-fn-name (:c-name rec)
-           fn-def (:fn-def rec)
-           rettype (:rettype rec)
-           ccall-rettype (:ccall-rettype rec)
-           ccall-argtypes (:ccall-argtypes rec)
-           result-wrapper (:result-wrapper hooks)
-           extras-builder (:extras-builder hooks)
-           pool-ref (:pool opts)
-           force-idx (:force-worker-idx opts)
-           worker-idx (if (some? force-idx)
-                        force-idx
-                        (pool/worker-idx-from-args library-key args))
-             ;; :primary-handle lets a trace match this call to its worker
-             ;; BUSY-INC and BUSY-DEC. It stays out of the ccall envelope.
-           _dispatch-resolve (hrt/dbg "DISPATCH-RESOLVE"
-                                      #js {:lib (str library-key)
-                                           :c-fn (str fn-key)
-                                           :force-idx force-idx
-                                           :worker-idx worker-idx
-                                           :primary-handle (:primary-handle opts)})
-             ;; .ctx_id is the wire contract for handle identity: a consumer
-             ;; result-wrapper sets it, and this scan and the pool refcount
-             ;; and eviction read it. Keep it one fixed name, not a registry.
-           ctx-ids (vec (keep (fn [a]
-                                (when (and (object? a) (some? (.-ctx_id a)))
-                                  (.-ctx_id a)))
-                              args))
-           {builder-args :args
-            extras       :extras
-            on-result    :on-result} (if extras-builder
-                                       (extras-builder fn-def args)
-                                       {:args args :extras nil :on-result nil})
-           on-result (or on-result identity)
-             ;; Only for a fn-def with :isolate-context?, which also stops
-             ;; recursion on the sub-dispatches of the isolator.
-           isolator-result (when (:isolate-context? fn-def)
-                             (when-let [iso (:context-isolator hooks)]
-                               (hrt/dbg "ISOLATE-FIRE" #js {:lib (str library-key)
-                                                            :c-fn (str fn-key)
-                                                            :worker worker-idx})
-                               (await (iso {:fn-key fn-key
-                                            :fn-def fn-def
-                                            :args (or builder-args args)
-                                            :worker-idx worker-idx
-                                            :library-key library-key
-                                            :library lib
-                                            :pool pool-ref}))))
-           isolator-args (get isolator-result :args (or builder-args args))
-           converted (int64-args->bigint rec (mapv convert-arg-cljs isolator-args))
-           ccall-cmd (cond-> {:cmd "ccall"
-                              :fn c-fn-name
-                              :returnType (str ccall-rettype)
-                              :argTypes (mapv str ccall-argtypes)
-                              :args converted}
-                       (seq extras) (merge extras))]
-         ;; An evicted ctx-id means a freed native handle. Fail cleanly
-         ;; before any ref.
-       (doseq [cid ctx-ids]
-         (when (pool/evicted? library-key cid)
-           (throw (ex-info (str "context " cid " was evicted (LRU); recreate it")
-                           {:library-key library-key :ctx-id cid :evicted true}))))
-         ;; Ref each ctx so the LRU sweep skips it while in flight.
-       (doseq [cid ctx-ids] (pool/ref-handle! library-key cid))
+           hooks       (:hooks lib)
+           pool-ref    (:pool opts)
+           force-idx   (:force-worker-idx opts)
+           worker-idx  (if (some? force-idx) force-idx (pool/worker-idx-from-args args))
+           ids         (ctx-ids args)]
+       ;; :primary-handle matches this call to its worker BUSY-INC and
+       ;; BUSY-DEC in a trace. The worker never gets it.
+       (hrt/dbg "DISPATCH-RESOLVE" #js {:lib (str library-key)
+                                         :c-fn (:c-name rec)
+                                         :force-idx force-idx
+                                         :worker-idx worker-idx
+                                         :primary-handle (:primary-handle opts)})
+       (check-not-evicted! library-key ids)
+       ;; Ref each ctx so the LRU sweep skips it while in flight.
+       (doseq [cid ids] (pool/ref-handle! library-key cid))
        (try
-         (let [raw (await (pool/worker-call pool-ref
-                                            library-key
-                                            (:cmd ccall-cmd)
-                                            (pool/cmd-args ccall-cmd)
-                                            worker-idx))
-               ;; Normalize before the result-wrapper, so the wrapper sees
-               ;; one shape.
-               postprocessed (normalize-null-pointer rettype (on-result raw))
-               wrapped (if result-wrapper
-                         (result-wrapper {:rettype rettype
-                                          :result postprocessed
-                                          :fn-def fn-def
-                                          :args args
-                                          :worker-idx worker-idx
-                                          :platform :cljs
-                                          :isolator-result isolator-result})
-                         postprocessed)]
-           wrapped)
-           ;; handler_runtime.mjs already normalizes wasm traps, but a later
-           ;; layer can inject a non-cloneable error, so normalize again.
+         (let [{built :args extras :extras on-result :on-result}
+               (if-let [b (:extras-builder hooks)]
+                 (b (:fn-def rec) args)
+                 {:args args})
+               isolated (await (isolate lib rec (or built args) worker-idx pool-ref))
+               call-args (int64-args->bigint rec (mapv convert-arg-cljs
+                                                       (get isolated :args (or built args))))
+               raw (await (pool/worker-call pool-ref library-key "ccall"
+                                            (ccall-args rec call-args extras) worker-idx))
+               ;; Normalize before the result-wrapper, so the wrapper sees one
+               ;; shape.
+               result (normalize-null-pointer (:rettype rec) ((or on-result identity) raw))]
+           (if-let [wrap (:result-wrapper hooks)]
+             (wrap {:rettype (:rettype rec)
+                    :result result
+                    :fn-def (:fn-def rec)
+                    :args args
+                    :worker-idx worker-idx
+                    :platform :cljs
+                    :isolator-result isolated})
+             result))
+         ;; handler_runtime.mjs already normalizes wasm traps, but a later layer
+         ;; can inject a non-cloneable error, so normalize again.
          (catch :default e
            (throw (hrt/normalizeWasmError e)))
          (finally
-           (doseq [cid ctx-ids] (pool/unref-handle! library-key cid)))))))
+           (doseq [cid ids] (pool/unref-handle! library-key cid)))))))
 
 (defn ^:async call!
   "Call C fn `fn-key` of `lib` with the vector `args`: on the JVM through
    the backend that :impl-atom selects, on CLJS through the worker pool.
    Throws on an unknown fn-key. Does not initialize the library.
 
-   Hooks: :extras-builder and :context-isolator run on CLJS only,
-   :result-wrapper on :graal and CLJS. call! never runs :result-check; call
-   check-result. A ccall exception throws on :graal and rejects on CLJS.
+   Hooks: :extras-builder, :context-isolator and :result-wrapper run on CLJS
+   only. call! never runs :result-check; call check-result. A ccall
+   exception throws on :graal and rejects on CLJS.
 
    opts (CLJS only): :pool, the worker-router ref (required);
    :force-worker-idx, which overrides affinity; :primary-handle, a trace
@@ -397,8 +368,7 @@
                       {:fn-key fn-key :library (:key lib)})))
     #?(:clj
        (if (= :graal @(:impl-atom lib))
-         (graal-leg lib rec args)
-         (ffi-leg lib rec fn-key args))
+         (call-graal lib rec args)
+         (call-ffi lib rec args))
        :cljs
-       (await (cljs-leg lib rec args opts)))))
-
+       (await (call-cljs lib rec args opts)))))

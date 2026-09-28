@@ -10,41 +10,23 @@
             ["ffi-wasm/handler-fs" :refer [stageFiles]]
             ["ffi-wasm/test-runner" :as tr]))
 
-(def ^:private EEXIST 20)
-
 (defn- fake-fs
-  "A stand-in module whose FS records every call. `mkdir-kind` :tree exposes
-   mkdirTree, :legacy only a mkdir that throws EEXIST on a repeat, and
-   :hostile a mkdir that throws EACCES."
-  [mkdir-kind]
+  "A stand-in module whose FS records each mkdirTree and writeFile."
+  []
   (let [writes (atom [])
-        mkdirs (atom [])
-        trees (atom [])
-        fs #js {}]
-    (set! (.-writeFile fs) (fn [path data] (swap! writes conj [path data]) nil))
-    (case mkdir-kind
-      :tree (set! (.-mkdirTree fs) (fn [dir] (swap! trees conj dir) nil))
-      :legacy (set! (.-mkdir fs)
-                    (fn [dir]
-                      (when (some #{dir} @mkdirs)
-                        (throw (doto (js/Error. "EEXIST") (aset "errno" EEXIST))))
-                      (swap! mkdirs conj dir)
-                      nil))
-      :hostile (set! (.-mkdir fs)
-                     (fn [_dir]
-                       (throw (doto (js/Error. "EACCES") (aset "errno" 13))))))
-    {:module #js {:FS fs}
+        trees (atom [])]
+    {:module #js {:FS #js {:writeFile (fn [path data] (swap! writes conj [path data]) nil)
+                           :mkdirTree (fn [dir] (swap! trees conj dir) nil)}}
      :writes writes
-     :mkdirs mkdirs
      :trees trees}))
 
 (deftest stage-files-writes-each-file-and-returns-its-memfs-path
-  (let [{:keys [module writes trees]} (fake-fs :tree)
+  (let [{:keys [module writes trees]} (fake-fs)
         out (stageFiles module
                         #js {"proj.db" (js/Uint8Array. #js [1 2 3])
                              "proj.ini" (js/Uint8Array. #js [4])}
                         "/proj")]
-    (is (= ["/proj"] @trees) "mkdirTree is used when the module exposes it")
+    (is (= ["/proj"] @trees))
     (is (= 2 (count @writes)))
     (testing "the returned map keys each basename to its absolute MEMFS path"
       (is (= "/proj/proj.db" (aget out "proj.db")))
@@ -55,13 +37,13 @@
         (is (= [4] (get by-path "/proj/proj.ini")))))))
 
 (deftest stage-files-trims-one-trailing-slash-from-the-dir
-  (let [{:keys [module]} (fake-fs :tree)
+  (let [{:keys [module]} (fake-fs)
         out (stageFiles module #js {"a.dat" (js/Uint8Array. #js [1])} "/data/")]
     (is (= "/data/a.dat" (aget out "a.dat"))
         "no doubled separator")))
 
 (deftest stage-files-coerces-what-it-is-given-to-uint8
-  (let [{:keys [module writes]} (fake-fs :tree)
+  (let [{:keys [module writes]} (fake-fs)
         backing (js/Uint8Array. #js [9 8 7 6])
         view (js/Uint8Array. (.-buffer backing) 1 2)]
     (stageFiles module
@@ -82,28 +64,15 @@
         (is (= [3 4] (vec (js/Array.from (get by-path "/d/ab.dat")))))))))
 
 (deftest stage-files-rejects-a-value-that-is-not-bytes
-  (let [{:keys [module]} (fake-fs :tree)]
+  (let [{:keys [module]} (fake-fs)]
     (is (thrown-with-msg? js/Error #"not Uint8Array or coercible"
                           (stageFiles module #js {"bad.dat" 42} "/d")))
     (testing "the failing name is in the message, so the caller knows which one"
       (is (thrown-with-msg? js/Error #"bad\.dat"
                             (stageFiles module #js {"bad.dat" "text"} "/d"))))))
 
-;; An emscripten with no mkdirTree takes this path, as on a pinned toolchain.
-(deftest stage-files-on-an-older-emscripten-tolerates-eexist
-  (let [{:keys [module mkdirs]} (fake-fs :legacy)]
-    (stageFiles module #js {"a.dat" (js/Uint8Array. #js [1])} "/d")
-    (testing "a second staging into the same dir does not throw"
-      (stageFiles module #js {"b.dat" (js/Uint8Array. #js [2])} "/d")
-      (is (= ["/d"] @mkdirs) "the dir was created once and the repeat swallowed"))))
-
-(deftest stage-files-rethrows-a-mkdir-failure-that-is-not-eexist
-  (let [{:keys [module]} (fake-fs :hostile)]
-    (is (thrown-with-msg? js/Error #"EACCES"
-                          (stageFiles module #js {"a.dat" (js/Uint8Array. #js [1])} "/d")))))
-
 (deftest stage-files-guards-its-arguments
-  (let [{:keys [module]} (fake-fs :tree)
+  (let [{:keys [module]} (fake-fs)
         bytes #js {"a.dat" (js/Uint8Array. #js [1])}]
     (testing "a module with no FS cannot stage anything"
       (is (thrown-with-msg? js/Error #"module\.FS not available"

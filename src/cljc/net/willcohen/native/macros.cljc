@@ -68,25 +68,18 @@
 
 (defn fn-def-arg-syms
   "The parameter symbols of a fndefs entry, from its :argtypes names in C
-   order. A repeated name gets a numeric suffix."
+   order."
   [fn-def]
-  (first
-   (reduce (fn [[syms seen] [arg-name _]]
-             (let [base (name arg-name)
-                   n    (get seen base 0)
-                   sym  (symbol (if (zero? n) base (str base "-" (inc n))))]
-               [(conj syms sym) (assoc seen base (inc n))]))
-           [[] {}]
-           (:argtypes fn-def))))
+  (mapv (fn [[arg-name _]] (symbol (name arg-name))) (:argtypes fn-def)))
 
 (defn library-fns-form
   "A `do` form of the public wrapper defns for `fndefs`.
 
-   `name-fn` (default c-name->clj-name) maps a fndefs key to the public
-   symbol, or to nil to skip the entry. `emit-fn` takes the symbol, the key
-   and the fn-def, and returns one defn form. `alias-name-fn` and
-   `alias-emit-fn` add an optional second walk for a second spelling. All
-   of them run at macro-expansion time."
+   `name-fn` maps a fndefs key to the public symbol. `emit-fn` takes the
+   symbol, the key and the fn-def, and returns one defn form. `alias-name-fn`
+   and `alias-emit-fn` add an optional second walk for a second spelling, and
+   `alias-name-fn` returns nil to skip a key. All of them run at
+   macro-expansion time."
   [fndefs {:keys [name-fn emit-fn alias-name-fn alias-emit-fn]}]
   (let [walk (fn [nf ef]
                (when (and nf ef)
@@ -94,24 +87,22 @@
                          (when-let [fn-name (nf fn-key)]
                            (ef fn-name fn-key fn-def)))
                        fndefs)))]
-    (cons 'do (concat (walk (or name-fn c-name->clj-name) emit-fn)
+    (cons 'do (concat (walk name-fn emit-fn)
                       (walk alias-name-fn alias-emit-fn)))))
 
 #?(:clj
    (defn intern-library-fns!
      "Intern one wrapper fn per fndefs entry into `ns-sym` at load time,
       because the JVM macro cannot see the fndefs shape at expansion.
-      `name-fn` maps a key to the public symbol, or to nil to skip it.
-      `make-fn` takes the key and the fn-def, and returns the fn.
+      `name-fn` maps a key to the public symbol. `make-fn` takes the key and
+      the fn-def, and returns the fn.
 
       Call it only from inside the consumer macro. A direct call gives
       clj-kondo no macro to expand, so every generated var reads as
       unresolved."
      [ns-sym fndefs name-fn make-fn]
      (doseq [[fn-key fn-def] fndefs]
-       (when-let [fn-name (name-fn fn-key)]
-         (intern ns-sym fn-name (make-fn fn-key fn-def))))
-     nil))
+       (intern ns-sym (name-fn fn-key) (make-fn fn-key fn-def)))))
 
 #?(:cljs
    (defn underscore->camelCase

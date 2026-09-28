@@ -8,7 +8,7 @@
   "JVM smoke tests for the workload-pool registry."
   (:require [clojure.test :refer [deftest is testing]]
             [net.willcohen.native.workload-pool :as wp])
-  (:import [java.util.concurrent ExecutorService Callable TimeUnit ThreadPoolExecutor]))
+  (:import [java.util.concurrent ExecutorService Callable TimeUnit]))
 
 (defn- await-shutdown!
   "Block until exec has terminated or the timeout elapses, returning a
@@ -35,7 +35,6 @@
 
 (deftest init-workload-pool-shape
   (let [registry (wp/init-workload-pool! {:size 2})]
-    (is (= :jvm (:runtime registry)))
     (is (= 2 (:size registry)))
     (is (= #{:mixed :io :compute}
            (set (keys @(:slots registry)))))
@@ -43,26 +42,6 @@
            (set (keys @(:handlers registry)))))
     (is (false? @(:terminated? registry)))
     (wp/shutdown-pool! registry)))
-
-(deftest sizes-defaults-to-size-for-every-slot
-  (testing "omitting :sizes leaves every slot at :size (default unchanged)"
-    (let [registry (wp/init-workload-pool! {:size 3})]
-      (is (= {:mixed 3 :io 3 :compute 3} (:sizes registry)))
-      (wp/shutdown-pool! registry))))
-
-(deftest per-slot-sizes-override-default-size
-  (testing ":sizes sizes each slot independently; absent slots fall back to :size"
-    (let [registry (wp/init-workload-pool! {:size 2 :sizes {:io 5}})]
-      (is (= {:mixed 2 :io 5 :compute 2} (:sizes registry))
-          "resolved per-slot sizes: :io overridden, others default to :size")
-      (is (= 2 (:size registry)) ":size default preserved for backward compat")
-      (let [^ThreadPoolExecutor io-exec (wp/as-executor-service registry :io)
-            ^ThreadPoolExecutor compute-exec (wp/as-executor-service registry :compute)]
-        (is (= 5 (.getCorePoolSize io-exec)) ":io pool sized from :sizes")
-        (is (= 2 (.getCorePoolSize compute-exec)) ":compute pool sized from :size")
-        (wp/shutdown-pool! registry)
-        (await-shutdown! io-exec 5)
-        (await-shutdown! compute-exec 5)))))
 
 (deftest register-handler-stacks-by-workload
   (let [registry (wp/init-workload-pool! {:size 2})

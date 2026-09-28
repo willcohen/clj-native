@@ -45,12 +45,7 @@
   (is (= ["dataset" "band-num"]
          (mapv str (m/fn-def-arg-syms {:argtypes [["dataset" "pointer"]
                                                   ["band-num" "int32"]]}))))
-  (is (= [] (mapv str (m/fn-def-arg-syms {:argtypes []}))))
-  (testing "a repeated name is suffixed, so the second does not shadow the first"
-    (is (= ["ptr" "ptr-2" "ptr-3"]
-           (mapv str (m/fn-def-arg-syms {:argtypes [["ptr" "pointer"]
-                                                    ["ptr" "pointer"]
-                                                    ["ptr" "pointer"]]}))))))
+  (is (= [] (mapv str (m/fn-def-arg-syms {:argtypes []})))))
 
 (def ^:private two-fndefs
   {"AlphaOne" {:argtypes []}
@@ -83,11 +78,6 @@
     (is (= 3 (count parts)) "two primary fns plus one alias")
     (is (= "alias:a1" (last parts)) "the alias walk runs after the primary walk")))
 
-(deftest library-fns-form-defaults-to-the-underscore-mapping
-  (let [form (m/library-fns-form {"a_b" {:argtypes []}}
-                                 {:emit-fn (fn [fn-name _ _] (str fn-name))})]
-    (is (= ["a-b"] (vec (rest form))))))
-
 #?(:clj
    (deftest intern-library-fns!-interns-one-var-per-entry
      (let [target (create-ns 'net.willcohen.native.macros-test.target)]
@@ -97,17 +87,6 @@
                                 (fn [fn-key _fn-def] (fn [] fn-key)))
          (is (= "AlphaOne" ((ns-resolve target 'alpha-one))))
          (is (= "BetaTwo" ((ns-resolve target 'beta-two))))
-         (finally (remove-ns (ns-name target)))))))
-
-#?(:clj
-   (deftest intern-library-fns!-skips-a-key-the-name-fn-declines
-     (let [target (create-ns 'net.willcohen.native.macros-test.partial-target)]
-       (try
-         (m/intern-library-fns! (ns-name target) two-fndefs
-                                (fn [fn-key] (when (= fn-key "BetaTwo") 'beta-two))
-                                (fn [_ _] (fn [] :ok)))
-         (is (nil? (ns-resolve target 'alpha-one)) "declined key interns nothing")
-         (is (some? (ns-resolve target 'beta-two)))
          (finally (remove-ns (ns-name target)))))))
 
 #?(:cljs (tr/run-tests-and-exit! "net.willcohen.native.macros-test"))

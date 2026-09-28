@@ -17,7 +17,7 @@
 (set! *warn-on-reflection* true)
 
 (defn ptr-addr
-  "The raw address of a dt-ffi Pointer or a NativeBuffer."
+  "The raw address of a dt-ffi Pointer or a NativeBuffer. Throws on nil."
   ^long [p]
   (dt-ptr/ptr-value p))
 
@@ -109,8 +109,4 @@
   (let [base (long base-addr)]
     (if (zero? base)
       []
-      (loop [i 0 acc []]
-        (let [p (rd-addr (+ base (* i 8)))]
-          (if (zero? p)
-            acc
-            (recur (inc i) (conj acc (dt-ffi/c->string (dt-ffi/->pointer p))))))))))
+      (into [] (comp (map #(rd-cstr (+ base (* 8 (long %))))) (take-while some?)) (range)))))

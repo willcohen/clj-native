@@ -60,9 +60,19 @@ jobs:
       - name: Run lint
         run: bb lint
 
-  test-linux:
-    name: Tests (Linux amd64)
-    runs-on: ubuntu-latest
+  test:
+    name: Tests (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux amd64
+            key: linux
+          - os: macos-latest
+            name: macOS arm64
+            key: macos
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -83,6 +93,21 @@ jobs:
         with:
           node-version: '26'
 
+      # The zig of flake.lock. Without zig and llvm-readobj, bb test:bb
+      # skips its zig tests.
+      - name: Setup Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Put llvm-readobj on the PATH
+        if: runner.os == 'Linux'
+        run: |
+          for d in /usr/lib/llvm-*/bin; do
+            if [ -x "$d/llvm-readobj" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+          done
+
       - name: Setup Clojure cache
         uses: actions/cache@v4
         with:
@@ -90,15 +115,15 @@ jobs:
             ~/.m2
             ~/.gitlibs
             ~/.clojure/.cpcache
-          key: clojure-deps-linux-${{ hashFiles('deps.edn', 'bb.edn') }}
-          restore-keys: clojure-deps-linux-
+          key: clojure-deps-${{ matrix.key }}-${{ hashFiles('deps.edn', 'bb.edn') }}
+          restore-keys: clojure-deps-${{ matrix.key }}-
 
       - name: Cache node_modules
         uses: actions/cache@v4
         with:
           path: node_modules
-          key: node-modules-linux-${{ hashFiles('package-lock.json') }}
-          restore-keys: node-modules-linux-
+          key: node-modules-${{ matrix.key }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: node-modules-${{ matrix.key }}-
 
       - name: Run JVM tests
         run: bb test:clj
@@ -109,78 +134,12 @@ jobs:
       - name: Run build helper tests
         run: bb test:bb
 
-  test-macos:
-    name: Tests (macOS arm64)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '25'
-
-      - name: Install Clojure and Babashka
-        uses: DeLaGuardo/setup-clojure@12.5
-        with:
-          bb: latest
-          cli: latest
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '26'
-
-      - name: Setup Clojure cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.m2
-            ~/.gitlibs
-            ~/.clojure/.cpcache
-          key: clojure-deps-macos-${{ hashFiles('deps.edn', 'bb.edn') }}
-          restore-keys: clojure-deps-macos-
-
-      - name: Cache node_modules
-        uses: actions/cache@v4
-        with:
-          path: node_modules
-          key: node-modules-macos-${{ hashFiles('package-lock.json') }}
-          restore-keys: node-modules-macos-
-
-      - name: Run JVM tests
-        run: bb test:clj
-
-      - name: Run CLJS tests
-        run: bb test:cljs
-
   ci-pass:
     name: CI Pass
     if: always()
-    needs:
-      - lint
-      - test-linux
-      - test-macos
+    needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
-        run: |
-          results=(
-            "${{ needs.lint.result }}"
-            "${{ needs.test-linux.result }}"
-            "${{ needs.test-macos.result }}"
-          )
-          names=("lint" "test-linux" "test-macos")
-          failed=false
-          for i in "${!results[@]}"; do
-            echo "  ${names[$i]}: ${results[$i]}"
-            if [ "${results[$i]}" != "success" ]; then
-              failed=true
-            fi
-          done
-          if [ "$failed" = "true" ]; then
-            echo "One or more required jobs failed."
-            exit 1
-          fi
-          echo "All required jobs passed."
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

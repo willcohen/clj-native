@@ -31,38 +31,19 @@
                :else :unknown)]
     {:os os :arch arch}))
 
-(defn safe-parallel-jobs
+(defn- safe-parallel-jobs
   "A make -j value: one job per 3 GB of memory (available on Linux, total
   on macOS), from 1 to the CPU count, so a C++ build fits a small CI
   runner."
   []
-  (let [{:keys [os]} (detect-host-platform)
-        available-gb (try
-                       (cond
-                         (fs/exists? "/proc/meminfo")
-                         (let [meminfo (slurp "/proc/meminfo")
-                               kb (or (some->> meminfo
-                                               (re-find (re-pattern "MemAvailable:\\s+(\\d+)"))
-                                               second
-                                               str/trim
-                                               Long/parseLong)
-                                      (some->> meminfo
-                                               (re-find (re-pattern "MemFree:\\s+(\\d+)"))
-                                               second
-                                               str/trim
-                                               Long/parseLong)
-                                      4194304)]
-                           (/ kb 1048576.0))
-
-                         (= :darwin os)
-                         (let [bytes (-> (tasks/shell {:out :string} "sysctl" "-n" "hw.memsize")
-                                         :out str/trim Long/parseLong)]
-                           (/ bytes 1073741824.0))
-
-                         :else 8.0)
-                       (catch Exception _ 8.0))
-        cpus (.. Runtime getRuntime availableProcessors)]
-    (min cpus (max 1 (int (/ available-gb 3))))))
+  (let [gb (try
+             (if (fs/exists? "/proc/meminfo")
+               (-> (re-find #"MemAvailable:\s+(\d+)" (slurp "/proc/meminfo"))
+                   second parse-long (/ 1048576.0))
+               (-> (tasks/shell {:out :string} "sysctl" "-n" "hw.memsize")
+                   :out str/trim parse-long (/ 1073741824.0)))
+             (catch Exception _ 8.0))]
+    (min (.availableProcessors (Runtime/getRuntime)) (max 1 (int (/ gb 3))))))
 
 (defn- file-sha256 [path]
   (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-256")
@@ -180,37 +161,31 @@
                       \"./configure\" with :in-tree?.
     :in-tree?         :build-dir is the source dir. Runs make distclean
                       first when a Makefile exists.
-    :post-configure   A fn of no args, called between configure and make.
-    :parallel-jobs    Default from safe-parallel-jobs.
-    :skip-if-exists   Skip the build when this path exists."
+    :post-configure   A fn of no args, called between configure and make."
   [{:keys [type build-dir install-dir configure-args env
-           configure-script in-tree? post-configure parallel-jobs skip-if-exists]
-    :or {parallel-jobs (safe-parallel-jobs)
-         env {}}}]
+           configure-script in-tree? post-configure]
+    :or {env {}}}]
   (check-cflags! env (System/getenv))
-  (when (or (nil? skip-if-exists)
-            (not (fs/exists? skip-if-exists)))
-    (let [configure-script (or configure-script
-                               (if in-tree? "./configure" "../configure"))
-          make-cmd (cmd-prefix type :make)]
-      (fs/delete-tree install-dir)
-      (if in-tree?
-        (when (fs/exists? (fs/path build-dir "Makefile"))
-          (try (apply tasks/shell {:dir (str build-dir)}
-                      (concat make-cmd ["distclean"]))
-               (catch Exception _ nil)))
-        (do (fs/delete-tree build-dir)
-            (fs/create-dirs build-dir)))
-      (let [configure-cmd (concat (cmd-prefix type :configure)
-                                  [configure-script
-                                   (str "--prefix=" install-dir)]
-                                  configure-args)]
-        (apply tasks/shell {:dir (str build-dir) :extra-env env} configure-cmd))
-      (when post-configure (post-configure))
-      (apply tasks/shell {:dir (str build-dir) :extra-env env}
-             (concat make-cmd ["-j" (str parallel-jobs)]))
-      (apply tasks/shell {:dir (str build-dir) :extra-env env}
-             (concat make-cmd ["install"])))))
+  (let [configure-script (or configure-script
+                             (if in-tree? "./configure" "../configure"))
+        make-cmd (cmd-prefix type :make)]
+    (fs/delete-tree install-dir)
+    (if in-tree?
+      (when (fs/exists? (fs/path build-dir "Makefile"))
+        (try (apply tasks/shell {:dir (str build-dir)}
+                    (concat make-cmd ["distclean"]))
+             (catch Exception _ nil)))
+      (do (fs/delete-tree build-dir)
+          (fs/create-dirs build-dir)))
+    (apply tasks/shell {:dir (str build-dir) :extra-env env}
+           (concat (cmd-prefix type :configure)
+                   [configure-script (str "--prefix=" install-dir)]
+                   configure-args))
+    (when post-configure (post-configure))
+    (apply tasks/shell {:dir (str build-dir) :extra-env env}
+           (concat make-cmd ["-j" (str (safe-parallel-jobs))]))
+    (apply tasks/shell {:dir (str build-dir) :extra-env env}
+           (concat make-cmd ["install"]))))
 
 (defn build-cmake-library
   "Build a library with CMake.
@@ -220,45 +195,24 @@
                     emmake.
     :src-dir        The directory with CMakeLists.txt.
     :build-dir      The out-of-tree build directory.
-    :cmake-args     Every CMake flag, with the install prefix and each dep
-                    path.
+    :cmake-args     Every CMake flag, with each dep path.
 
   Optional keys:
     :env            More env vars.
-    :install?       Default true.
     :clean?         Delete :build-dir first. Default true. False keeps the
-                    cache for an incremental rebuild.
-    :parallel-jobs  Default from safe-parallel-jobs.
-    :skip-if-exists Skip the build when this path exists.
-    :cache-file     An initial cache, passed as -C.
-    :pre-configure  A fn of no args, called after :build-dir exists and
-                    before cmake."
-  [{:keys [type src-dir build-dir cmake-args env install? clean? parallel-jobs
-           skip-if-exists cache-file pre-configure]
-    :or {install? true
-         clean? true
-         parallel-jobs (safe-parallel-jobs)
+                    cache for an incremental rebuild."
+  [{:keys [type src-dir build-dir cmake-args env clean?]
+    :or {clean? true
          env {}}}]
-  (when (or (nil? skip-if-exists)
-            (not (fs/exists? skip-if-exists)))
-    (when clean? (fs/delete-tree build-dir))
-    (fs/create-dirs build-dir)
-    (when pre-configure (pre-configure))
-    (let [cmake-cmd (cmd-prefix type :cmake)
-          final-args (cond-> (vec cmake-args)
-                       cache-file (as-> a (into ["-C" (str cache-file)] a))
-                       true (conj (str src-dir)))
-          build-cmd (if (= type :wasm)
-                      (concat (cmd-prefix type :make) ["-j" (str parallel-jobs)])
-                      ["cmake" "--build" "." "--parallel" (str parallel-jobs)])
-          install-cmd (if (= type :wasm)
-                        (concat (cmd-prefix type :make) ["install"])
-                        ["cmake" "--install" "."])]
-      (apply tasks/shell {:dir (str build-dir) :extra-env env}
-             (concat cmake-cmd final-args))
-      (apply tasks/shell {:dir (str build-dir) :extra-env env} build-cmd)
-      (when install?
-        (apply tasks/shell {:dir (str build-dir) :extra-env env} install-cmd)))))
+  (when clean? (fs/delete-tree build-dir))
+  (fs/create-dirs build-dir)
+  (let [jobs      (str (safe-parallel-jobs))
+        build-cmd (if (= type :wasm)
+                    (concat (cmd-prefix type :make) ["-j" jobs])
+                    ["cmake" "--build" "." "--parallel" jobs])]
+    (apply tasks/shell {:dir (str build-dir) :extra-env env}
+           (concat (cmd-prefix type :cmake) cmake-args [(str src-dir)]))
+    (apply tasks/shell {:dir (str build-dir) :extra-env env} build-cmd)))
 
 (def ^:private emscripten-incoming-module-js-api-default
   "A copy of the emscripten default INCOMING_MODULE_JS_API, from
@@ -472,6 +426,56 @@
   [coll]
   (str "[" (str/join "," (map (fn [s] (str "\"" s "\"")) coll)) "]"))
 
+(defn- emcc-link-cmd
+  [{:keys [output-name objects exported-functions exported-runtime-methods
+           pthreads? environment extra-flags module-name allow-memory-growth?
+           optimization maximum-memory force-filesystem?]
+    :or {module-name "Module"
+         allow-memory-growth? true
+         optimization "-O2"}}]
+  ;; worker-router runs each module in a Web Worker, so even a
+  ;; single-threaded build needs `worker`.
+  (let [environment (or environment (if pthreads? "web,worker,node" "web,worker,node,shell"))]
+    (vec (concat ["em++" "-o" output-name optimization
+                  "-fexceptions" "-fvisibility=default"
+                  "--target=wasm32-unknown-emscripten" "--no-entry"]
+                 (when pthreads? ["-pthread"])
+                 extra-flags
+                 (when force-filesystem? ["-s" "FORCE_FILESYSTEM=1"])
+                 (map str objects)
+                 [(str "-sEXPORTED_FUNCTIONS=" (js-string-list exported-functions))]
+                 (when (seq exported-runtime-methods)
+                   [(str "-sEXPORTED_RUNTIME_METHODS=" (js-string-list exported-runtime-methods))])
+                 ;; A GraalVM host gives the wasm bytes through wasmBinary.
+                 [(str "-sINCOMING_MODULE_JS_API="
+                       (js-string-list (conj emscripten-incoming-module-js-api-default
+                                             "wasmBinary")))]
+                 ["-s" (str "ENVIRONMENT=" environment)]
+                 (when allow-memory-growth? ["-s" "ALLOW_MEMORY_GROWTH=1"])
+                 ;; At 1 the resizable memory fails TextDecoder.decode in Chrome and Firefox,
+                 ;; so each string return throws. The emscripten default varies by version.
+                 (when allow-memory-growth? ["-s" "GROWABLE_ARRAYBUFFERS=0"])
+                 ["-s" "ALLOW_TABLE_GROWTH=1"]
+                 (when maximum-memory ["-s" (str "MAXIMUM_MEMORY=" maximum-memory)])
+                 ["-s" "MODULARIZE=1"
+                  "-s" "EXPORT_ES6=1"
+                  "-s" (str "EXPORT_NAME=\"" module-name "\"")]
+                 ;; Deep C++ code can overflow the 64K default, and that
+                 ;; corrupts dlmalloc with no error. Each pthread stack
+                 ;; also gets STACK_SIZE.
+                 ["-s" "STACK_SIZE=1048576"]
+                 (when pthreads? ["-s" "FETCH=1"])
+                 ;; One pool worker serves a rare pthread_create, as from
+                 ;; libcxx <thread>. DELAY_LOAD keeps 'loading-workers'
+                 ;; out of init, which would outlast the worker-router
+                 ;; bootstrap timeout. Disable such calls at the source too, as
+                 ;; with -DSQLITE_MAX_WORKER_THREADS=0.
+                 (when pthreads?
+                   ["-s" "USE_PTHREADS=1"
+                    "-s" "SHARED_MEMORY=1"
+                    "-s" "PTHREAD_POOL_SIZE=1"
+                    "-s" "PTHREAD_POOL_DELAY_LOAD=1"])))))
+
 (defn emcc-link
   "Link objects into a WASM module with em++. Writes the .js and .wasm into
   :build-dir. Throws on a non-zero exit.
@@ -484,127 +488,32 @@
 
   Optional keys:
     :exported-runtime-methods For example [\"ccall\" \"cwrap\"].
-    :pthreads?          -pthread, USE_PTHREADS and SHARED_MEMORY. Default
+    :pthreads?          -pthread, USE_PTHREADS, SHARED_MEMORY and FETCH, with
+                        one pool worker that loads on first use. Default
                         false.
-    :fetch?             -sFETCH=1. Default :pthreads?.
-    :stack-size         Bytes. Default 1048576.
-    :pthread-pool-size  Default 1. Only with :pthreads?.
-    :pthread-pool-delay-load? Default true. Only with :pthreads?.
     :environment        Default \"web,worker,node\", plus \",shell\" without
                         :pthreads?.
     :force-filesystem?  Keep the FS runtime, which emcc drops when no
                         compiled call site uses it. Set it when the consumer
                         stages files at run time. Default false.
-    :extra-flags        emcc flags, placed before :link-flags.
-    :link-flags         emcc flags, placed right before :objects. Use it
-                        where order against the objects matters, as with -L
-                        or --whole-archive.
+    :extra-flags        emcc flags, placed before the objects.
     :module-name        EXPORT_NAME. Default \"Module\".
     :allow-memory-growth? Default true.
-    :allow-table-growth?  Default true.
-    :maximum-memory     Bytes. Default 2 GiB with :pthreads?, else unset.
-                        SHARED_MEMORY otherwise caps the memory at its
-                        initial size.
-    :modularize?        MODULARIZE=1 with EXPORT_ES6=1. Default true.
+    :maximum-memory     Bytes. Default unset.
     :optimization       Default \"-O2\".
-    :incoming-module-js-api The Module.* properties the module reads.
-                        Default: the emscripten default plus \"wasmBinary\",
-                        through which a GraalVM host gives the wasm bytes.
-                        [] omits the flag."
-  [{:keys [build-dir output-name objects exported-functions
-           exported-runtime-methods pthreads? environment extra-flags
-           module-name allow-memory-growth? allow-table-growth?
-           modularize? optimization maximum-memory stack-size
-           force-filesystem? link-flags pthread-pool-size pthread-pool-delay-load?
-           incoming-module-js-api]
-    :or {exported-runtime-methods []
-         pthreads? false
-         extra-flags []
-         module-name "Module"
-         allow-memory-growth? true
-         allow-table-growth? true
-         modularize? true
-         optimization "-O2"
-         stack-size 1048576
-         force-filesystem? false
-         link-flags []
-         pthread-pool-size 1
-         pthread-pool-delay-load? true
-         incoming-module-js-api (conj emscripten-incoming-module-js-api-default
-                                      "wasmBinary")}
-    :as opts}]
-  ;; worker-router runs each module in a Web Worker, so even a
-  ;; single-threaded build needs `worker`.
-  (let [environment (or environment (if pthreads? "web,worker,node" "web,worker,node,shell"))
-        fetch? (if (contains? opts :fetch?) (boolean (:fetch? opts)) pthreads?)
-        maximum-memory (if (some? maximum-memory)
-                         maximum-memory
-                         (when pthreads? 2147483648))
-        exports-str (js-string-list exported-functions)
-        runtime-str (js-string-list exported-runtime-methods)
-        cmd (vec (concat ["em++" "-o" output-name optimization
-                          "-fexceptions" "-fvisibility=default"
-                          "--target=wasm32-unknown-emscripten" "--no-entry"]
-                         (when pthreads? ["-pthread"])
-                         extra-flags
-                         (when force-filesystem? ["-s" "FORCE_FILESYSTEM=1"])
-                         link-flags
-                         (map str objects)
-                         [(str "-sEXPORTED_FUNCTIONS=" exports-str)]
-                         (when (seq exported-runtime-methods)
-                           [(str "-sEXPORTED_RUNTIME_METHODS=" runtime-str)])
-                         (when (seq incoming-module-js-api)
-                           [(str "-sINCOMING_MODULE_JS_API="
-                                 (js-string-list incoming-module-js-api))])
-                         ["-s" (str "ENVIRONMENT=" environment)]
-                         (when allow-memory-growth? ["-s" "ALLOW_MEMORY_GROWTH=1"])
-                         ;; At 1 the memory is resizable, and Chrome and Firefox
-                         ;; (not node) reject TextDecoder.decode on it, so each
-                         ;; string return throws. Only emscripten 6.0.2 defaults
-                         ;; to 1, and a consumer can bring its own emscripten.
-                         (when allow-memory-growth? ["-s" "GROWABLE_ARRAYBUFFERS=0"])
-                         (when allow-table-growth? ["-s" "ALLOW_TABLE_GROWTH=1"])
-                         (when maximum-memory ["-s" (str "MAXIMUM_MEMORY=" maximum-memory)])
-                         (when modularize?
-                           ["-s" "MODULARIZE=1"
-                            "-s" "EXPORT_ES6=1"
-                            "-s" (str "EXPORT_NAME=\"" module-name "\"")])
-                         ;; Deep C++ code can overflow the 64K default, and that
-                         ;; corrupts dlmalloc with no error. Each pthread stack
-                         ;; also gets STACK_SIZE.
-                         ["-s" (str "STACK_SIZE=" stack-size)]
-                         (when fetch? ["-s" "FETCH=1"])
-                         ;; One pool worker serves a rare pthread_create, as from
-                         ;; libcxx <thread>. DELAY_LOAD keeps 'loading-workers'
-                         ;; out of init, which would outlast the worker-router
-                         ;; bootstrap timeout. Disable such calls at the source too, as
-                         ;; with -DSQLITE_MAX_WORKER_THREADS=0.
-                         (when pthreads?
-                           (concat
-                            ["-s" "USE_PTHREADS=1"
-                             "-s" "SHARED_MEMORY=1"
-                             "-s" (str "PTHREAD_POOL_SIZE=" pthread-pool-size)]
-                            (when pthread-pool-delay-load?
-                              ["-s" "PTHREAD_POOL_DELAY_LOAD=1"])))))]
-    (apply tasks/shell {:dir (str build-dir)} cmd)))
+
+  The module is an ES6 MODULARIZE factory with a 1 MiB stack and a growable
+  table."
+  [opts]
+  (apply tasks/shell {:dir (str (:build-dir opts))} (emcc-link-cmd opts)))
 
 (defn emcc-compile
   "Compile the C or C++ file :source to the object file :output with
-  `emcc -c`. Throws on a non-zero exit.
-
-  Optional keys:
-    :include-dirs  Each one becomes -I<dir>.
-    :optimization  Default \"-O3\".
-    :pthreads?     Adds -pthread. Match the link.
-    :extra-flags   More emcc flags."
-  [{:keys [source output include-dirs optimization pthreads? extra-flags]
-    :or {include-dirs [] optimization "-O3" pthreads? false extra-flags []}}]
-  (let [cmd (vec (concat ["emcc" "-c" (str source) "-o" (str output)
-                          optimization "-fexceptions"]
-                         (when pthreads? ["-pthread"])
-                         (mapcat (fn [d] ["-I" (str d)]) include-dirs)
-                         extra-flags))]
-    (apply tasks/shell cmd)))
+  `emcc -c -O3`, with -I for each of :include-dirs. Throws on a non-zero
+  exit."
+  [{:keys [source output include-dirs]}]
+  (apply tasks/shell "emcc" "-c" (str source) "-o" (str output) "-O3" "-fexceptions"
+         (mapcat (fn [d] ["-I" (str d)]) include-dirs)))
 
 (defn- leading-comment-block
   "The run of `;;` lines at the top of `source` as `//` lines, or nil."
@@ -625,7 +534,7 @@
         (spit (fs/file out-file) (str header body))))))
 
 (defn squint-compile!
-  "Compile the .cljc `file` to the .mjs beside it, in `dir`. Throws on a
+  "Compile the .cljc or .cljs `file` to the .mjs beside it, in `dir`. Throws on a
   non-zero exit. Copies the leading `;;` header onto the .mjs, since squint
   drops comments and the license header must ship.
 
@@ -639,7 +548,7 @@
                [binary "compile" file]
                ["npx" "squint" "compile" file])
          result (apply tasks/shell {:dir dir :continue true :out :string :err :string} cmd)
-         out    (str/replace file (re-pattern "\\.cljc$") ".mjs")]
+         out    (str/replace file (re-pattern "\\.clj[cs]$") ".mjs")]
      (when (seq (:out result)) (print (:out result)))
      (when (seq (:err result)) (print (:err result)))
      (when (not= 0 (:exit result))
@@ -648,57 +557,36 @@
      (carry-header! (fs/path dir file) (fs/path dir out))
      (println out "ready at" (str dir "/" out)))))
 
-(defn- clj-native-root
-  "The clj-native checkout root, or nil when clj-native loads from a jar."
-  []
-  (let [resource (io/resource "net/willcohen/native/build.clj")]
-    (when (= "file" (some-> resource .getProtocol))
-      ;; <root>/src/bb/net/willcohen/native/build.clj
-      (str (nth (iterate fs/parent (fs/path (.toURI resource))) 6)))))
-
 (defn stage-test-deps!
-  "Copy the clj-native test helper .mjs files into the test dist dir of a
-  consumer, for import by relative path. An npm symlink would load a second
-  squint-cljs instance, and deftest and run-tests would then see different
-  registries. Throws when a file is missing.
-
-  opts:
-    :dist        Default \"test/cljc/dist\".
-    :files       Default platform_state.mjs and test_runner.mjs.
-    :native-src  The dir with the built .mjs. Default: the loaded checkout.
-                 Required when clj-native loads from a jar.
+  "Copy platform_state.mjs and test_runner.mjs, the clj-native test
+  helpers, from the dir :native-src into :dist (default
+  \"test/cljc/dist\"), for import by relative path. An npm symlink would
+  load a second squint-cljs instance, and deftest and run-tests would then
+  see different registries. Throws when a file is missing.
 
   Each copy still imports squint-cljs by bare specifier, so the consumer's
   test node_modules must have it."
-  ([] (stage-test-deps! nil))
-  ([opts]
-   (let [dist (fs/path (or (:dist opts) "test/cljc/dist"))
-         native-src (or (some-> (:native-src opts) fs/path)
-                        (some-> (clj-native-root)
-                                (fs/path "src/cljc/net/willcohen/native"))
-                        (throw (ex-info (str "No clj-native checkout on the classpath; "
-                                             "pass :native-src (for example a "
-                                             "node_modules/ffi-wasm path)")
-                                        {})))
-         files (or (:files opts) ["platform_state.mjs" "test_runner.mjs"])]
-     (fs/create-dirs dist)
-     (doseq [n files]
-       (let [src (fs/path native-src n)]
-         (when-not (fs/exists? src)
-           (throw (ex-info (str "Missing clj-native artifact: " src
-                                " -- run `bb build:js` in the clj-native tree first")
-                           {:missing (str src)})))
-         (fs/copy src (fs/path dist n) {:replace-existing true})))
-     (println (str "Staged clj-native helpers into " dist
-                   ": " (str/join ", " files))))))
+  [{:keys [native-src dist] :or {dist "test/cljc/dist"}}]
+  (let [files ["platform_state.mjs" "test_runner.mjs"]]
+    (fs/create-dirs dist)
+    (doseq [n files]
+      (let [src (fs/path (str native-src) n)]
+        (when-not (fs/exists? src)
+          (throw (ex-info (str "Missing clj-native artifact: " src
+                               ". Install ffi-wasm where :native-src points.")
+                          {:missing (str src)})))
+        (fs/copy src (fs/path dist n) {:replace-existing true})))
+    (println (str "Staged clj-native helpers into " dist ": " (str/join ", " files)))))
 
-(def npm-package-name
+(def ^:private npm-package-name
   "The npm package name. check-exports-sync! pins it to package.json."
   "ffi-wasm")
 
 (def shipped-module-files
   "Each compiled .mjs that the npm tarball ships. check-exports-sync! pins
   it to package.json."
+  ;; macros.mjs is dead code in a consumer bundle, but esbuild needs it to
+  ;; resolve the import.
   ["dispatch.mjs" "fetch_worker.mjs" "handler_env.mjs" "handler_fs.mjs"
    "handler_heap.mjs" "handler_paths.mjs" "handler_runtime.mjs"
    "http_bridge.mjs" "macros.mjs" "platform_state.mjs" "pool.mjs"
@@ -721,23 +609,20 @@
 
 (defn rewrite-import-specifiers!
   "Rewrite the import specifiers in the file at `target` by `rewrites`, a
-  map of specifier to replacement. Covers `from \"x\"`, `import(\"x\")` and
+  map of specifier to replacement. Covers `from \"x\"` and
   `import.meta.resolve(\"x\")`, with or without a space before the quote,
   and keeps each quote character. Returns true when it wrote the file."
   [target rewrites]
-  (let [escape-re (fn [s] (str/replace s (re-pattern "[.*+?^${}()|\\[\\]\\\\]") "\\\\$0"))
-        content (slurp (fs/file target))
+  (let [content (slurp (fs/file target))
         rewritten
         (reduce
          (fn [s [from to]]
-           (let [esc (escape-re from)
+           (let [esc (java.util.regex.Pattern/quote from)
                  qto (java.util.regex.Matcher/quoteReplacement to)
                  static-re (re-pattern (str "from\\s*([\"'])" esc "\\1"))
-                 dynamic-re (re-pattern (str "import\\(\\s*([\"'])" esc "\\1\\s*\\)"))
                  resolve-re (re-pattern (str "import\\.meta\\.resolve\\(\\s*([\"'])" esc "\\1\\s*\\)"))]
              (-> s
                  (str/replace static-re (str "from $1" qto "$1"))
-                 (str/replace dynamic-re (str "import($1" qto "$1)"))
                  (str/replace resolve-re (str "import.meta.resolve($1" qto "$1)")))))
          content
          rewrites)]
@@ -745,18 +630,12 @@
       (spit (fs/file target) rewritten)
       true)))
 
-(def consumer-squint-edn
+(def ^:private consumer-squint-edn
   "The squint.edn that ensure-consumer-squint-edn! writes into a consumer.
   It lives here because its path depends on the npm name and layout of this
   package."
-  (str ";; GENERATED by clj-native's ensure-consumer-squint-edn! from the\n"
-       ";; consumer's own `bb squint`; edit it there, not here.\n"
-       ";; Adds the npm-installed ffi-wasm source tree to squint's :paths so\n"
-       ";; CLJS macros can :require [net.willcohen.native.macros ...] and pull\n"
-       ";; the cross-platform helpers (c-name->clj-name, camel-name->clj-name)\n"
-       ";; instead of reimplementing them locally. ffi-wasm's package.json\n"
-       ";; `files` list ships macros.cljc, so the path resolves for a consumer\n"
-       ";; of the packed tarball as well as for an npm-linked checkout.\n"
+  (str ";; Written by net.willcohen.native.build/ensure-consumer-squint-edn!.\n"
+       ";; The ffi-wasm path lets a CLJS macro require net.willcohen.native.macros.\n"
        "{:paths [\".\" \"node_modules/ffi-wasm/src/cljc\"]}\n"))
 
 (defn ensure-consumer-squint-edn!

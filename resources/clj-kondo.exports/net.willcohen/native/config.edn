@@ -4,9 +4,7 @@
 ;;   clj-kondo --lint "$(clojure -Spath)" --copy-configs --skip-lint
 ;; then names the copied directory in its own :config-paths, which also puts
 ;; hooks.native.generated on the hook classpath.
-{;; The exclusions exist for squint host escapes (js/, js*) in .cljc :cljs
- ;; branches, which clj-kondo reads with ClojureScript rules that do not
- ;; model them. Shipping the exclusions here keeps one copy instead of one
- ;; per squint consumer; a non-squint consumer imports them without effect.
+{;; clj-kondo's ClojureScript rules do not model squint host escapes (js/, js*)
+ ;; in .cljc :cljs branches. A non-squint consumer imports these without effect.
  :linters {:unresolved-namespace {:exclude [js]}
            :unresolved-symbol {:exclude [js*]}}}

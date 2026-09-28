@@ -52,4 +52,5 @@
                :target-dir class-dir
                :ignores jar-ignores})
   (b/jar {:class-dir class-dir
-          :jar-file jar-file}))
+          :jar-file jar-file})
+  (println "Jar built:" jar-file))

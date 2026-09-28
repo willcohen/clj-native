@@ -109,6 +109,7 @@
           (.setRequestHeader xhr "x-from-xhr" "1")
           (.send xhr)
           (is (= 200 (.-status xhr)))
+          (is (thrown? js/Error (.open (new js/globalThis.XMLHttpRequest) "GET" "/" true)))
           ;; The polyfill leaves .responseText empty, and `or` treats "" as
           ;; truthy, so test the length.
           (let [rt (.-responseText xhr)
@@ -237,28 +238,6 @@
             res (sync-fetch (str (.-base fixture) "/slow?chunks=6&delay=300"))]
         (is (= 200 (.-status res)) "a steady transfer longer than requestTimeoutMs still completes")
         (is (= 60 (.-length (.-bodyBytes res))) "full body received, not truncated by an abort"))
-      (finally
-        (await (shutdown))
-        (await (stop-fixture fixture))))))
-
-(deftest ^:async a-caller-timeout-does-not-mispair-the-next-request-with-a-stale-response
-  ;; The caller abandons this 6.5 s transfer at its 5.5 s cap, and the worker's
-  ;; idle timer never fires. The stale response must not answer the next request.
-  (let [fixture (await (start-fixture))]
-    (try
-      (let [sync-fetch (await (createSyncFetch #js {:workerUrl worker-url
-                                                    :requestTimeoutMs 500}))
-            abandoned (sync-fetch (str (.-base fixture) "/slow?chunks=26&delay=250"))]
-        (is (= 0 (.-status abandoned)) "the caller gives up on the over-cap transfer")
-        ;; Issued while the worker is still streaming the abandoned request.
-        (let [res (sync-fetch (str (.-base fixture) "/plain"))
-              body (decode (.-bodyBytes res))]
-          (is (= 200 (.-status res)) "the follow-up request completes")
-          (is (not (.startsWith body "y"))
-              "the follow-up did not receive the abandoned /slow payload")
-          (let [echoed (js/JSON.parse body)]
-            (is (= "/plain" (.-url echoed))
-                "the follow-up received its own response, not a stale one"))))
       (finally
         (await (shutdown))
         (await (stop-fixture fixture))))))

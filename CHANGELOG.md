@@ -14,13 +14,17 @@
 ### Changed
 
 - Clojure 1.12.6, dtype-next 11.026, GraalVM 25.3.4.1, Node.js 22 or later.
-- GraalVM reads a NULL string as nil, and a ccall that throws makes `call!`
-  throw, as on FFI.
+- `null-ptr?` takes nil or 0 as NULL. GraalVM reads a NULL string as nil,
+  and a ccall that throws makes `call!` throw, as on FFI.
+- `make-native-fn-resolver` throws for a missing fn. Pool options are
+  kebab-case only. `write-handler!` needs `:fingerprint-fields`, and
+  `makeHandler` a `fingerprint`.
 
 ### Removed
 
 - The cross shells and `cross-compile-in-container`. zig builds each lib.
-- The `decorate` option of `createSyncFetch` in a browser.
+- Unused options, arities and dead exports, `heapf64`, `getLogConfig` and
+  `register-cmd-args!` among them.
 
 ### Fixed
 

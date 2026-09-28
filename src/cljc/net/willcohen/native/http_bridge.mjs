@@ -26,8 +26,7 @@
 //   - A response that the caller gave up on never answers the next request.
 //
 // The auth decorator runs in the fetch worker, never in the blocked caller.
-// installXhrPolyfill sends the synchronous path of a global XHR through
-// syncFetch.
+// installXhrPolyfill sends a global synchronous XHR through syncFetch.
 
 import { isNode } from './handler_env.mjs';
 
@@ -41,12 +40,6 @@ const WAIT_SLACK_MS = 5000;
 const WORKER_READY_TIMEOUT_MS = 10000;
 // metaBuffer[3] bit 0: the response did not fit dataBuffer.
 const OVERFLOW_FLAG = 1;
-// Skips 0, which marks no pending request.
-function nextGeneration(state) {
-  const next = (state.generation + 1) | 0;
-  state.generation = next === 0 ? 1 : next;
-  return state.generation;
-}
 
 // One fetch worker per thread, shared and reference-counted, because one pool
 // worker can load the handlers of several libraries. Each createSyncFetch on
@@ -93,6 +86,7 @@ async function startWorker(workerUrl, decorateUrl, opts) {
   const dataSAB = new SharedArrayBuffer(dataBufferSize);
 
   const worker = new Worker(workerUrl);
+  // Before the ready listener: adding it refs the port again until init ends.
   worker.unref();
   await waitForWorkerReady(worker, {
     cmd: 'init',
@@ -110,7 +104,8 @@ async function startWorker(workerUrl, decorateUrl, opts) {
     meta: new Int32Array(metaSAB),
     data: new Uint8Array(dataSAB),
     view: new DataView(dataSAB),
-    waitTimeoutMs: requestTimeoutMs + WAIT_SLACK_MS,
+    // The slack is at most requestTimeoutMs, so a short timeout fails fast.
+    waitTimeoutMs: requestTimeoutMs + Math.min(WAIT_SLACK_MS, requestTimeoutMs),
     generation: 0,
     dead: false,
   };
@@ -129,38 +124,28 @@ async function startWorker(workerUrl, decorateUrl, opts) {
 // A rejection terminates the worker, so a later createSyncFetch starts clean.
 function waitForWorkerReady(worker, initMsg) {
   return new Promise((resolve, reject) => {
-    let settled = false;
     const timer = setTimeout(
-      () => finishReject(new Error(
+      () => finish(new Error(
         `createSyncFetch: fetch worker did not become ready within ${WORKER_READY_TIMEOUT_MS}ms`)),
       WORKER_READY_TIMEOUT_MS);
     timer.unref?.();
     const onMessage = (msg) => {
-      if (msg?.status === 'ready') finishResolve();
+      if (msg?.status === 'ready') finish();
       else if (msg?.status === 'error') {
-        finishReject(new Error(`createSyncFetch: fetch worker failed to initialize: ${msg.error}`));
+        finish(new Error(`createSyncFetch: fetch worker failed to initialize: ${msg.error}`));
       }
     };
     const onError = (err) =>
-      finishReject(new Error(`createSyncFetch: fetch worker error during init: ${err.message}`));
+      finish(new Error(`createSyncFetch: fetch worker error during init: ${err.message}`));
     const onExit = (code) =>
-      finishReject(new Error(`createSyncFetch: fetch worker exited (code ${code}) during init`));
-    function cleanup() {
+      finish(new Error(`createSyncFetch: fetch worker exited (code ${code}) during init`));
+    // Removes every listener, so the first outcome is the only one.
+    function finish(err) {
       clearTimeout(timer);
       worker.off('message', onMessage);
       worker.off('error', onError);
       worker.off('exit', onExit);
-    }
-    function finishResolve() {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve();
-    }
-    function finishReject(err) {
-      if (settled) return;
-      settled = true;
-      cleanup();
+      if (!err) return resolve();
       worker.terminate();
       reject(err);
     }
@@ -204,7 +189,9 @@ function nodeSyncFetch(state, url, reqOpts) {
   view.setInt32(0, jsonBytes.length, true);
   data.set(jsonBytes, 4);
 
-  const generation = nextGeneration(state);
+  // Skips 0, which marks no pending request.
+  state.generation = (state.generation % 0x7fffffff) + 1;
+  const { generation } = state;
   Atomics.store(control, 0, generation);
   Atomics.notify(control, 0, 1);
 
@@ -262,108 +249,72 @@ export async function createSyncFetch(opts = {}) {
   return (url, reqOpts = {}) => browserSyncFetch(url, reqOpts);
 }
 
-function makeXhrClass(syncFetch, XHR2) {
+// emscripten's lazy files and FETCH open each XHR synchronously, so the
+// polyfill has no async path.
+function makeXhrClass(syncFetch) {
   return class XMLHttpRequest {
     constructor() {
-      this._xhr2 = null;  // Only the async path needs xhr2.
-      this._async = true;
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseText = '';
+      this.responseType = '';
+      this.responseURL = '';
       this._method = 'GET';
       this._url = null;
       this._headers = {};
-      this._syncResponseHeaders = null;
-      this._status = 0;
-
-      ['readyState', 'status', 'statusText', 'response', 'responseText', 'responseType',
-        'responseURL', 'onreadystatechange', 'onload', 'onerror', 'onprogress'].forEach((prop) => {
-        Object.defineProperty(this, prop, {
-          get: () => (this._async && this._xhr2 ? this._xhr2[prop] : this['_' + prop]),
-          set: (v) => {
-            if (this._async && this._xhr2) this._xhr2[prop] = v;
-            else this['_' + prop] = v;
-          },
-        });
-      });
-    }
-
-    _ensureXhr2() {
-      if (this._xhr2) return this._xhr2;
-      if (!XHR2) throw new Error('async XMLHttpRequest requires the optional xhr2 package');
-      this._xhr2 = new XHR2();
-      return this._xhr2;
+      this._responseHeaders = null;
     }
 
     open(method, url, async = true) {
+      if (async) throw new Error('http-bridge: the XMLHttpRequest polyfill is synchronous only');
       this._method = method;
       this._url = url;
-      this._async = async;
-      if (async) this._ensureXhr2().open(method, url, async);
-      else this._readyState = 1;
+      this.readyState = 1;
     }
 
     setRequestHeader(name, value) {
       this._headers[name] = value;
-      if (this._async) this._ensureXhr2().setRequestHeader(name, value);
     }
 
     getResponseHeader(name) {
-      if (this._async) return this._ensureXhr2().getResponseHeader(name);
-      return this._syncResponseHeaders?.[name.toLowerCase()] || null;
+      return this._responseHeaders?.[name.toLowerCase()] || null;
     }
 
     getAllResponseHeaders() {
-      if (this._async) return this._ensureXhr2().getAllResponseHeaders();
-      if (!this._syncResponseHeaders) return '';
-      return Object.entries(this._syncResponseHeaders)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join('\r\n') + '\r\n';
+      if (!this._responseHeaders) return '';
+      return Object.entries(this._responseHeaders).map(([k, v]) => `${k}: ${v}\r\n`).join('');
     }
 
     send(body = null) {
-      if (this._async) {
-        this._ensureXhr2().send(body);
-        return;
-      }
       try {
         const response = syncFetch(this._url, { method: this._method, headers: this._headers, body });
-        this._status = response.status;
-        this._statusText = response.status >= 200 && response.status < 300 ? 'OK' : 'Error';
-        this._responseURL = this._url;
-        this._readyState = 4;
-        this._syncResponseHeaders = response.headers || {};
-        const arrayBuffer = new ArrayBuffer(response.bodyBytes.byteLength);
-        new Uint8Array(arrayBuffer).set(response.bodyBytes);
-        this._response = arrayBuffer;
-        this._responseText = '';
-        if (this._onreadystatechange) this._onreadystatechange();
-        if (this._onload) this._onload();
+        this.status = response.status;
+        this.statusText = response.status >= 200 && response.status < 300 ? 'OK' : 'Error';
+        this.responseURL = this._url;
+        this.readyState = 4;
+        this._responseHeaders = response.headers;
+        this.response = response.bodyBytes.slice().buffer;
+        this.onreadystatechange?.();
+        this.onload?.();
       } catch (err) {
-        this._status = 0;
-        this._readyState = 4;
-        if (this._onerror) this._onerror(err);
-        if (this._onreadystatechange) this._onreadystatechange();
+        this.status = 0;
+        this.readyState = 4;
+        this.onerror?.(err);
+        this.onreadystatechange?.();
       }
     }
 
     abort() {
-      if (this._async && this._xhr2) this._xhr2.abort();
-      else this._readyState = 0;
+      this.readyState = 0;
     }
   };
 }
 
 export async function installXhrPolyfill(opts = {}) {
-  const { syncFetch } = opts;
   if (!isNode || typeof globalThis.XMLHttpRequest !== 'undefined') return;
-  let XHR2 = null;
-  try {
-    const { createRequire } = await import('module');
-    const require = createRequire(import.meta.url);
-    XHR2 = require('xhr2');
-  } catch (_) {
-    // Without xhr2 there is no async XHR. The synchronous path, which wasm
-    // libraries use, still works.
-  }
-  globalThis.XMLHttpRequest = makeXhrClass(syncFetch, XHR2);
+  globalThis.XMLHttpRequest = makeXhrClass(opts.syncFetch);
 }
 
 // Releases one consumer reference and terminates the worker at the last one.
@@ -379,17 +330,11 @@ export async function shutdown() {
   return true;
 }
 
-// Stock wirings for a handler whose init called createSyncFetch. Each releases
-// one reference. Put shutdownMethod in the handler methods as `shutdown`, for a
-// client that closes the transport. Export moduleDestroy as the handler
-// module's `destroy`, which worker-router calls once per worker at pool
-// termination. A missing call does not hang exit, because terminate() reaps
-// the nested fetch worker.
+// Stock releases for a handler whose init called createSyncFetch. Export
+// moduleDestroy as the module's `destroy`; worker-router calls it once per worker.
 export const shutdownMethod = async () => {
   await shutdown();
   return { ok: true };
 };
 
-export const moduleDestroy = async () => {
-  await shutdown();
-};
+export const moduleDestroy = shutdown;

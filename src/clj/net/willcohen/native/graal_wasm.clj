@@ -7,7 +7,7 @@
 (ns net.willcohen.native.graal-wasm
   "The JVM wasm backend on GraalVM polyglot, which dispatch calls as the
    :graal impl: the shared Engine and Contexts, the WasmContext registry,
-   the Pointerlike protocol and the heap utilities.
+   TrackablePointer and the heap utilities.
 
    Each library calls create-wasm-context! at boot, then
    bootstrap-graal-module! to load its module. Heap calls use the module
@@ -85,12 +85,12 @@
 
 ;; The polyglot API may clean up a Context whose creator instance is
 ;; collected before close.
-(defonce ^:private creator-context-pin (atom nil))
+(defonce ^:private builder-context (atom nil))
 
 (defonce ^:private context-state
   (delay
     (let [c (build-context)]
-      (reset! creator-context-pin c)
+      (reset! builder-context c)
      ;; The builder returns a different wrapper than Value.getContext does.
      ;; Use the getContext one, so (context) and the module locks share one
      ;; monitor.
@@ -217,7 +217,7 @@
                               (into-array Object args))
                     as))))
 
-(defn graal-execute
+(defn- graal-execute
   "module-execute on the current module."
   ([path args] (graal-execute path args :value))
   ([path args as]
@@ -232,13 +232,12 @@
      (coerce-result (.execute f (into-array Object args)) as))))
 
 (defn value->int
-  "Read `v` as an int. For a number that is not an address; use
-   address-as-int for addresses."
+  "(.asInt v) with the Value hint, so a caller needs no import."
   [^Value v]
   (.asInt v))
 
 (defn value->long
-  "Read `v` as a long."
+  "(.asLong v) with the Value hint, so a caller needs no import."
   [^Value v]
   (.asLong v))
 
@@ -277,18 +276,13 @@
           (.deleteOnExit f)))
       f)))
 
-(defn- build-js-module-source
-  "An ESM Source for the JS module at `url`."
-  [^java.net.URL url]
-  (-> (Source/newBuilder "js" (module-file url))
-      (.mimeType "application/javascript+module")
-      .build))
-
 (defn- eval-module!
-  "Evaluate the ESM module at `url` in `pctx`."
+  "Evaluate the ESM module at `url` in `pctx`. The caller holds the monitor
+   of `pctx`."
   ^Value [^Context pctx url]
-  (locking pctx
-    (.eval pctx ^Source (build-js-module-source url))))
+  (.eval pctx (-> (Source/newBuilder "js" (module-file url))
+                  (.mimeType "application/javascript+module")
+                  .build)))
 
 (defn- run-loader!
   "Call the load or initialize export of `loader`. The caller holds the
@@ -387,25 +381,14 @@
                 (log/info "Module ready for" (:library-key ctx))
                 m)))))))
 
-(defn eval-js
-  "Evaluate JS `source` under the monitor of `ctx`, by default the shared
-   Context."
-  ([source]
-   (eval-js source "src.js"))
-  ([source js-name]
-   (eval-js (context) source js-name))
-  ([^Context ctx ^String source ^String js-name]
-   (locking ctx
-     (.eval ctx
-            (.build
-             (Source/newBuilder "js" ^String source js-name))))))
-
 (defn module-eval-js
   "Evaluate JS `source` in the Context that owns `module`, under its
    monitor. A Value works only in the Context that built it, so evaluate a
    helper per Context instead of sharing one."
   [^Value module ^String source ^String js-name]
-  (eval-js (.getContext module) source js-name))
+  (let [ctx (.getContext module)]
+    (locking ctx
+      (.eval ctx (.build (Source/newBuilder "js" source js-name))))))
 
 (defn- byte-array-proxy
   "Read-only, no-copy ProxyArray over `b` that reads each byte as 0 to
@@ -419,7 +402,7 @@
 
 ;; Evaluated per call in the target Context. The Engine source cache makes
 ;; that cheap.
-(def ^:private bytes-widener-source
+(def ^:private uint8-array-copy-source
   (.build (Source/newBuilder "js"
                              "(src) => { const n = src.length; const a = new Uint8Array(n); for (let i = 0; i < n; i++) a[i] = src[i]; return a; }"
                              "clj-native-bytes.js")))
@@ -431,7 +414,7 @@
   ([^bytes b] (js-bytes (context) b))
   ([^Context ctx ^bytes b]
    (locking ctx
-     (.execute ^Value (.eval ctx bytes-widener-source)
+     (.execute ^Value (.eval ctx uint8-array-copy-source)
                (into-array Object [(byte-array-proxy b)])))))
 
 (defn js-bytes-map
@@ -455,19 +438,17 @@
       n)))
 
 (defn heap-write-doubles!
-  "Copy `xs` into the HEAPF64 of `module`, by default the current module,
-   at 8-byte-aligned wasm address `ptr`. Returns the count. It reads
-   HEAPF64 itself, as heap-write-bytes! does."
-  (^long [ptr xs]
-   (heap-write-doubles! (current-module) ptr xs))
-  (^long [^Value module ^long ptr ^doubles xs]
-   (with-module-lock module
-     (let [heapf64 (.getMember module "HEAPF64")
-           b (bit-shift-right ptr 3)
-           n (alength xs)]
-       (dotimes [i n]
-         (.setArrayElement heapf64 (+ b i) (aget xs i)))
-       n))))
+  "Copy `xs` into the HEAPF64 of the current module at 8-byte-aligned wasm
+   address `ptr`. Returns the count. It reads HEAPF64 itself, as
+   heap-write-bytes! does."
+  ^long [^long ptr ^doubles xs]
+  (with-current-module [module]
+    (let [heapf64 (.getMember module "HEAPF64")
+          b (bit-shift-right ptr 3)
+          n (alength xs)]
+      (dotimes [i n]
+        (.setArrayElement heapf64 (+ b i) (aget xs i)))
+      n)))
 
 (defn utf8->string
   "Read the NUL-terminated UTF-8 string at wasm address `ptr`, through the
@@ -507,95 +488,49 @@
       (doseq [[k v] m]
         (.putMember bindings (name k) v)))))
 
-(defprotocol Pointerlike
-  (address-as-int [this])
-  (address-as-string [this])
-  (address-as-polyglot-value [this])
-  (address-as-trackable-pointer [this])
-  (get-value [this type])
-  (pointer->string [this])
-  (string-array-pointer->strs [this]))
+(defrecord TrackablePointer [address])
 
-(defrecord TrackablePointer [address]
-  Pointerlike
-  (address-as-int [this] (address-as-int (:address this)))
-  (address-as-string [this] (address-as-string (:address this)))
-  (address-as-polyglot-value [this] (address-as-polyglot-value (:address this)))
-  (address-as-trackable-pointer [this] this)
-  (get-value [this type] (get-value (:address this) type))
-  (pointer->string [this] (pointer->string (:address this)))
-  (string-array-pointer->strs [this] (string-array-pointer->strs (:address this))))
+(defn address-as-int
+  "The address of `p`, a TrackablePointer, a polyglot Value or a number, as
+   an int."
+  [p]
+  (cond
+    (instance? TrackablePointer p) (address-as-int (:address p))
+    (instance? Value p)            (.asInt ^Value p)
+    :else                          (int p)))
 
-(def ^:dynamic *runtime-log-level*
-  "Optional log level (:debug, :info) for verbose Pointerlike tracing."
-  nil)
+(defn address-as-trackable-pointer
+  "`p` as a TrackablePointer. Throws when `p` is a polyglot Value that is
+   not a number."
+  [p]
+  (if (instance? TrackablePointer p) p (->TrackablePointer (address-as-int p))))
 
-(extend-protocol Pointerlike
-  org.graalvm.polyglot.Value
-  (address-as-int [this] (.asInt this))
-  (address-as-string [this] (.asString this))
-  (address-as-polyglot-value [this] this)
-  (address-as-trackable-pointer [this]
-    (let [addr (if (.isNumber this) (.asLong this) 0)]
-      (when (not (.isNumber this))
-        (log/error "Polyglot Value is not a number when creating TrackablePointer:" this))
-      (->TrackablePointer addr)))
-  (get-value [this type]
-    (graal-execute "getValue" [this type]))
-  (pointer->string [this]
-    (when-not (zero? (address-as-int this))
-      (utf8->string (current-module) this)))
-  (string-array-pointer->strs [this]
-    (loop [addr this
-           result-strings []
-           idx 0]
-      (when *runtime-log-level*
-        (log/log *runtime-log-level* (str "Graal: string-array-pointer->strs - Loop iteration " idx ", reading from address: " (address-as-int addr))))
-      (let [string-addr-polyglot (if (zero? (address-as-int addr)) 0 (get-value (address-as-int addr) "*"))
-            string-addr-int (address-as-int string-addr-polyglot)]
-        (when *runtime-log-level*
-          (log/log *runtime-log-level* (str "Graal: string-array-pointer->strs - Pointer at " (address-as-int addr) " points to string at: " string-addr-int)))
-        (if (zero? string-addr-int)
-          (do (when *runtime-log-level*
-                (log/log *runtime-log-level* (str "Graal: string-array-pointer->strs - Found null terminator, returning: " result-strings)))
-              result-strings)
-          (let [current-str (pointer->string string-addr-polyglot)]
-            (when *runtime-log-level*
-              (log/log *runtime-log-level* (str "Graal: string-array-pointer->strs - Read string: \"" current-str "\"")))
-            (recur (address-as-polyglot-value (+ (address-as-int addr) 4))
-                   (conj result-strings current-str)
-                   (inc idx))))))))
+(defn get-value
+  "The value of emscripten `type`, such as \"i32\" or \"*\", at address `p`
+   of the current module."
+  [p type]
+  (graal-execute "getValue" [(address-as-int p) type]))
 
-;; Wrap in the current module's Context: a Value from the default Context
-;; throws on a pooled Context.
-(def ^:private scalar-address-impl
-  {:address-as-polyglot-value (fn [this]
-                                (with-current-module [m]
-                                  (.asValue (.getContext m) this)))
-   :address-as-trackable-pointer (fn [this] (->TrackablePointer (address-as-int this)))
-   :get-value (fn [this type] (get-value (address-as-polyglot-value this) type))
-   :pointer->string (fn [this] (pointer->string (address-as-polyglot-value this)))
-   :string-array-pointer->strs (fn [this]
-                                 (string-array-pointer->strs
-                                  (address-as-polyglot-value this)))})
+(defn pointer->string
+  "The NUL-terminated UTF-8 string at address `p` of the current module, or
+   nil for NULL."
+  [p]
+  (let [a (address-as-int p)]
+    (when-not (zero? a)
+      (utf8->string (current-module) a))))
 
-(extend java.lang.String
-  Pointerlike
-  (assoc scalar-address-impl
-         :address-as-int (fn [this] (Integer/parseInt this))
-         :address-as-string (fn [this] this)))
-
-(extend java.lang.Long
-  Pointerlike
-  (assoc scalar-address-impl
-         :address-as-int (fn [this] (int this))
-         :address-as-string (fn [this] (str this))))
-
-(extend java.lang.Integer
-  Pointerlike
-  (assoc scalar-address-impl
-         :address-as-int (fn [this] this)
-         :address-as-string (fn [this] (str this))))
+(defn string-array-pointer->strs
+  "The strings of the NULL-terminated char** at address `p` of the current
+   module, or [] for NULL."
+  [p]
+  (with-current-module [m]
+    (let [get-value (.getMember m "getValue")
+          utf8      (.getMember m "UTF8ToString")]
+      (loop [slot (long (address-as-int p)), acc []]
+        (let [a (if (zero? slot) 0 (.asInt (.execute get-value (object-array [slot "*"]))))]
+          (if (zero? a)
+            acc
+            (recur (+ slot 4) (conj acc (.asString (.execute utf8 (object-array [a])))))))))))
 
 (defn malloc
   "Allocate `b` bytes on the wasm heap. Returns a TrackablePointer that the
@@ -608,23 +543,6 @@
     (when (and (pos? b) (zero? (address-as-int p)))
       (throw (ex-info (str "malloc of " b " bytes failed") {:size b})))
     p))
-
-(defn heapf64
-  "A HEAPF64 subarray of `n` doubles from `offset`, in 8-byte units."
-  [offset n]
-  (with-current-module [m]
-    (.invokeMember (.getMember ^Value m "HEAPF64") "subarray"
-                   (object-array [offset (+ offset n)]))))
-
-(defn allocate-string-on-heap
-  "Allocate a UTF-8 copy of `s` on the wasm heap. Returns a
-   TrackablePointer, or nil for nil."
-  [^String s]
-  (when s
-    (let [len (+ 1 (alength (.getBytes s "UTF-8")))
-          addr (malloc len)]
-      (graal-execute "stringToUTF8" [s (address-as-polyglot-value addr) len])
-      addr)))
 
 (defn- write-pointer-slots!
   "Write the address of each of `ptrs` into 4-byte slots from `base`.
@@ -641,11 +559,11 @@
 (defn string-list-to-native-array
   "Allocate a NULL-terminated char** of `s-list` on the wasm heap, in one
    block: the pointer slots, then the strings. An empty list gives the NULL
-   slot alone, as on FFI. Returns its address as a Value, which the caller
-   frees with free-on-heap. Throws on a nil element."
+   slot alone, as on FFI. Returns a TrackablePointer that the caller frees
+   with free-on-heap. Throws on a nil element."
   [s-list]
   (when (some nil? s-list)
-    (throw (ex-info "string-list-to-native-array: nil element in s-list (char** cannot represent a null string); validate before calling"
+    (throw (ex-info "string-list-to-native-array: s-list holds nil, which a char** cannot hold"
                     {:s-list s-list})))
   (let [sizes (mapv #(inc (alength (.getBytes ^String % "UTF-8"))) s-list)
         slots (* 4 (inc (count s-list)))
@@ -655,14 +573,14 @@
       (let [to-utf8 (.getMember m "stringToUTF8")]
         (dotimes [i (count s-list)]
           (.execute to-utf8 (object-array [(nth s-list i) (nth addrs i) (nth sizes i)]))))
-      (write-pointer-slots! m base (conj addrs 0))
-      (.asValue (.getContext m) base))))
+      (write-pointer-slots! m base (conj addrs 0)))
+    (->TrackablePointer base)))
 
 (defn free-on-heap
   "Free wasm heap pointer `ptr`. A nil `ptr` does nothing."
   [ptr]
   (when ptr
-    (graal-execute "_free" [(address-as-polyglot-value ptr)])))
+    (graal-execute "_free" [(address-as-int ptr)])))
 
 (defn pointers->wasm-array
   "Pack the addresses of `ptrs` into a new table of 4-byte slots on the
@@ -677,31 +595,23 @@
 (defn read-heap-array
   "Read `n` elements at `ptr` from the `heap-type` view (:u8 :i8 :u16 :i16
    :u32 :i32 :f32 :f64) of the current module, into a Java primitive array
-   of the same width. Unsigned views keep the bit pattern."
+   of the same width. An unsigned type reads the signed view, which has the
+   same bits."
   [ptr n heap-type]
   (with-current-module [module]
     (let [base (long (address-as-int ptr))]
       ;; Written out: a table loses the primitive-array types that
       ;; *warn-on-reflection* needs.
       (case heap-type
-        :u8  (let [h ^Value (.getMember module "HEAPU8") out (byte-array n)]
-               (dotimes [i n] (aset out i (unchecked-byte (.asInt (.getArrayElement h (+ base i))))))
-               out)
-        :i8  (let [h ^Value (.getMember module "HEAP8") out (byte-array n)]
-               (dotimes [i n] (aset out i (unchecked-byte (.asInt (.getArrayElement h (+ base i))))))
-               out)
-        :u16 (let [h ^Value (.getMember module "HEAPU16") b (bit-shift-right base 1) out (short-array n)]
-               (dotimes [i n] (aset out i (unchecked-short (.asInt (.getArrayElement h (+ b i))))))
-               out)
-        :i16 (let [h ^Value (.getMember module "HEAP16") b (bit-shift-right base 1) out (short-array n)]
-               (dotimes [i n] (aset out i (unchecked-short (.asInt (.getArrayElement h (+ b i))))))
-               out)
-        :u32 (let [h ^Value (.getMember module "HEAPU32") b (bit-shift-right base 2) out (int-array n)]
-               (dotimes [i n] (aset out i (unchecked-int (.asLong (.getArrayElement h (+ b i))))))
-               out)
-        :i32 (let [h ^Value (.getMember module "HEAP32") b (bit-shift-right base 2) out (int-array n)]
-               (dotimes [i n] (aset out i (.asInt (.getArrayElement h (+ b i)))))
-               out)
+        (:u8 :i8)   (let [h ^Value (.getMember module "HEAP8") out (byte-array n)]
+                      (dotimes [i n] (aset out i (unchecked-byte (.asInt (.getArrayElement h (+ base i))))))
+                      out)
+        (:u16 :i16) (let [h ^Value (.getMember module "HEAP16") b (bit-shift-right base 1) out (short-array n)]
+                      (dotimes [i n] (aset out i (unchecked-short (.asInt (.getArrayElement h (+ b i))))))
+                      out)
+        (:u32 :i32) (let [h ^Value (.getMember module "HEAP32") b (bit-shift-right base 2) out (int-array n)]
+                      (dotimes [i n] (aset out i (.asInt (.getArrayElement h (+ b i)))))
+                      out)
         :f32 (let [h ^Value (.getMember module "HEAPF32") b (bit-shift-right base 2) out (float-array n)]
                (dotimes [i n] (aset out i (float (.asDouble (.getArrayElement h (+ b i))))))
                out)

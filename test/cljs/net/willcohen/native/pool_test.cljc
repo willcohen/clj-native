@@ -17,7 +17,6 @@
                      await_parent_drain_BANG_
                      worker_idx_from_args
                      assign_worker_for_context_BANG_
-                     get_context_worker
                      evict_oldest_BANG_
                      bounded_create_handle_BANG_
                      evicted_QMARK_
@@ -25,7 +24,9 @@
                      unref_handle_BANG_
                      get_pool_stats
                      fire_and_capture_dispose_BANG_
-                     flush_pending_disposes_BANG_]]
+                     flush_pending_disposes_BANG_
+                     set_log_config_BANG_]]
+            ["ffi-wasm/handler-runtime" :refer [isEnabled]]
             ["ffi-wasm/test-runner" :as tr]))
 
 (defn ^:async gc-until
@@ -91,10 +92,10 @@
   (let [lib "affinity-test"]
     (register_library_context_BANG_ lib)
     ;; .worker_idx is the munged :worker-idx a consumer tags on its context.
-    (is (= 3 (worker_idx_from_args lib #js [#js {:worker_idx 3} "scalar"])))
+    (is (= 3 (worker_idx_from_args #js [#js {:worker_idx 3} "scalar"])))
     ;; The fallback is a fixed 0, since dispatch cannot tell a pure call from
     ;; one that touches worker-local module state.
-    (is (= 0 (worker_idx_from_args lib #js ["scalar" 42])))
+    (is (= 0 (worker_idx_from_args #js ["scalar" 42])))
     (reset_library_context_BANG_ lib)))
 
 (deftest assign-worker-for-context-honors-explicit-worker-and-bounds-checks
@@ -121,12 +122,9 @@
           owner-b #js {:k "b"}]
       (track_context_BANG_ libA 1 2 (fn [] (swap! relA inc)) owner-a)
       (track_context_BANG_ libB 1 3 (fn [] (swap! relB inc)) owner-b)
-      (is (= 2 (get_context_worker libA 1)) "libA ctx 1 pinned to worker 2")
-      (is (= 3 (get_context_worker libB 1)) "libB ctx 1 pinned to worker 3")
       (reset_library_context_BANG_ libA)
       (is (= 1 @relA) "libA reset fired libA's release")
       (is (= 0 @relB) "libA reset left libB untouched")
-      (is (= 3 (get_context_worker libB 1)) "libB context survives libA reset")
       (reset_library_context_BANG_ libB)
       (is (= 1 @relB))
       ;; Keep owners reachable so no FR fires mid-test and perturbs counts.
@@ -171,7 +169,7 @@
         o0 #js {:id 0} o1 #js {:id 1} o2 #js {:id 2}
         log #js []
         mk (fn [id] (fn [] (.push log id)))]
-    (register_library_context_BANG_ lib #js {:max_live_ctxs 3 :min_age_ms 0})
+    (register_library_context_BANG_ lib {:max-live-ctxs 3 :min-age-ms 0})
     (register_handle_BANG_ lib "c0" 0 (mk "c0") o0)
     (register_handle_BANG_ lib "c1" 0 (mk "c1") o1)
     (register_handle_BANG_ lib "c2" 0 (mk "c2") o2)
@@ -179,16 +177,14 @@
         "idle entry is evictable even though its owner is still reachable")
     (is (= 1 (.-length log)) "exactly one release fired")
     (let [victim (aget log 0)]
-      (is (true? (evicted_QMARK_ lib victim)) "evicted ctx-id is tombstoned")
-      (is (= 1 (count (filter #(= true (aget % "__cljNativeEvicted")) [o0 o1 o2])))
-          "exactly one owner marked invalid"))
+      (is (true? (evicted_QMARK_ lib victim)) "evicted ctx-id is tombstoned"))
     (is (= 2 (.-live (get_pool_stats lib))) "live dropped by one")
     (reset_library_context_BANG_ lib)))
 
 (deftest bounded-create-caps-live-count-by-evicting
   (let [lib "evict-bound"
         owners #js []]
-    (register_library_context_BANG_ lib #js {:max_live_ctxs 4 :min_age_ms 0})
+    (register_library_context_BANG_ lib {:max-live-ctxs 4 :min-age-ms 0})
     (dotimes [i 10]
       (let [o #js {:id i}]
         (.push owners o)
@@ -204,7 +200,7 @@
 (deftest refcount-still-pins-against-eviction
   (let [lib "evict-refcount"
         o #js {}]
-    (register_library_context_BANG_ lib #js {:max_live_ctxs 2 :min_age_ms 0})
+    (register_library_context_BANG_ lib {:max-live-ctxs 2 :min-age-ms 0})
     (register_handle_BANG_ lib "p" 0 (fn [] nil) o)
     (ref_handle_BANG_ lib "p")
     (is (= "none-evictable" (evict_oldest_BANG_ lib)) "refcount>0 pins the entry")
@@ -215,7 +211,7 @@
 
 (deftest reregister-clears-eviction-tombstone
   (let [lib "evict-reregister"]
-    (register_library_context_BANG_ lib #js {:max_live_ctxs 1 :min_age_ms 0})
+    (register_library_context_BANG_ lib {:max-live-ctxs 1 :min-age-ms 0})
     (register_handle_BANG_ lib "x" 0 (fn [] nil) #js {})
     (evict_oldest_BANG_ lib)
     (is (true? (evicted_QMARK_ lib "x")) "evicted ctx-id is tombstoned")
@@ -233,5 +229,10 @@
   (let [settled (await (flush_pending_disposes_BANG_))]
     (is (= 1 (.-length settled)))
     (is (= "rejected" (.-status (aget settled 0))))))
+
+(deftest set-log-config!-takes-a-lazy-seq-of-categories
+  (set_log_config_BANG_ {:level :debug :categories (map identity [:busy])})
+  (is (isEnabled "BUSY-INC"))
+  (set_log_config_BANG_ nil))
 
 (tr/run-tests-and-exit! "net.willcohen.native.pool-test")

@@ -44,6 +44,11 @@
   (let [m (w/get-module @ctx)]
     (.execute (.getMember m "setValue") (object-array [addr v type]))))
 
+(defn- heap-string
+  "The address of a UTF-8 copy of `s` on the heap of the current module."
+  [s]
+  (w/get-value (w/string-list-to-native-array [s]) "*"))
+
 (deftest bootstrap-loads-the-module-and-is-idempotent
   (testing "the fixture's initialize/onSuccess contract registers a module"
     (is (some? (w/get-module @ctx))))
@@ -89,13 +94,11 @@
 (deftest string-round-trips-through-the-heap
   (on-module
    (testing "ascii"
-     (is (= "hello" (w/pointer->string (w/allocate-string-on-heap "hello")))))
+     (is (= "hello" (w/pointer->string (heap-string "hello")))))
    (testing "multi-byte utf-8 survives the encode/decode pair"
-     (is (= "héllo wörld" (w/pointer->string (w/allocate-string-on-heap "héllo wörld")))))
+     (is (= "héllo wörld" (w/pointer->string (heap-string "héllo wörld")))))
    (testing "the empty string"
-     (is (= "" (w/pointer->string (w/allocate-string-on-heap "")))))
-   (testing "nil in, nil out -- no allocation"
-     (is (nil? (w/allocate-string-on-heap nil))))
+     (is (= "" (w/pointer->string (heap-string "")))))
    (testing "NULL reads as nil, as on FFI"
      (is (nil? (w/pointer->string 0)))
      (is (= [] (w/string-array-pointer->strs 0))))))
@@ -173,21 +176,11 @@
      (is (= -1 (first (w/read-heap-array p 1 :u32)))
          ":u32 reads 4294967295 and narrows to int -1, same bits"))))
 
-(deftest heapf64-returns-a-subarray-view
-  (on-module
-   (let [p (w/malloc 32)
-         a (w/address-as-int p)]
-     (set-value! a 3.5 "double")
-     (let [view (w/heapf64 (bit-shift-right a 3) 2)]
-       (is (some? view))
-       (is (= 2 (.getArraySize view)))
-       (is (= 3.5 (.asDouble (.getArrayElement view 0))))))))
-
 (deftest read-struct-reads-fields-by-offset
   (on-module
    (let [s   (w/malloc 32)
          a   (w/address-as-int s)
-         txt (w/allocate-string-on-heap "field")]
+         txt (heap-string "field")]
      (set-value! a 42 "i32")
      (set-value! (+ a 4) 1 "i32")
      (set-value! (+ a 8) 6.25 "double")
@@ -370,6 +363,9 @@
   (let [f (on-module (w/module-eval-js (module) "(a, b) => a - b" "vx.js"))]
     (is (= 4 (w/value-execute f [7 3] :int)))))
 
+(deftest address-as-trackable-pointer-throws-on-a-non-number
+  (is (thrown? Exception (w/address-as-trackable-pointer (w/module-eval-js (module) "undefined" "u.js")))))
+
 (deftest heap-write-doubles!-resolves-the-current-module
   (let [ptr (long (w/address-as-int (on-module (w/malloc 16))))]
     (on-module (w/heap-write-doubles! ptr (double-array [3.5 -4.5])))
@@ -392,32 +388,31 @@
             (.close pctx)))))))
 
 (deftest heap-write-doubles!-copies-at-the-given-address
-  (let [m    (module)
-        ptr  (long (w/address-as-int (on-module (w/malloc 32))))
+  (let [ptr  (long (w/address-as-int (on-module (w/malloc 32))))
         src  (double-array [1.25 -2.5 0.0 6.02e23])
-        n    (w/heap-write-doubles! m ptr src)]
+        n    (on-module (w/heap-write-doubles! ptr src))]
     (testing "every double lands at its slot"
       (is (= 4 n))
       (is (= [1.25 -2.5 0.0 6.02e23]
              (vec (on-module (w/read-heap-array ptr 4 :f64))))))
     (testing "a second write at an offset does not disturb the first"
       (let [ptr2 (long (w/address-as-int (on-module (w/malloc 16))))]
-        (w/heap-write-doubles! m ptr2 (double-array [9.0 9.0]))
+        (on-module (w/heap-write-doubles! ptr2 (double-array [9.0 9.0])))
         (is (= [1.25 -2.5 0.0 6.02e23]
                (vec (on-module (w/read-heap-array ptr 4 :f64)))))))))
 
 (deftest value-coercers-read-numbers
   (testing "value->long keeps i64-range numbers that an int read cannot"
-    (is (= 5000000000 (w/value->long (on-module (w/address-as-polyglot-value 5000000000))))))
+    (is (= 5000000000 (w/value->long (w/module-eval-js (module) "5000000000" "v64.js")))))
   (testing "value->int reads as an int"
-    (is (instance? Integer (w/value->int (on-module (w/address-as-polyglot-value 7)))))))
+    (is (= (int 7) (w/value->int (w/module-eval-js (module) "7" "v32.js"))))))
 
 (deftest utf8->string-reads-through-an-explicit-module
   (testing "a string written to the heap reads back through the given module"
-    (let [written (on-module (w/allocate-string-on-heap "grüße/ünïcode"))]
+    (let [written (on-module (heap-string "grüße/ünïcode"))]
       (is (= "grüße/ünïcode" (w/utf8->string (module) (w/address-as-int written))))))
   (testing "the protocol method resolves the module itself and agrees"
-    (let [written (on-module (w/allocate-string-on-heap "same text"))]
+    (let [written (on-module (heap-string "same text"))]
       (is (= "same text" (on-module (w/pointer->string written)))))))
 
 (deftest ccall-hands-its-lists-across-as-js-arrays
@@ -490,12 +485,10 @@
                              (.getContext (w/get-module @ctx))))))
       (testing "the registry does not know the pooled WasmContext"
         (is (nil? (get @w/contexts ::pooled-lib))))
-      (testing "heap utilities and scalar Pointerlike ops stay in the pooled Context"
-        ;; allocate-string-on-heap wraps a scalar through
-        ;; address-as-polyglot-value, which throws if it uses the default Context.
+      (testing "heap utilities stay in the pooled Context"
         (w/with-wasm-context wc
           (is (pos? (w/address-as-int (w/malloc 8))))
-          (is (= "pooled write" (w/pointer->string (w/allocate-string-on-heap "pooled write"))))
+          (is (= "pooled write" (w/pointer->string (heap-string "pooled write"))))
           (is (= ["a" "b"] (w/string-array-pointer->strs
                             (w/string-list-to-native-array ["a" "b"]))))))
       (finally (.close pooled)))))
@@ -521,7 +514,7 @@
                (let [{:keys [wc]} (wp/current-context ::graal-pool)]
                  (.await barrier 20 TimeUnit/SECONDS)
                  (w/with-wasm-context wc
-                   (let [s (w/pointer->string (w/allocate-string-on-heap "pooled"))]
+                   (let [s (w/pointer->string (heap-string "pooled"))]
                      (swap! seen conj (.getContext (w/get-module wc)))
                      s))))
         f1 (.submit exec ^Callable task)
@@ -578,15 +571,15 @@
 
 (deftest each-context-has-crypto-get-random-values
   (testing "a view at an offset with a tail shorter than 8 bytes"
-    (is (= "true,true,true" (str (w/eval-js unaligned-probe "unaligned-probe.js")))))
+    (is (= "true,true,true" (str (.eval (w/context) "js" unaligned-probe)))))
   (testing "the default Context"
     (is (= "function,true,true,true"
-           (str (w/eval-js random-probe "random-probe.js")))))
+           (str (.eval (w/context) "js" random-probe)))))
   (testing "a pooled Context"
     (let [pooled (w/new-polyglot-context!)]
       (try
         (is (= "function,true,true,true"
-               (str (w/eval-js pooled random-probe "random-probe.js"))))
+               (str (.eval ^org.graalvm.polyglot.Context pooled "js" random-probe))))
         (finally (.close pooled))))))
 
 (deftest graal-leg-tells-a-null-string-from-an-empty-string

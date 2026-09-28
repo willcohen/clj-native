@@ -8,12 +8,11 @@
   "JVM round-trip tests for the native-memory primitives, on dtype native
    buffers. They need no external native library."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [net.willcohen.native.platform :as platform]
             [net.willcohen.native.ffi-mem :as m]
             [tech.v3.datatype.ffi :as dt-ffi]
             [tech.v3.datatype.native-buffer :as dt-nb]))
 
-(use-fixtures :once (fn [f] (platform/init-ffi! :jdk) (f)))
+(use-fixtures :once (fn [f] (dt-ffi/set-ffi-impl! :jdk) (f)))
 
 (defn- scratch ^long [n]
   (m/ptr-addr (dt-nb/malloc (long n) {:datatype :int8})))

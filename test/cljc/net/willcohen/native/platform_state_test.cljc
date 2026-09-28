@@ -7,8 +7,8 @@
   "Tests of platform-state's predicates and force/impl transitions under JVM
    clojure.test and squint cljs.test. The JVM-only try-init! tests supply both
    bootstrap fns, so they need no native or wasm resources."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
-               :cljs [cljs.test :refer [deftest is testing]])
+  (:require #?(:clj  [clojure.test :refer [deftest is]]
+               :cljs [cljs.test :refer [deftest is]])
             #?(:clj  [net.willcohen.native.platform-state :as ps]
                :cljs ["ffi-wasm/platform-state" :as ps])
             #?(:cljs ["ffi-wasm/test-runner" :as tr])))
@@ -35,18 +35,10 @@
     (is (false? @force) "true -> false")
     (is (nil? @impl))))
 
-(deftest null-ptr?-and-some-ptr?-are-complementary
-  (testing "nil is the null pointer in both runtimes"
-    (is (ps/null-ptr? nil))
-    (is (not (ps/some-ptr? nil))))
-  (testing "a non-zero pointer is non-null in both runtimes"
-    (is (not (ps/null-ptr? 42)))
-    (is (ps/some-ptr? 42)))
-  (testing "0 diverges: null on cljs/wasm, a valid pointer on JVM dt-ffi"
-    #?(:clj  (do (is (not (ps/null-ptr? 0)) "JVM: 0 is a valid pointer")
-                 (is (ps/some-ptr? 0)))
-       :cljs (do (is (ps/null-ptr? 0) "cljs/wasm: 0 is the null pointer")
-                 (is (not (ps/some-ptr? 0)))))))
+(deftest null-ptr?-takes-nil-and-0-as-null-on-each-runtime
+  (is (ps/null-ptr? nil))
+  (is (ps/null-ptr? 0) "a heap read gives 0 for NULL")
+  (is (not (ps/null-ptr? 42))))
 
 #?(:clj
    (defn- silently

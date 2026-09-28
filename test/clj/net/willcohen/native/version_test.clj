@@ -45,42 +45,7 @@
                        (str "target/native-" canonical ".jar"))
         "the :deploy :artifact path must name the jar build.clj produces")))
 
-(deftest bb-edn-carries-no-version-literal
-  (testing "bb.edn reads the version from build.clj at :init, so a hardcoded
-            one is drift waiting to happen"
-    (let [bb (slurp-root "bb.edn")
-          tokens (re-seq #"\b\d+\.\d+\.\d+\b" bb)
-          project-tokens (filter #(= canonical %) tokens)]
-      (is (empty? project-tokens)
-          (str "bb.edn must name no project version; found "
-               (count project-tokens)
-               ". Use the project-version binding from :init instead."))))
-  (testing "the :init binding still resolves, so the tasks print a real number"
-    (let [bb (slurp-root "bb.edn")]
-      (is (str/includes? bb "(def project-version")
-          "bb.edn :init must define project-version")
-      (is (str/includes? bb "project-version \".jar\"")
-          "the jar task must compose its path from project-version")))
-  ;; some?, since canonical comes from the same pattern and would equal nil too.
-  (testing "the pattern bb.edn's :init carries still matches build.clj"
-    (let [bb-pattern (re-pattern "\\(def version \"([^\"]+)\"\\)")]
-      (is (some? (second (re-find bb-pattern (slurp-root "build.clj"))))
-          "bb.edn's :init regex must still find build.clj's (def version ...)"))))
-
-(deftest readme-carries-no-version-literal
-  (testing "the README names no version, so it has nothing to drift"
-    (let [tokens (re-seq #"\b\d+\.\d+\.\d+\b" (slurp-root "README.md"))]
-      (is (empty? tokens)
-          (str "README must name no version; found " (pr-str tokens)
-               ". If a version site returns on purpose, pin it here instead.")))))
-
-(deftest gitignore-carries-no-version-literal
-  (testing "the tarball ignore is a glob, and its comment must not pin a version"
-    (let [tokens (re-seq #"\b\d+\.\d+\.\d+\b" (slurp-root ".gitignore"))]
-      (is (empty? tokens)
-          (str ".gitignore must name no version; found " (pr-str tokens))))))
-
-(deftest the-npm-and-clojars-versions-are-the-same-release
-  (testing "the two ecosystems ship one version number, not two"
-    (is (= (npm-version) canonical)
-        (str "npm and Clojars must agree; canonical is " canonical))))
+(deftest no-other-file-names-the-version
+  (doseq [f ["bb.edn" "README.md" ".gitignore"]]
+    (is (not-any? #{canonical} (re-seq #"\b\d+\.\d+\.\d+\b" (slurp-root f)))
+        (str f " names the version " canonical))))

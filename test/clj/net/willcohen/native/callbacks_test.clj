@@ -8,12 +8,12 @@
   "JVM smoke tests for upcall registration under the :jdk backend. The consumer
    suites (clj-proj, clj-gdal) test callback invocation end to end."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [net.willcohen.native.platform :as platform]
             [net.willcohen.native.callbacks :as cb]
-            [net.willcohen.native.ffi-mem :as m])
+            [net.willcohen.native.ffi-mem :as m]
+            [tech.v3.datatype.ffi :as dt-ffi])
   (:import [tech.v3.datatype.ffi Pointer]))
 
-(use-fixtures :once (fn [f] (platform/init-ffi! :jdk) (f)))
+(use-fixtures :once (fn [f] (dt-ffi/set-ffi-impl! :jdk) (f)))
 
 (deftest register-callback-produces-retained-pointer
   (let [iface (cb/define-callback-interface :int64 [:int64])

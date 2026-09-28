@@ -7,31 +7,23 @@
 (ns net.willcohen.native.http
   "Blocking java.net.http transport for wasm and native libraries that get
    their networking from the host. A consumer binding calls fetch or
-   range-request from inside its own callback.
-
-   :decorate in a request map is the auth hook. fetch applies it to the
-   request first, and it may block, for example on a token refresh."
+   range-request from inside its own callback."
   (:require [clojure.string :as str]
             [clojure.tools.logging :as log])
   (:import [java.net URI]
            [java.net.http HttpClient HttpClient$Redirect HttpRequest
-            HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
+            HttpResponse$BodyHandlers]
            [java.time Duration]))
 
 (set! *warn-on-reflection* true)
-
-(def ^:private connect-timeout-ms
-  "Connect timeout. java.net.http has none, so an unreachable host would
-   block the caller thread. There is no default total timeout, because
-   HttpRequest.timeout includes the body and would stop a slow large
-   download."
-  10000)
 
 (defonce ^:private http-client
   (delay
     (-> (HttpClient/newBuilder)
         (.followRedirects HttpClient$Redirect/NORMAL)
-        (.connectTimeout (Duration/ofMillis connect-timeout-ms))
+        ;; An unreachable host blocks forever with no connect timeout. A request
+        ;; timeout would also cover the body and stop a slow download.
+        (.connectTimeout (Duration/ofSeconds 10))
         (.build))))
 
 (defn- parse-headers
@@ -45,49 +37,25 @@
                      (first vs)
                      (str/join ", " vs))]))))
 
-(defn- body-publisher [body]
-  (cond
-    (nil? body) (HttpRequest$BodyPublishers/noBody)
-    (bytes? body) (HttpRequest$BodyPublishers/ofByteArray body)
-    :else (HttpRequest$BodyPublishers/ofString (str body))))
-
-(defn- build-request ^HttpRequest [{:keys [url method headers body timeout-ms] :or {method :get}}]
-  (let [^java.net.http.HttpRequest$Builder builder
-        (reduce-kv (fn [^java.net.http.HttpRequest$Builder b k v] (.header b (name k) (str v)))
-                   (cond-> (-> (HttpRequest/newBuilder) (.uri (URI. url)))
-                     timeout-ms (.timeout (Duration/ofMillis (long timeout-ms))))
-                   (or headers {}))
-        m (-> method name str/upper-case)
-        ^java.net.http.HttpRequest$Builder built
-        (case m
-          "GET" (.GET builder)
-          "DELETE" (.DELETE builder)
-          "POST" (.POST builder (body-publisher body))
-          "PUT" (.PUT builder (body-publisher body))
-          (.method builder m (body-publisher body)))]
-    (.build built)))
+(defn- build-request
+  ^HttpRequest [{:keys [url headers]}]
+  (.build ^java.net.http.HttpRequest$Builder
+          (reduce-kv (fn [^java.net.http.HttpRequest$Builder b k v] (.header b (name k) (str v)))
+                     (.uri (HttpRequest/newBuilder) (URI. url))
+                     headers)))
 
 (defn- transport-failure [url e]
   (log/warn e (str "HTTP request failed, returning status 0: " url))
   {:status 0 :headers {} :body-bytes nil})
 
 (defn fetch
-  "Send an HTTP request. Keys:
-     :url         Required.
-     :method      Keyword or string. Default :get.
-     :headers     Map of name to value.
-     :body        String or byte[].
-     :timeout-ms  Optional total timeout.
-     :decorate    Optional fn from request to request, applied first.
-
-   Returns {:status :headers :body-bytes}, with headers as parse-headers
-   gives them. On a transport failure, logs the cause at warn and returns
+  "Send a GET of :url with the :headers map, and follow redirects. Returns
+   {:status :headers :body-bytes}, with lower-case header names.
+   On a transport failure, logs the cause at warn and returns
    {:status 0 :headers {} :body-bytes nil}."
-  [{:keys [decorate url] :as request}]
+  [{:keys [url] :as request}]
   (try
-    (let [request (cond-> (dissoc request :decorate)
-                    decorate decorate)
-          response (.send ^java.net.http.HttpClient @http-client
+    (let [response (.send ^java.net.http.HttpClient @http-client
                           (build-request request)
                           (HttpResponse$BodyHandlers/ofByteArray))]
       {:status (.statusCode response)
@@ -113,7 +81,6 @@
                     {:url (:url request) :offset offset :size size})))
   (-> request
       (dissoc :offset :size)
-      (assoc :method :get
-             :headers (assoc (or headers {})
+      (assoc :headers (assoc headers
                              "Range" (format "bytes=%d-%d" (long offset) (+ (long offset) (long size) -1))))
       fetch))

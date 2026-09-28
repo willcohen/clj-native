@@ -40,9 +40,6 @@
   "scripts": {
     "prepack": "bb build:js"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "dependencies": {
     "resource-tracker": "^0.0.1",
     "worker-router": "npm:@wcohen/worker-router@^0.0.2"

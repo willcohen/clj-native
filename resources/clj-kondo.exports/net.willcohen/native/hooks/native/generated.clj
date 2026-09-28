@@ -10,37 +10,25 @@
    define-library-functions, so each call reads as `Unresolved var`.
 
    A hook cannot read a var of the project it lints. A consumer keeps a copy
-   of its fndefs under .clj-kondo/hooks and passes it to `defn-nodes`."
+   of its fndefs under .clj-kondo/hooks and builds one defn-node for each
+   entry, or a declare-node."
   (:require [clj-kondo.hooks-api :as api]
             [clojure.string :as string]))
 
 (defn defn-node
-  "A defn node for one generated fn. `arities` is a vector of arg vectors,
-   default [] and [opts].
+  "A defn node for one generated fn. `arities` is a vector of arg vectors.
 
-   Each arity has no body. A nil body tells clj-kondo that the fn returns
-   nil, and then a correct call such as `(inc (f))` reports a type error."
-  ([fn-name] (defn-node fn-name nil [[] ['opts]]))
-  ([fn-name docstring arities]
-   (api/list-node
-    (concat [(api/token-node 'defn)
-             (api/token-node (symbol fn-name))]
-            (when docstring [(api/string-node docstring)])
-            (for [args arities]
-              (api/list-node
-               (list (api/vector-node (mapv api/token-node args)))))))))
-
-(defn defn-nodes
-  "A `do` node with one defn for each entry of `fndefs`. `fn-key->name`
-   gives the public name. `fn-key->doc` may return nil."
-  ([fndefs fn-key->name] (defn-nodes fndefs fn-key->name nil))
-  ([fndefs fn-key->name fn-key->doc]
-   (api/list-node
-    (cons (api/token-node 'do)
-          (for [fn-key (keys fndefs)]
-            (defn-node (fn-key->name fn-key)
-              (when fn-key->doc (fn-key->doc fn-key))
-              [[] ['opts]]))))))
+   Each arity has no body, because a nil body tells clj-kondo that the fn
+   returns nil, and then a correct call such as `(inc (f))` reports a type
+   error."
+  [fn-name docstring arities]
+  (api/list-node
+   (concat [(api/token-node 'defn)
+            (api/token-node (symbol fn-name))]
+           (when docstring [(api/string-node docstring)])
+           (for [args arities]
+             (api/list-node
+              (list (api/vector-node (mapv api/token-node args))))))))
 
 (defn- upper-char? [ch]
   (and (not= ch (string/lower-case ch)) (= ch (string/upper-case ch))))

@@ -11,7 +11,7 @@
                      byteLengthFingerprint
                      normalizeWasmError
                      setLogConfig
-                     getLogConfig
+                     isEnabled
                      dbg]]
             ["ffi-wasm/test-runner" :as tr]
             ["node:child_process" :refer [spawnSync]]))
@@ -45,15 +45,21 @@
   (is (thrown-with-msg? js/Error #"methods"
                         (makeHandler #js {:methods #js {}}))))
 
+(deftest makeHandler-without-a-fingerprint-rejects
+  (is (thrown-with-msg? js/Error #"fingerprint"
+                        (makeHandler #js {:methods #js {:ping (fn ^:async ping [] "pong")}}))))
+
 (deftest makeHandler-rejects-a-method-listed-as-both-busy-and-destroy
   ;; wrap() tests destroy before busy, so an overlapping name would lose its
   ;; busy accounting.
   (is (thrown-with-msg? js/Error #"both busyMethods and destroyMethods"
                         (makeHandler #js {:methods #js {:ccall (fn ^:async ccall [] "ok")}
+                                          :fingerprint (fn [] "")
                                           :busyMethods #js ["ccall"]
                                           :destroyMethods #js ["ccall"]})))
   (testing "disjoint lists are still accepted"
-    (is (some? (makeHandler #js {:methods #js {:a (fn ^:async a-fn [] 1)
+    (is (some? (makeHandler #js {:fingerprint (fn [] "")
+                                 :methods #js {:a (fn ^:async a-fn [] 1)
                                                :b (fn ^:async b-fn [] 2)}
                                  :busyMethods #js ["a"]
                                  :destroyMethods #js ["b"]})))))
@@ -61,7 +67,8 @@
 (deftest ^:async idempotent-re-init-with-same-args-returns-cached-handler
   (let [init-count (atom 0)
         factory (makeHandler
-                 #js {:init (fn ^:async init-fn [_args] (swap! init-count inc))
+                 #js {:fingerprint (fn [args] (str (.-x args)))
+                      :init (fn ^:async init-fn [_args] (swap! init-count inc))
                       :methods #js {:ping (fn ^:async ping [] "pong")}})
         a (await (factory #js {:x 1}))
         b (await (factory #js {:x 1}))]
@@ -71,7 +78,8 @@
 
 (deftest ^:async re-init-with-different-args-throws
   (let [factory (makeHandler
-                 #js {:init (fn ^:async init-fn [] nil)
+                 #js {:fingerprint (fn [args] (str (.-x args)))
+                      :init (fn ^:async init-fn [] nil)
                       :methods #js {:ping (fn ^:async ping [] "pong")}})]
     (await (factory #js {:x 1}))
     (try
@@ -79,58 +87,6 @@
       (is false "should reject")
       (catch :default e
         (is (re-find #"(?i)fingerprint|init" (.-message e)))))))
-
-(defn- ping-factory [fp]
-  (makeHandler (cond-> #js {:init (fn ^:async init-fn [] nil)
-                            :methods #js {:ping (fn ^:async ping [] "pong")}}
-                 fp (doto (aset "fingerprint" fp)))))
-
-(defn- ^:async same-print?
-  "True when a handler built with `a` answers `b` from its cache, false when it
-   rejects `b` as a re-init with different args."
-  [a b]
-  (let [factory (ping-factory nil)
-        h (await (factory a))]
-    (try
-      (identical? h (await (factory b)))
-      (catch :default e
-        (if (re-find #"different args" (.-message e)) false (throw e))))))
-
-(deftest ^:async default-fingerprint-counts-bytes-by-length-and-the-rest-by-value
-  (let [db (js/Uint8Array. 4096)]
-    (doseq [[why a b same?]
-            [["the same payload re-inits from cache"
-              #js {:db db :logLevel 0} #js {:db db :logLevel 0} true]
-             ["bytes of the same length match, whatever their content"
-              #js {:db db} #js {:db (js/Uint8Array. 4096)} true]
-             ["an ArrayBuffer counts by its length"
-              #js {:db (js/ArrayBuffer. 8)} #js {:db (js/ArrayBuffer. 16)} false]
-             ["a scalar beside the bytes still counts"
-              #js {:db db :logLevel 0} #js {:db db :logLevel 2} false]
-             ;; A nested ArrayBuffer serializes as {}, so only a walk that
-             ;; descends tells these apart.
-             ["bytes below the top level count by length"
-              #js {:r #js {:db (js/ArrayBuffer. 8)}} #js {:r #js {:db (js/ArrayBuffer. 16)}} false]
-             ["a plain array keeps its contents"
-              #js {:sizes #js [1 2 3]} #js {:sizes #js [4 5 6]} false]
-             ;; JSON.stringify throws on a BigInt, which a wasm init payload
-             ;; carries for 64-bit values.
-             ["the same BigInt payload re-inits from cache"
-              #js {:size (js/BigInt 1)} #js {:size (js/BigInt 1)} true]
-             ["a different BigInt payload is rejected"
-              #js {:size (js/BigInt 1)} #js {:size (js/BigInt 2)} false]]]
-      (is (= same? (await (same-print? a b))) why))))
-
-(deftest ^:async default-fingerprint-throws-on-args-it-cannot-print
-  ;; An unprintable payload would collide with every other one, so init fails.
-  (let [cyclic #js {:a #js {:b #js {:c #js {:d #js {}}}}}]
-    (aset (.-d (.-c (.-b (.-a cyclic)))) "back" cyclic)
-    (is (thrown-with-msg? js/Error #"not fingerprintable[\s\S]*byteLengthFingerprint"
-                          (await ((ping-factory nil) cyclic))))
-    (testing "an explicit fingerprint still accepts that payload"
-      (aset cyclic "tag" "x")
-      (let [h (await ((ping-factory (byteLengthFingerprint #js ["tag"])) cyclic))]
-        (is (= "pong" (await (.ping h))))))))
 
 (deftest byte-length-fingerprint-prints-named-fields-only
   (let [fp (byteLengthFingerprint #js ["dbBytes" "iniBytes" "logLevel"])]
@@ -176,6 +132,7 @@
                                     :d1    (traced-method events "d1")
                                     :d2    (traced-method events "d2")
                                     :plain (traced-method events "plain")}
+                      :fingerprint    (fn [] "")
                       :busyMethods    #js ["a" "b"]
                       :destroyMethods #js ["d1" "d2"]})
         h (await (factory))]
@@ -210,7 +167,8 @@
 
 (deftest ^:async wrap-normalizes-synchronous-wasm-RuntimeError-thrown-from-a-destroy-method
   (let [factory (makeHandler
-                 #js {:methods #js {:teardown
+                 #js {:fingerprint (fn [] "")
+                      :methods #js {:teardown
                                     (fn []
                                       (throw (new js/WebAssembly.RuntimeError "OOB sync")))}
                       :destroyMethods #js ["teardown"]})
@@ -226,7 +184,8 @@
 
 (deftest ^:async wrap-normalizes-async-wasm-RuntimeError-thrown-from-a-busy-method
   (let [factory (makeHandler
-                 #js {:methods #js {:work
+                 #js {:fingerprint (fn [] "")
+                      :methods #js {:work
                                     (fn ^:async work []
                                       (await (sleep 1))
                                       (throw (new js/WebAssembly.RuntimeError "OOB async busy")))}
@@ -242,7 +201,8 @@
 
 (deftest ^:async wrap-normalizes-async-emscripten-Aborted-thrown-from-a-default-classified-method
   (let [factory (makeHandler
-                 #js {:methods #js {:misc
+                 #js {:fingerprint (fn [] "")
+                      :methods #js {:misc
                                     (fn ^:async misc []
                                       (await (sleep 1))
                                       (throw (js/Error. "Aborted(native code called abort())")))}})
@@ -260,6 +220,7 @@
                  #js {:methods #js {:trap (fn ^:async trap []
                                             (throw (new js/WebAssembly.RuntimeError "OOB")))
                                     :ok   (fn ^:async ok [] "fine")}
+                      :fingerprint (fn [] "")
                       :busyMethods #js ["trap" "ok"]})
         h (await (factory))]
     (is (thrown? js/Error (await (.trap h))))
@@ -267,14 +228,14 @@
 
 (deftest setLogConfig-default-state-is-off-dbg-is-silent
   (reset-substrate!)
-  (is (= #js {:level nil :categories nil} (getLogConfig)))
+  (is (not (isEnabled "BUSY-INC")))
   (let [{:keys [captured]} (capture-logs (fn [] (dbg "BUSY-INC" #js {:fn "x" :counter 1})))]
     (is (= 0 (.-length captured)) "no console.log when level is null")))
 
 (deftest setLogConfig-level-debug-enables-emission-with-default-category-filter
   (reset-substrate!)
   (setLogConfig #js {:level "debug"})
-  (is (= #js {:level "debug" :categories nil} (getLogConfig)))
+  (is (isEnabled "BUSY-INC"))
   (let [{:keys [captured]} (capture-logs
                             (fn []
                               (dbg "BUSY-INC"     #js {:fn "x" :counter 1})
@@ -288,14 +249,14 @@
 (deftest setLogConfig-null-resets-to-off
   (setLogConfig #js {:level "debug" :categories #js ["busy"]})
   (setLogConfig nil)
-  (is (= #js {:level nil :categories nil} (getLogConfig)))
+  (is (not (isEnabled "BUSY-INC")))
   (let [{:keys [captured]} (capture-logs (fn [] (dbg "BUSY-INC" #js {})))]
     (is (= 0 (.-length captured)))))
 
 (deftest setLogConfig-categories-filter-by-tag-prefix-lowercased-before-first-dash
   (reset-substrate!)
   (setLogConfig #js {:level "debug" :categories #js ["busy" "fr"]})
-  (is (= #js {:level "debug" :categories #js ["busy" "fr"]} (getLogConfig)))
+  (is (not (isEnabled "DESTROY-FIRE")))
   (let [{:keys [captured]} (capture-logs
                             (fn []
                               (dbg "BUSY-INC"               #js {})
@@ -311,19 +272,16 @@
   (reset-substrate!)
   (setLogConfig #js {:level "debug" :categories #js ["busy"]})
   (setLogConfig #js {:categories #js ["fr"]})
-  (is (= #js {:level "debug" :categories #js ["fr"]} (getLogConfig))))
+  (is (isEnabled "FR-CALLBACK"))
+  (is (not (isEnabled "BUSY-INC"))))
 
-(deftest setLogConfig-level-rank-event-level-above-config-level-is-suppressed
+(deftest setLogConfig-a-level-below-debug-suppresses-every-event
+  ;; Every event is debug level.
   (reset-substrate!)
-  (setLogConfig #js {:level "info"}) ; info=3, debug=4, trace=5
-  (let [{:keys [captured]} (capture-logs
-                            (fn []
-                              (dbg "A" #js {} "error")
-                              (dbg "B" #js {} "warn")
-                              (dbg "C" #js {} "info")
-                              (dbg "D" #js {} "debug")
-                              (dbg "E" #js {} "trace")))]
-    (is (= 3 (.-length captured)))))
+  (setLogConfig #js {:level "info"})
+  (is (= 0 (.-length (:captured (capture-logs (fn [] (dbg "A" #js {})))))))
+  (setLogConfig #js {:level "trace"})
+  (is (= 1 (.-length (:captured (capture-logs (fn [] (dbg "A" #js {}))))))))
 
 (deftest setLogConfig-invalid-level-throws
   (reset-substrate!)
@@ -344,29 +302,29 @@
   (reset-substrate!)
   (is (thrown-with-msg? js/Error #"categories must be an array"
                         (setLogConfig #js {:level "debug" :categories 42})))
-  (is (nil? (.-level (getLogConfig)))
+  (is (not (isEnabled "BUSY-INC"))
       "a rejected call must not commit the level it validated first")
   (testing "the same guard holds over an already-configured state"
-    (setLogConfig #js {:level "warn" :categories #js ["busy"]})
+    (setLogConfig #js {:level "debug" :categories #js ["busy"]})
     (is (thrown-with-msg? js/Error #"categories must be an array"
-                          (setLogConfig #js {:level "trace" :categories 42})))
-    (is (= "warn" (.-level (getLogConfig))))
-    (is (= 1 (.-length (.-categories (getLogConfig)))))
+                          (setLogConfig #js {:level "off" :categories 42})))
+    (is (isEnabled "BUSY-INC"))
+    (is (not (isEnabled "FR-CALLBACK")))
     (reset-substrate!)))
 
-(deftest setLogConfig-Set-is-accepted-for-categories-deduped-lowercased
+(deftest setLogConfig-accepts-a-Set-of-categories-in-any-case
   (reset-substrate!)
   (setLogConfig #js {:level "debug"
                      :categories (new js/Set #js ["Busy" "BUSY" "fr"])})
-  (let [cfg (getLogConfig)]
-    (is (= 2 (.-length (.-categories cfg))))
-    (is (.includes (.-categories cfg) "busy"))
-    (is (.includes (.-categories cfg) "fr"))))
+  (is (isEnabled "BUSY-INC"))
+  (is (isEnabled "FR-CALLBACK"))
+  (is (not (isEnabled "DESTROY-FIRE"))))
 
 (deftest ^:async factory-propagates-initArgs-handlerRuntime-to-setLogConfig-before-wrap-fires
   (reset-substrate!)
   (let [factory (makeHandler
-                 #js {:init (fn ^:async init-fn [] nil)
+                 #js {:fingerprint (fn [] "")
+                      :init (fn ^:async init-fn [] nil)
                       :methods #js {:ping (fn ^:async ping [] "pong")}
                       :busyMethods #js ["ping"]
                       :label "rt-test"})
@@ -375,13 +333,13 @@
       (let [h (await (factory #js {:handlerRuntime
                                       #js {:logLevel "debug"
                                            :logCategories #js ["busy"]}}))]
-        (is (= #js {:level "debug" :categories #js ["busy"]} (getLogConfig)))
+        (is (isEnabled "BUSY-INC"))
         (await (.ping h)))
       (finally (restore)))
     (let [busy-events (.filter captured (fn [l] (re-find #"\[CLJ-NATIVE" l)))]
       (is (= 2 (.-length busy-events)))
-      (is (re-find #"BUSY-INC.*fn=ping.*label=rt-test.*counter=1" (aget busy-events 0)))
-      (is (re-find #"BUSY-DEC.*fn=ping.*label=rt-test.*counter=0" (aget busy-events 1))))
+      (is (re-find #"BUSY-INC.*fn=ping.*label=rt-test" (aget busy-events 0)))
+      (is (re-find #"BUSY-DEC.*fn=ping.*label=rt-test" (aget busy-events 1))))
     (reset-substrate!)))
 
 (defn- ^:async busy-lines
@@ -392,6 +350,7 @@
   (let [factory (makeHandler
                  #js {:init (fn ^:async init-fn [_initArgs ctx]
                               (when module (.attachEmscriptenModule ctx module)))
+                      :fingerprint (fn [] "")
                       :methods #js {:ping (fn ^:async ping [] "pong")}
                       :busyMethods #js ["ping"]})
         {:keys [captured restore]} (install-log-capture!)]
@@ -429,6 +388,7 @@
         factory (makeHandler
                  #js {:init (fn ^:async init-fn [_initArgs ctx]
                               (.attachEmscriptenModule ctx mock-module))
+                      :fingerprint (fn [] "")
                       :methods #js {:ping (fn ^:async ping [] "pong")}
                       :busyMethods #js ["ping"]
                       :label "sbrk-gate-test"})
@@ -449,7 +409,8 @@
   ;; with corrected args is not rejected as a re-init.
   (let [attempts (atom 0)
         factory (makeHandler
-                 #js {:init (fn ^:async init-fn [args]
+                 #js {:fingerprint (fn [] "")
+                      :init (fn ^:async init-fn [args]
                               (swap! attempts inc)
                               (when-not (.-ok args)
                                 (throw (js/Error. "missing required arg `ok`"))))

@@ -110,20 +110,18 @@
                           (nb/build-once! out {:dir (fs/path "x")} #(spit out "x"))))))
 
 (deftest autotools-rejects-cflags-with-no-optimization-level
-  (let [existing (str (fs/create-temp-file))
-        opts     {:type :native :build-dir "/nonexistent" :install-dir "/nonexistent"
-                  :configure-args [] :skip-if-exists existing}]
+  ;; The check runs before the build touches a dir.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"CFLAGS \"-DX\" has no -O"
+                        (nb/build-autotools-library {:type :native :build-dir "/nonexistent"
+                                                     :install-dir "/nonexistent" :configure-args []
+                                                     :env {"CFLAGS" "-DX" "CXXFLAGS" "-O2"}})))
+  (let [check! #'nb/check-cflags!]
     (doseq [flags ["" "-DSQLITE_ENABLE_RTREE"]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"-O"
-                            (nb/build-autotools-library (assoc opts :env {"CFLAGS" flags "CXXFLAGS" "-O2"})))
+      (is (thrown? clojure.lang.ExceptionInfo (check! {"CFLAGS" flags} {}))
           (str "CFLAGS \"" flags "\" replaces the -O2 of configure")))
     (doseq [flags ["-O2 -DX" "-DX -Os" "-O0" "-Og" "-Ofast -DX"]]
-      (is (nil? (nb/build-autotools-library (assoc opts :env {"CFLAGS" flags "CXXFLAGS" "-O2"})))
-          (str "CFLAGS \"" flags "\" has a level")))))
-
-(deftest cflags-check-reads-the-inherited-environment
-  ;; A nix shell can export CFLAGS, and configure then sees that value.
-  (let [check! #'nb/check-cflags!]
+      (is (nil? (check! {"CFLAGS" flags} {})) (str "CFLAGS \"" flags "\" has a level")))
+    ;; A nix shell can export CFLAGS, and configure then sees that value.
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"CFLAGS \"-fPIC\""
                           (check! {} {"CFLAGS" "-fPIC"})))
     (is (nil? (check! {} {"CFLAGS" "-O2 -fPIC"})))
@@ -311,6 +309,19 @@ Import {
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"(?i)imports ws2_32\.dll"
                             (nb/check-windows-lib! "windows-amd64" (lib "windows-amd64" "y.dll" "-lws2_32")))
           "a DLL outside the allowlist"))))
+
+(deftest emcc-link-cmd-sets-the-flag-of-each-option
+  (let [cmd (fn [opts]
+              (set (#'nb/emcc-link-cmd (merge {:output-name "m.js" :objects ["a.o"]
+                                               :exported-functions ["_f"]}
+                                              opts))))]
+    (is (some #(str/includes? % "\"wasmBinary\"") (cmd {})) "a GraalVM host passes wasmBinary")
+    (is (contains? (cmd {}) "GROWABLE_ARRAYBUFFERS=0"))
+    (is (contains? (cmd {}) "STACK_SIZE=1048576"))
+    (is (contains? (cmd {}) "ENVIRONMENT=web,worker,node,shell"))
+    (is (contains? (cmd {:pthreads? true}) "ENVIRONMENT=web,worker,node"))
+    (is (contains? (cmd {:pthreads? true}) "PTHREAD_POOL_DELAY_LOAD=1"))
+    (is (contains? (cmd {:force-filesystem? true}) "FORCE_FILESYSTEM=1"))))
 
 (deftest check-exports-sync-compares-full-paths
   (let [copy   (str (fs/path (fs/create-temp-dir) "package.json"))

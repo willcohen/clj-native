@@ -21,8 +21,6 @@
         resp-headers (.getResponseHeaders exchange)
         path (.getPath (.getRequestURI exchange))
         range (.getFirst req-headers "Range")]
-    (when-let [v (.getFirst req-headers "X-Injected")]
-      (.set resp-headers "X-Injected-Echoed" v))
     ;; The Set-Cookie value holds its own comma, so a comma join corrupts it.
     (when (= path "/repeated")
       (doto resp-headers
@@ -105,11 +103,3 @@
       (is (= 0 (:status res)))
       (is (= {} (:headers res)))
       (is (nil? (:body-bytes res))))))
-
-(deftest decorate-injects-a-header
-  (testing "the :decorate hook mutates the request before dispatch"
-    (let [res (http/fetch {:url (str *base* "/plain")
-                           :decorate (fn [req]
-                                       (update req :headers assoc "X-Injected" "tok"))})]
-      (is (= 200 (:status res)))
-      (is (= "tok" (get-in res [:headers "x-injected-echoed"]))))))

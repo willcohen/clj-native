@@ -32,11 +32,5 @@ export default [
       // These modules run in Node, browser pages and workers.
       globals: { ...globals.browser, ...globals.node, ...globals.worker },
     },
-    rules: {
-      // A catch binding that starts with '_' is unused on purpose, and so is
-      // an empty catch.
-      'no-unused-vars': ['error', { caughtErrorsIgnorePattern: '^_' }],
-      'no-empty': ['error', { allowEmptyCatch: true }],
-    },
   },
 ];

@@ -27,7 +27,6 @@
           autoconf
           automake
           cmake
-          curl
           gawk
           libtool
           pkg-config

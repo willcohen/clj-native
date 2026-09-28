@@ -1,27 +1,20 @@
-{:paths ["src/bb" "src/clj" "src/cljc" "resources"]
- :deps {org.babashka/http-client {:mvn/version "0.4.25"}}
+{:paths ["src/bb"]
  :tasks
  {:requires ([babashka.fs :as fs]
              [clojure.string :as str]
-             [clojure.java.shell :as jshell]
              [net.willcohen.native.build :as nb])
 
-  ;; build.clj alone declares the version. version-test pins the static copies.
-  ;; re-pattern, not #"": EDN has no regex literal.
-  :init (def project-version
-          (or (second (re-find (re-pattern "\\(def version \"([^\"]+)\"\\)")
-                               (slurp "build.clj")))
-              (throw (ex-info "build.clj carries no (def version \"...\")" {}))))
+  :init (def cljs-suites
+          (sort (map str (fs/glob "test" "{cljs,cljc}/**_test.cljc"))))
 
   lint:deps
   {:doc "Index the classpath into the clj-kondo cache, so lint resolves dependency vars. Run it again after a dependency bump."
-   ;; --copy-configs --skip-lint leaves the cache empty; --dependencies fills it.
-   ;; Not the default .cache: clojure-lsp writes that one and can replace a
-   ;; namespace with a hook stub that hides the real vars.
-   ;; -A:build replaces the project deps, so index both classpaths for build.clj.
-   :task (let [cp (str/trim (:out (jshell/sh "clojure" "-Spath")))
-               build-cp (str/trim (:out (jshell/sh "clojure" "-Spath" "-A:build")))]
-           (shell "clj-kondo" "--lint" (str cp ":" build-cp)
+   ;; --skip-lint leaves the cache empty. Not .cache: clojure-lsp writes it
+   ;; and can stub a namespace there, which hides the real vars.
+   ;; -A:build replaces the project deps, so build.clj needs its own classpath.
+   :task (let [cp       (:out (shell {:out :string} "clojure" "-Spath"))
+               build-cp (:out (shell {:out :string} "clojure" "-Spath" "-A:build"))]
+           (shell "clj-kondo" "--lint" (str (str/trim cp) ":" (str/trim build-cp))
                   "--dependencies" "--parallel"
                   "--cache-dir" ".clj-kondo/.cache-cli"))}
 
@@ -41,7 +34,7 @@
 
   test:clj
   {:doc "Run the Clojure tests. test_runner_test.clj runs the compiled test_runner.mjs."
-   :depends [squint:test-runner]
+   :depends [build:js]
    :task (shell "clojure" "-M:test")}
 
   test:bb
@@ -60,181 +53,51 @@
   {:doc "Install the npm dependencies. package.json pins squint-cljs."
    :task (shell "npm" "install")}
 
-  squint:pool
-  {:doc "Compile pool.cljc to pool.mjs, shipped as ffi-wasm/pool."
-   :depends [npm:install]
-   :task (nb/squint-compile! "src/cljc/net/willcohen/native" "pool.cljc")}
-
-  squint:workload-pool
-  {:doc "Compile workload_pool.cljc to workload_pool.mjs, shipped as ffi-wasm/workload-pool."
-   :depends [npm:install]
-   :task (nb/squint-compile! "src/cljc/net/willcohen/native" "workload_pool.cljc")}
-
-  squint:platform-state
-  {:doc "Compile platform_state.cljc to platform_state.mjs, shipped as ffi-wasm/platform-state."
-   :depends [npm:install]
-   :task (nb/squint-compile! "src/cljc/net/willcohen/native" "platform_state.cljc")}
-
-  squint:dispatch
-  {:doc "Compile dispatch.cljc to dispatch.mjs, shipped as ffi-wasm/dispatch."
-   :depends [npm:install]
-   :task (nb/squint-compile! "src/cljc/net/willcohen/native" "dispatch.cljc")}
-
-  squint:macros
-  {:doc "Compile macros.cljc to macros.mjs, shipped as ffi-wasm/macros.
-In a consumer bundle the .mjs is dead code, but esbuild needs it to
-resolve the import.
-macros.cljc is the one .cljc in the npm tarball: squint reads it to expand
-the macros."
-   :depends [npm:install]
-   :task (nb/squint-compile! "src/cljc/net/willcohen/native" "macros.cljc")}
-
-  squint:test-runner
-  {:doc "Compile test_runner.cljc to test_runner.mjs, shipped as ffi-wasm/test-runner."
-   :depends [npm:install]
-   :task (nb/squint-compile! "src/cljc/net/willcohen/native" "test_runner.cljc")}
-
   check:exports
   {:doc "Check the module inventory of net.willcohen.native.build against package.json.
 Drift fails build:js, and through prepack each npm pack."
    :task (nb/check-exports-sync! "package.json")}
 
   build:js
-  {:doc "Compile each shipped CLJC module to JS."
-   :depends [check:exports
-             squint:pool squint:workload-pool squint:platform-state
-             squint:dispatch squint:macros squint:test-runner]}
-
-  squint:test:pool
-  {:doc "Compile pool_test.cljc, the cljs suite for LibraryContext lifetime. It runs under node --expose-gc."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "pool_test.cljc")}
-
-  squint:test:handler-runtime
-  {:doc "Compile handler_runtime_test.cljc, the cljs suite for the handler runtime."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "handler_runtime_test.cljc")}
-
-  squint:test:dispatch
-  {:doc "Compile dispatch_test.cljc, a suite for the JVM and cljs."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljc/net/willcohen/native" "dispatch_test.cljc")}
-
-  squint:test:macros
-  {:doc "Compile macros_test.cljc, a suite for the JVM and cljs."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljc/net/willcohen/native" "macros_test.cljc")}
-
-  squint:test:platform-state
-  {:doc "Compile platform_state_test.cljc, a suite for the JVM and cljs."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljc/net/willcohen/native" "platform_state_test.cljc")}
-
-  squint:test:http-bridge
-  {:doc "Compile http_bridge_test.cljc, the cljs suite for the sync HTTP bridge."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "http_bridge_test.cljc")}
-
-  squint:test:handler-env
-  {:doc "Compile handler_env_test.cljc, the cljs suite for the environment classifier."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "handler_env_test.cljc")}
-
-  squint:test:handler-fs
-  {:doc "Compile handler_fs_test.cljc, the cljs suite for MEMFS staging."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "handler_fs_test.cljc")}
-
-  squint:test:handler-heap
-  {:doc "Compile handler_heap_test.cljc, the cljs suite for the heap and ccall methods."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "handler_heap_test.cljc")}
-
-  squint:test:handler-paths
-  {:doc "Compile handler_paths_test.cljc, the cljs suite for asset and module paths."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "handler_paths_test.cljc")}
-
-  squint:test:workload-pool
-  {:doc "Compile workload_pool_test.cljc, the cljs suite for the workload-pool registry."
-   :depends [npm:install]
-   :task (nb/squint-compile! "test/cljs/net/willcohen/native" "workload_pool_test.cljc")}
+  {:doc "Compile each shipped .cljc or .cljs module to the .mjs that npm ships."
+   :depends [check:exports npm:install]
+   :task (let [dir "src/cljc/net/willcohen/native"]
+           (doseq [f nb/shipped-module-files
+                   :let [base (str/replace f (re-pattern "\\.mjs$") "")
+                         src  (first (filter (fn [src] (fs/exists? (fs/path dir src)))
+                                             [(str base ".cljc") (str base ".cljs")]))]
+                   :when src]
+             (nb/squint-compile! dir src)))}
 
   build:js:test
   {:doc "Compile each cljs.test suite."
-   :depends [squint:test:pool squint:test:handler-runtime squint:test:dispatch
-             squint:test:macros squint:test:platform-state squint:test:http-bridge
-             squint:test:workload-pool squint:test:handler-env
-             squint:test:handler-fs squint:test:handler-heap
-             squint:test:handler-paths]}
+   :depends [npm:install]
+   :task (doseq [f cljs-suites]
+           (nb/squint-compile! (str (fs/parent f)) (str (fs/file-name f))))}
 
   test:cljs
-  {:doc "Run the cljs.test suites on node. Each suite runs its tests on import.
-pool_test runs under --expose-gc to drive the FinalizationRegistry."
+  {:doc "Run the cljs.test suites on node. Each suite runs its tests on import."
    :depends [build:js build:js:test]
-   :task (do
-           (shell "node" "test/cljs/net/willcohen/native/handler_runtime_test.mjs")
-           (shell "node" "--expose-gc" "test/cljs/net/willcohen/native/pool_test.mjs")
-           (shell "node" "test/cljc/net/willcohen/native/dispatch_test.mjs")
-           (shell "node" "test/cljc/net/willcohen/native/macros_test.mjs")
-           (shell "node" "test/cljc/net/willcohen/native/platform_state_test.mjs")
-           (shell "node" "test/cljs/net/willcohen/native/http_bridge_test.mjs")
-           (shell "node" "test/cljs/net/willcohen/native/workload_pool_test.mjs")
-           (shell "node" "test/cljs/net/willcohen/native/handler_env_test.mjs")
-           (shell "node" "test/cljs/net/willcohen/native/handler_fs_test.mjs")
-           (shell "node" "test/cljs/net/willcohen/native/handler_heap_test.mjs")
-           (shell "node" "test/cljs/net/willcohen/native/handler_paths_test.mjs"))}
+   ;; pool_test drives the FinalizationRegistry through gc().
+   :task (doseq [f cljs-suites]
+           (shell "node" "--expose-gc" (str (fs/strip-ext f) ".mjs")))}
 
   jar
   {:doc "Build the net.willcohen/native jar with tools.build."
-   :task (do
-           (println "Building jar...")
-           (shell "clojure" "-T:build" "jar")
-           (println (str "Jar built: target/native-" project-version ".jar")))}
+   :task (shell "clojure" "-T:build" "jar")}
 
   install
   {:doc "Install the jar to ~/.m2, for a consumer to test with :mvn/version.
 The local copy shadows the Clojars release, so it does not prove that
 Clojars resolves."
    :depends [jar]
-   :task (do
-           (println "Installing to local .m2...")
-           (shell "clojure" "-X:deploy" ":installer" ":local")
-           (println (str "Installed net.willcohen/native " project-version
-                         " to ~/.m2.")))}
+   :task (shell "clojure" "-X:deploy" ":installer" ":local")}
 
   deploy:clojars
   {:doc "Deploy the jar to Clojars. Needs CLOJARS_USERNAME and CLOJARS_PASSWORD (a deploy token)."
    :depends [jar]
-   :task (do
-           (println "Deploying to Clojars...")
-           (shell "clojure" "-X:deploy")
-           (println "Deployed to Clojars."))}
+   :task (shell "clojure" "-X:deploy")}
 
   deploy:npm
   {:doc "Publish ffi-wasm to npm. The prepack script runs bb build:js first."
-   :task (do
-           (println "Publishing to npm...")
-           (shell "npm" "publish")
-           (println "Published to npm."))}
-
-  gen-handler
-  {:doc "Print the handler JS that gen-handler-source emits for a sample fndefs map."
-   :requires ([net.willcohen.native.gen-handler :as g])
-   :task (let [fndefs   {:mylib_create
-                         {:rettype :pointer
-                          :argtypes [[:context :pointer] [:definition :string]]}
-                         :mylib_destroy
-                         {:rettype :void
-                          :argtypes [[:handle :pointer]]
-                          :destroy? true}
-                         :mylib_context_destroy
-                         {:rettype :void
-                          :argtypes [[:context :pointer]]
-                          :destroy? true}}
-               overrides {:overrides-import-path "./demo-overrides.mjs"
-                          :runtime-import-path "ffi-wasm/handler-runtime"
-                          :exposed-methods [:ccall :malloc :free :shutdown]
-                          :busy-methods [:ccall :malloc]
-                          :destroy-methods [:free :shutdown]}]
-           (println (g/gen-handler-source fndefs overrides)))}}}
+   :task (shell "npm" "publish")}}}

@@ -66,7 +66,7 @@ capability has one implementation for each host.
 | malloc, free, UTF-8 | `malloc`, `free-on-heap`, `utf8->string` | `heapHelpers` `malloc`, `free`, `utf8_to_string` |
 | synchronous host HTTP | `net.willcohen.native.http` | `http-bridge` plus `fetch-worker` |
 | host callback into C | `callbacks` (Panama upcall), `graal-wasm/put-js-globals!` | a consumer handler method |
-| string-array walk | `string-array-pointer->strs` | `heapHelpers` `read_string_array` |
+| string-array walk | `string-array-pointer->strs` | none. The consumer writes it. |
 | struct read | `read-struct` | none. The consumer writes it. |
 
 Each `heapHelpers` entry is a key of the object that
@@ -128,10 +128,6 @@ The test directories divide the suites by runtime:
 - `test/cljs/`: CLJS suites (`cljs.test`), for `bb test:cljs`. squint compiles
   them, and Node runs them.
 - `test/bb/`: tests of the babashka build helpers, for `bb test:bb`.
-
-`bb test:cljs` runs the pool suite with `node --expose-gc`. The suite starts a
-garbage collection to do a test of its `FinalizationRegistry` sweeps. Without
-the flag, the suite fails.
 
 ## Nix flake
 

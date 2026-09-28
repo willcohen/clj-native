@@ -50,18 +50,11 @@
   (reset! impl-atom nil))
 
 (defn null-ptr?
-  "True when `p` is NULL for this runtime: nil on the JVM, nil or 0 on
-   cljs. Use it in place of nil?, which misses a cljs NULL and can make an
-   iterator loop run forever. A JVM :graal heap read gives 0 for NULL,
-   which this misses."
+  "True when `p` is NULL: nil or a numeric 0, on each runtime. A heap read
+   gives 0 for NULL. Use it in place of nil?, which misses that 0 and can
+   make an iterator loop run forever."
   [p]
-  #?(:clj  (nil? p)
-     :cljs (or (nil? p) (zero? p))))
-
-(defn some-ptr?
-  "True when `p` is a non-null pointer."
-  [p]
-  (not (null-ptr? p)))
+  (or (nil? p) (and (number? p) (zero? p))))
 
 #?(:clj
    (defn try-init!
@@ -73,25 +66,17 @@
       because a silent run on GraalVM is hard to diagnose."
      [impl-atom force-atom log? ffi-fn graal-fn]
      (let [chosen
-           (cond
-             @force-atom
+           (if @force-atom
              (do (when log? (println "Forcing GraalVM implementation."))
                  (graal-fn)
                  :graal)
-
-             :else
              (try
                (when log? (println "Attempting FFI implementation."))
                (ffi-fn)
                :ffi
                (catch Throwable e
-                 (println "-------------------- FFI Initialization Failure --------------------")
-                 (println "FFI initialization failed, falling back to GraalVM.")
-                 (println (str "Top-level exception: " (.getClass e) " - " (.getMessage e)))
-                 (when-let [cause (.getCause e)]
-                   (println (str "Root cause: " (.getClass cause) " - " (.getMessage cause))))
+                 (println "FFI initialization failed, falling back to GraalVM:")
                  (.printStackTrace e)
-                 (println "------------------------------------------------------------------")
                  (graal-fn)
                  :graal)))]
        (reset! impl-atom chosen)

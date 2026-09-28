@@ -40,7 +40,8 @@
                   :heapf64_set :heapf64_get :read_string_array
                   :heapu8_set :heapu8_get
                   :string_to_utf8 :utf8_to_string]
-   :destroy-methods [:context_destroy :free :shutdown]})
+   :destroy-methods [:context_destroy :free :shutdown]
+   :fingerprint-fields [:dbBytes]})
 
 (defn- destroy-block [source]
   (let [start (str/index-of source "const destroyFns =")
@@ -49,11 +50,11 @@
 
 (deftest gen-handler-source--imports
   (let [source (g/gen-handler-source sample-fndefs mylib-overrides)]
-    (is (str/includes? source "import { makeHandler } from 'ffi-wasm/handler-runtime'"))
+    (is (str/includes? source "import { makeHandler, byteLengthFingerprint } from 'ffi-wasm/handler-runtime'"))
     (is (str/includes? source "import * as overrides from './mylib-handler-overrides.mjs'"))))
 
 (deftest gen-handler-source--classification-arrays
-  (let [source (g/gen-handler-source sample-fndefs mylib-overrides)]
+  (let [source (g/gen-handler-source {} mylib-overrides)]
     (is (str/includes? source "const busyMethods ="))
     (is (str/includes? source "\"ccall\""))
     (is (str/includes? source "\"malloc\""))
@@ -95,15 +96,19 @@
   (testing "Missing :overrides-import-path throws"
     (is (thrown? Exception
                  (g/gen-handler-source
-                  sample-fndefs (dissoc mylib-overrides :overrides-import-path)))))
+                  {} (dissoc mylib-overrides :overrides-import-path)))))
   (testing "Missing :runtime-import-path throws"
     (is (thrown? Exception
                  (g/gen-handler-source
-                  sample-fndefs (dissoc mylib-overrides :runtime-import-path)))))
+                  {} (dissoc mylib-overrides :runtime-import-path)))))
   (testing "Missing :exposed-methods throws"
     (is (thrown? Exception
                  (g/gen-handler-source
-                  sample-fndefs (dissoc mylib-overrides :exposed-methods))))))
+                  {} (dissoc mylib-overrides :exposed-methods)))))
+  (testing "Missing :fingerprint-fields throws"
+    (is (thrown? Exception
+                 (g/gen-handler-source
+                  {} (dissoc mylib-overrides :fingerprint-fields))))))
 
 (deftest gen-handler-source--classification-is-optional
   ;; The runtime queue is serial, so the classification affects trace fields only.
@@ -118,12 +123,6 @@
     (zero? (:exit (sh/sh "sh" "-c" "command -v node")))
     (catch Throwable _ false)))
 
-(deftest gen-handler-source--fingerprint-defaults-to-the-overrides-export
-  (let [source (g/gen-handler-source sample-fndefs mylib-overrides)]
-    (is (str/includes? source "fingerprint: overrides.fingerprint,"))
-    (is (not (str/includes? source "byteLengthFingerprint"))
-        "nothing extra is imported when the overrides own the fingerprint")))
-
 (deftest gen-handler-source--fingerprint-fields-emit-a-generated-fingerprint
   ;; The overrides stay external to the bundle, so an overrides import of the
   ;; runtime would load a second copy of its logging state.
@@ -133,23 +132,20 @@
     (is (str/includes? source "import { makeHandler, byteLengthFingerprint } from")
         "the helper is imported alongside makeHandler, from the same one copy")
     (is (str/includes? source "byteLengthFingerprint(\n  [\"dbBytes\", \"iniBytes\", \"logLevel\"],\n  null,\n)"))
-    (is (str/includes? source "fingerprint: fingerprint,"))
+    (is (str/includes? source "  fingerprint,\n"))
     (is (not (str/includes? source "overrides.fingerprint"))
         "the overrides export is no longer consulted")))
 
+(defn- prefixed-source [prefix]
+  (g/gen-handler-source sample-fndefs (assoc mylib-overrides
+                                             :fingerprint-fields [:dbBytes]
+                                             :fingerprint-prefix prefix)))
+
 (deftest gen-handler-source--fingerprint-prefix-labels-the-handler
-  (let [source (g/gen-handler-source
-                sample-fndefs
-                (assoc mylib-overrides
-                       :fingerprint-fields [:dbBytes]
-                       :fingerprint-prefix "gdal"))]
-    (is (str/includes? source "byteLengthFingerprint(\n  [\"dbBytes\"],\n  'gdal',\n)")))
-  (testing "a prefix without fields is ignored, not emitted on its own"
-    (let [source (g/gen-handler-source
-                  sample-fndefs
-                  (assoc mylib-overrides :fingerprint-prefix "gdal"))]
-      (is (str/includes? source "fingerprint: overrides.fingerprint,"))
-      (is (not (str/includes? source "'gdal'"))))))
+  (is (str/includes? (prefixed-source "gdal")
+                     "byteLengthFingerprint(\n  [\"dbBytes\"],\n  \"gdal\",\n)"))
+  (testing "the prefix is a JS string literal, so a quote in it cannot end it"
+    (is (str/includes? (prefixed-source "o'b\"x") "  \"o'b\\\"x\",\n"))))
 
 (deftest gen-handler-source--output-parses-under-node
   ;; The fingerprint variant emits every form, the trailing-comma call included.
@@ -175,9 +171,9 @@
 (deftest write-handler!--writes-file
   (let [tmp (java.io.File/createTempFile "gen-handler-write-" ".mjs")]
     (try
-      (let [path (g/write-handler! sample-fndefs mylib-overrides (.getAbsolutePath tmp))
+      (let [path (g/write-handler! {} mylib-overrides (.getAbsolutePath tmp))
             content (slurp path)]
         (is (= (.getAbsolutePath tmp) path))
         (is (str/includes? content "export default create"))
-        (is (str/includes? content "import { makeHandler }")))
+        (is (str/includes? content "import { makeHandler, byteLengthFingerprint }")))
       (finally (.delete tmp)))))

@@ -30,15 +30,14 @@
     (set! (.-HEAPF64 m) (js/Float64Array. buffer))
     (set! (.-_malloc m) (fn [size] (let [p @bump] (swap! bump + (max 8 size)) p)))
     (set! (.-_free m) (fn [ptr] (swap! freed conj ptr) nil))
-    ;; read_string_array reads slots as "*", the same 4-byte read as i32 on wasm32.
     (set! (.-getValue m) (fn [ptr type]
                            (case type
-                             ("i32" "*") (aget (.-HEAP32 m) (bit-shift-right ptr 2))
+                             "i32" (aget (.-HEAP32 m) (bit-shift-right ptr 2))
                              "double" (aget (.-HEAPF64 m) (bit-shift-right ptr 3))
                              (throw (js/Error. (str "fake getValue: " type))))))
     (set! (.-setValue m) (fn [ptr value type]
                            (case type
-                             ("i32" "*") (aset (.-HEAP32 m) (bit-shift-right ptr 2) value)
+                             "i32" (aset (.-HEAP32 m) (bit-shift-right ptr 2) value)
                              "double" (aset (.-HEAPF64 m) (bit-shift-right ptr 3) value)
                              (throw (js/Error. (str "fake setValue: " type))))
                            nil))
@@ -120,17 +119,6 @@
       (is (= [7 7] (vec (js/Array.from got)))
           "a later heap write does not reach the copy, so it survives a free"))))
 
-(deftest ^:async the-shared-ok-result-is-frozen
-  ;; Methods with nothing to return share one result object, so a write to it
-  ;; would change every later answer.
-  (let [{:keys [module]} (fake-module)
-        heap (heapHelpers (fn [] module))
-        r (await ((.-free heap) 8))]
-    (is (true? (js/Object.isFrozen r)))
-    (is (thrown? js/TypeError (aset r "ok" false)))
-    (is (true? (.-ok (await ((.-set_value heap) 16 1 "i32"))))
-        "a later call still answers ok")))
-
 (deftest ^:async the-methods-object-late-binds-the-module
   (let [{:keys [module]} (fake-module)
         current (atom nil)
@@ -141,56 +129,6 @@
     (reset! current module)
     (is (pos? (await ((.-malloc heap) 8)))
         "the same object works once init has resolved the module")))
-
-(defn- ^:async write-string-array!
-  "Write each of `strs` at its address in `addrs`, then a NULL-terminated
-   pointer table at `table-ptr`."
-  [heap table-ptr addrs strs]
-  (doseq [[addr s] (map vector addrs strs)]
-    (await ((.-string_to_utf8 heap) s addr (inc (count s)))))
-  (await ((.-heapu32_set heap)
-          (bit-shift-right table-ptr 2)
-          (js/Uint32Array. (into-array (conj (vec addrs) 0))))))
-
-(deftest ^:async read-string-array-walks-a-null-terminated-table
-  (let [{:keys [module]} (fake-module)
-        heap (heapHelpers (fn [] module))]
-    (await (write-string-array! heap 400 [100 200 300] ["alpha" "beta" "gamma"]))
-    (is (= ["alpha" "beta" "gamma"]
-           (vec (await ((.-read_string_array heap) 400)))))))
-
-(deftest ^:async read-string-array-gives-an-empty-vector-for-a-null-list
-  (let [{:keys [module]} (fake-module)
-        heap (heapHelpers (fn [] module))]
-    (is (= [] (vec (await ((.-read_string_array heap) 0))))
-        "a null char** is an empty list, and not a walk from address 0")))
-
-(deftest ^:async an-empty-string-entry-is-not-the-terminator
-  ;; The terminator is a NULL slot. Treating an empty string as one silently
-  ;; truncates the list.
-  (let [{:keys [module]} (fake-module)
-        heap (heapHelpers (fn [] module))]
-    (await (write-string-array! heap 400 [100 200 300] ["alpha" "" "gamma"]))
-    (is (= ["alpha" "" "gamma"]
-           (vec (await ((.-read_string_array heap) 400)))))))
-
-(deftest ^:async read-string-array-rejects-a-misaligned-pointer
-  (let [{:keys [module]} (fake-module)
-        heap (heapHelpers (fn [] module))]
-    (is (thrown-with-msg? js/Error #"not 4-byte aligned"
-                          (await ((.-read_string_array heap) 401))))))
-
-(deftest ^:async an-unterminated-table-throws-instead-of-spinning
-  ;; Without the bound this hangs rather than fails, because an out-of-range
-  ;; typed-array read gives undefined and undefined is not 0.
-  (let [{:keys [module]} (fake-module)
-        heap (heapHelpers (fn [] module))
-        slots (bit-shift-right (- 1024 512) 2)]
-    ;; Byte 4 holds a NUL, so every slot decodes to "" and none terminates.
-    (await ((.-heapu32_set heap) (bit-shift-right 512 2)
-            (js/Uint32Array. (into-array (repeat slots 4)))))
-    (is (thrown-with-msg? js/Error #"walked past the end of the heap"
-                          (await ((.-read_string_array heap) 512))))))
 
 (deftest ^:async ccall-method-forwards-its-four-arguments
   (let [{:keys [module ccalls]} (fake-module)

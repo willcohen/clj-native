@@ -14,11 +14,11 @@
                :cljs ["ffi-wasm/dispatch" :as d])
             #?(:clj [net.willcohen.native.platform])
             #?(:clj [tech.v3.datatype.ffi :as dt-ffi])
+            #?(:cljs ["ffi-wasm/pool" :as pool])
             #?(:cljs ["ffi-wasm/test-runner" :as tr])))
 
 (def number-typed-argtypes
-  [:pointer :pointer? :string-array :string-array?
-   :int32 :int64 :float64 :size-t :void])
+  [:pointer :pointer? :int32 :int64 :float64 :size-t :void])
 
 (def sample-fndefs
   {:lib_make  {:rettype :pointer :argtypes [[:ctx :pointer] [:name :string]]}
@@ -46,6 +46,11 @@
                  (d/library {:key :bad-lib
                              :fndefs {:lib_bad {:rettype :int128
                                                 :argtypes [[:x :pointer]]}}}))))
+  (testing "a string-array type throws, since dt-ffi has none"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (d/library {:key :bad-lib
+                             :fndefs {:lib_sa {:rettype :void
+                                               :argtypes [[:x :string-array]]}}}))))
   (testing "an unknown argtype throws at assembly"
     (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (d/library {:key :bad-lib
@@ -93,11 +98,7 @@
        (is (some? (d/jvm-rettype-postprocess :pointer? 4096)))
        (is (= (class (d/jvm-rettype-postprocess :pointer 4096))
               (class (d/jvm-rettype-postprocess :pointer? 4096)))
-           "both spellings produce the same wrapper type"))
-     (testing "a string-array return stays a raw address on purpose"
-       (is (= 4096 (d/jvm-rettype-postprocess :string-array 4096))
-           "the caller decides when to walk the array")
-       (is (= 0 (d/jvm-rettype-postprocess :string-array? 0))))))
+           "both spellings produce the same wrapper type"))))
 
 (deftest validate-fn-def!-names-every-supported-type
   ;; supported-types-msg is a literal, since (str :pointer) differs between
@@ -109,7 +110,7 @@
               (catch #?(:clj Exception :cljs :default) e
                 #?(:clj (.getMessage e) :cljs (.-message e))))]
     (is (some? msg) "an unsupported rettype has to throw for this to mean anything")
-    ;; Match whole tokens, since ":string" is a prefix of ":string-array".
+    ;; Match whole tokens, since ":string" is a prefix of ":string?".
     (let [tokens (set (string/split msg #"[ ,]+"))]
       (is (contains? tokens ":pointer") "the token split has to produce bare types")
       (doseq [t d/supported-types]
@@ -135,7 +136,7 @@
            ;; Postprocess passes an :int32 through, so the stub's value returns.
            (is (= 99 (d/call! lib :lib_count [7]))
                "same library value now routes to graal")))
-       (testing "the FFI leg gives a C string for a :string? argument, and nil for nil"
+       (testing "the FFI backend gives a C string for a :string? argument, and nil for nil"
          (reset! impl :ffi)
          (reset! calls [])
          (let [sq-lib (d/library {:key :sq-lib
@@ -206,7 +207,7 @@
     (is (= 21 r) "no hook means the result passes through")))
 
 #?(:cljs
-   (deftest ^:async cljs-leg-sends-an-int64-argument-as-a-bigint
+   (deftest ^:async call!-on-cljs-sends-an-int64-argument-as-a-bigint
      ;; A WASM_BIGINT module rejects a JS number for an i64 parameter.
      (let [seen (atom nil)
            fake #js {:worker (fn [_idx]
@@ -221,5 +222,43 @@
        (is (= 7 r))
        (is (= (js/BigInt "3000000000") (aget @seen 0)) "the :int64 argument is a BigInt")
        (is (= 1 (aget @seen 1)) "an :int32 argument stays a number"))))
+
+#?(:cljs
+   (deftest ^:async call!-on-cljs-runs-the-hooks-in-order
+     (let [seen (atom nil)
+           fake #js {:worker (fn [_idx]
+                               (js-obj "hook-lib" #js {:ccall (fn [& xs] (reset! seen (vec xs)) 5)}))}
+           lib  (d/library
+                 {:key :hook-lib
+                  :fndefs {:lib_iso {:rettype :int32 :argtypes [[:a :int32]] :isolate-context? true}}
+                  :hooks {:extras-builder (fn [_fn-def args]
+                                            {:args (mapv inc args)
+                                             :extras {:coords "c" :none nil}
+                                             :on-result (fn [r] (* 10 r))})
+                          :context-isolator (fn [{:keys [args]}]
+                                              (js/Promise.resolve {:args (mapv #(* 2 %) args) :clone 9}))
+                          :result-wrapper (fn [{:keys [result isolator-result]}]
+                                            [result (:clone isolator-result)])}})
+           r    (await (d/call! lib :lib_iso [1] #js {:pool fake}))]
+       (is (= [50 9] r) "on-result, then the result-wrapper with the isolator map")
+       (is (= [4] (vec (nth @seen 3))) "the builder args, then the isolator args")
+       (is (= "c" (.-coords (nth @seen 4))) "an extra goes in the fifth arg")
+       (is (not (.hasOwnProperty (nth @seen 4) "none")) "a nil extra does not"))))
+
+#?(:cljs
+   (deftest ^:async call!-on-cljs-rejects-an-evicted-handle-before-any-call
+     (let [calls (atom 0)
+           fake  #js {:worker (fn [_idx]
+                                (js-obj "ev-lib" #js {:ccall (fn [& _] (swap! calls inc) 1)}))}
+           lib   (d/library {:key :ev-lib :fndefs {:lib_use {:rettype :int32 :argtypes [[:h :pointer]]}}})
+           owner #js {}]
+       (pool/register-library-context! :ev-lib {:min-age-ms 0})
+       (pool/register-handle! :ev-lib "h1" 0 (fn [] (js/Promise.resolve nil)) owner)
+       (pool/evict-oldest! :ev-lib)
+       (let [err (await (-> (d/call! lib :lib_use [#js {:ctx_id "h1" :ptr 8}] #js {:pool fake})
+                            (.then (fn [_] nil))
+                            (.catch (fn [e] (.-message e)))))]
+         (is (and err (.includes err "evicted")))
+         (is (= 0 @calls))))))
 
 #?(:cljs (tr/run-tests-and-exit! "net.willcohen.native.dispatch-test"))

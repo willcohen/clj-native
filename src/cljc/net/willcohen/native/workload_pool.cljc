@@ -62,7 +62,7 @@
            (.set thread-init-errors (assoc (.get thread-init-errors) lib-key e)))))))
 
 #?(:clj
-   (defn- destroy-thread-handler-state!
+   (defn- run-handler-destroys!
      "Run each handler destroy on the state of this thread, in reverse
       registration order. Then clear the ThreadLocal."
      [handlers]
@@ -78,50 +78,44 @@
        (.set thread-handler-state {}))))
 
 ;; The explicit release and the GC dispose-fn call the same native destructor.
-;; A CAS on a weak-keyed sentinel for each pointer stops the double free.
+;; A CAS on a weak-keyed flag for each pointer stops the double free.
 
 #?(:clj
-   (def ^:private ^java.util.Map released-sentinels
+   (def ^:private ^java.util.Map released-flags
      (java.util.Collections/synchronizedMap (java.util.WeakHashMap.))))
-
-#?(:clj
-   (defn- get-or-make-sentinel!
-     ^java.util.concurrent.atomic.AtomicBoolean [pointer]
-     (locking released-sentinels
-       (or (.get released-sentinels pointer)
-           (let [s (java.util.concurrent.atomic.AtomicBoolean. false)]
-             (.put released-sentinels pointer s)
-             s)))))
 
 #?(:clj
    (defn release-once!
      "Run zero-arg `release-fn` at most once for each `pointer`, across
       threads, while the first `pointer` object passed stays reachable (the
-      sentinels have weak keys). Pass a dt-ffi Pointer or a pointer record,
+      flags have weak keys). Pass a dt-ffi Pointer or a pointer record,
       not a long: a long boxes anew on each call, so after a GC release-fn
       can run again. Returns true when it ran here, else nil.
 
       With a non-nil `lock`, release-fn also runs under that lock. Pass one
       lock for each library with process-global state, where the destroys of
       two different pointers can race into a SIGSEGV."
-     ([pointer release-fn]
-      (release-once! pointer nil release-fn))
-     ([pointer lock release-fn]
-      (when pointer
-        (let [sentinel (get-or-make-sentinel! pointer)]
-          (when (.compareAndSet sentinel false true)
-            (if lock
-              (locking lock (release-fn))
-              (release-fn))
-            true))))))
+     [pointer lock release-fn]
+     (when pointer
+       (let [^java.util.concurrent.atomic.AtomicBoolean flag
+             (.computeIfAbsent released-flags pointer
+                               (reify java.util.function.Function
+                                 (apply [_ _] (java.util.concurrent.atomic.AtomicBoolean. false))))]
+         (when (.compareAndSet flag false true)
+           (if lock
+             (locking lock (release-fn))
+             (release-fn))
+           true)))))
 
 #?(:clj
    (defn- make-thread-factory
-     "A ThreadFactory of daemon threads named clj-native-<slot>-<n>. Each
-      thread is in `threads` until it has run the handler destroys of
-      `workload` at its end."
-     [slot-name handlers-atom workload threads]
-     (let [counter (atom 0)]
+     "A ThreadFactory of daemon threads named clj-native-<workload>-<n>. Each
+      thread is in (:threads registry) until it has run the handler destroys
+      of `workload` at its end."
+     ^ThreadFactory [registry workload]
+     (let [handlers (:handlers registry)
+           threads  (:threads registry)
+           counter  (atom 0)]
        (reify ThreadFactory
          (newThread [_ runnable]
            (let [n (swap! counter inc)
@@ -134,47 +128,38 @@
                           ;; that waits must not see the flag.
                           (Thread/interrupted)
                           (try
-                            (destroy-thread-handler-state! (get @handlers-atom workload))
+                            (run-handler-destroys! (get @handlers workload))
                             (finally
                               (swap! threads disj (Thread/currentThread))))))))]
-             (.setName t (str "clj-native-" slot-name "-" n))
+             (.setName t (str "clj-native-" (name workload) "-" n))
              (.setDaemon t true)
              (swap! threads conj t)
              t))))))
 
 #?(:clj
-   (defn- handler-executor
-     "A fixed pool of `size` threads that run the handler inits, through
-      `bind!`, before each task."
-     ^ThreadPoolExecutor [size ^ThreadFactory factory bind!]
-     (proxy [ThreadPoolExecutor] [(int size) (int size) 0 TimeUnit/MILLISECONDS
-                                  (LinkedBlockingQueue.) factory]
-       (beforeExecute [_ _]
-         (bind!)))))
+   (defn- slot-executor
+     "The fixed pool of `workload`: (:size registry) threads that run the
+      handler inits of `workload` before each task."
+     ^ThreadPoolExecutor [registry workload]
+     (let [size (int (:size registry))]
+       (proxy [ThreadPoolExecutor] [size size 0 TimeUnit/MILLISECONDS
+                                    (LinkedBlockingQueue.)
+                                    (make-thread-factory registry workload)]
+         (beforeExecute [_ _]
+           (run-handler-inits! (get @(:handlers registry) workload)))))))
 
 (defn init-workload-pool!
   "Create a workload pool registry.
 
-     :size      JVM: default worker count for each slot (availableProcessors).
+     :size      JVM: worker count of each slot (availableProcessors).
                 CLJS: pool worker count, :auto (default) or an integer.
-     :sizes     (JVM) Worker count for each slot, such as {:io 32}. A
-                missing slot uses :size.
      :handler-runtime (CLJS) Diagnostic config for pool/init-pool!.
 
-   The returned map is API, and the workload-pool suites pin it.
-   JVM: :slots and :handlers atoms keyed :mixed, :io and :compute; a
-   :threads atom; :size; :sizes; :runtime :jvm; a :terminated? atom.
-   CLJS: atoms :pool, :owned?, :latch (the init promise), :generation,
-   :handlers (a vector in registration order) and :terminated?; :opts;
-   :runtime :cljs. A consumer in another package reads the pool through
-   current-pool, never (:pool registry)."
+   (CLJS) Read the pool through current-pool."
   [opts]
   #?(:clj
      (let [size (or (:size opts)
-                    (.. Runtime getRuntime availableProcessors))
-           per-slot (:sizes opts)
-           sizes (into {} (for [slot [:mixed :io :compute]]
-                            [slot (or (get per-slot slot) size)]))]
+                    (.. Runtime getRuntime availableProcessors))]
        {:slots (atom {:mixed   nil
                       :io      nil
                       :compute nil})
@@ -183,21 +168,17 @@
                          :compute []})
         :threads (atom #{})
         :size size
-        :sizes sizes
-        :runtime :jvm
         :terminated? (atom false)})
      :cljs
      {:pool (atom nil)
       :owned? (atom false)
-      :latch (atom nil)
-      :generation (atom 0)
+      :promise (atom nil)
       :stopping (atom nil)
       :handlers (atom [])
       :opts opts
-      :runtime :cljs
       :terminated? (atom false)}))
 
-(defn- assoc-handler
+(defn- replace-or-append-handler
   "`entries` with `entry` in place of the entry of its lib-key, or added at
    the end."
   [entries entry]
@@ -235,7 +216,7 @@
    import a new module."
   [registry workload lib-key spec]
   #?(:clj
-     (do (swap! (:handlers registry) update workload assoc-handler
+     (do (swap! (:handlers registry) update workload replace-or-append-handler
                 (assoc spec :lib-key lib-key))
          registry)
      :cljs
@@ -245,24 +226,21 @@
                               ":module or :pre-terminate (lib-key "
                               lib-key ")")
                          {:lib-key lib-key})))
-       (when (and (:module entry) (some? @(:latch registry)))
-         (throw (ex-info (str "workload-pool: the joint pool already "
+       (when (and (:module entry) (some? @(:promise registry)))
+         (throw (ex-info (str "workload-pool: the pool already "
                               "exists; a spec with a :module must register "
                               "before ensure-pool!/adopt-pool! (lib-key "
                               lib-key ")")
                          {:lib-key lib-key})))
-       (swap! (:handlers registry) assoc-handler entry)
+       (swap! (:handlers registry) replace-or-append-handler entry)
        registry)))
 
-(defn current-context
-  "Return the state for `lib-key` on this pool thread. Throws the error of
-   its init when that failed on this thread. Throws on a non-pool thread, or
-   when no handler is registered for `lib-key`.
-
-   CLJS always throws: worker state lives inside the worker, and the handler
-   module reaches it there."
-  [lib-key]
-  #?(:clj
+#?(:clj
+   (defn current-context
+     "Return the state of `lib-key` on this pool thread. Throws the error of
+      its init when that failed on this thread. Throws on a non-pool thread,
+      or when no handler is registered for `lib-key`."
+     [lib-key]
      (let [state (.get thread-handler-state)]
        (when-let [e (get (.get thread-init-errors) lib-key)]
          (throw e))
@@ -277,53 +255,41 @@
                       "for lib-key " lib-key " on this thread")
                  {:lib-key lib-key
                   :available (keys state)})))
-       (get state lib-key))
-     :cljs
-     (throw (ex-info
-             (str "clj-native.workload-pool: current-context is not "
-                  "callable from the main thread on CLJS (lib-key "
-                  lib-key "). Per-worker state lives inside Web Workers "
-                  "and is unreachable synchronously; worker-side code "
-                  "reaches its own state through the worker-router "
-                  "handler module.")
-             {:lib-key lib-key}))))
+       (get state lib-key))))
 
 #?(:clj
    (defn current-context-or-nil
      "current-context, but nil where it would throw, for a per-call probe
       that cannot afford the ex-info."
      [lib-key]
-     (let [state (.get thread-handler-state)]
-       (when state
-         (get state lib-key)))))
+     (get (.get thread-handler-state) lib-key)))
 
 #?(:cljs
-   (defn- ^:async spawn-joint-pool!
+   (defn- ^:async spawn-pool!
      "Fold every spec with a :module into one pool/init-pool! call, and
       record the pool on `registry`. Rejects when no spec has a :module,
       since that pool could run nothing."
      [registry]
      (let [entries @(:handlers registry)
-           modular (filterv (fn [e] (some? (:module e))) entries)]
-       (when (zero? (count modular))
+           module-specs (filterv (fn [e] (some? (:module e))) entries)]
+       (when (zero? (count module-specs))
          (throw (ex-info (str "workload-pool: no registered handler spec "
                               "carries a :module; register-handler! before "
                               "ensure-pool!")
-                         {:registered (mapv (fn [e] (:lib-key e)) entries)})))
+                         {:registered (mapv :lib-key entries)})))
        (let [handlers (reduce (fn [m e]
                                 (assoc m (:lib-key e)
                                        {:module (:module e)
                                         :init   (:args e)}))
                               {}
-                              modular)
+                              module-specs)
              opts     (:opts registry)
-             result   (await (pool/init-pool!
+             p        (await (pool/init-pool!
                               {:handlers        handlers
                                :size            (:size opts)
-                               :handler-runtime (:handler-runtime opts)}))
-             p        (.-pool result)]
+                               :handler-runtime (:handler-runtime opts)}))]
          (reset! (:pool registry) p)
-         (reset! (:owned? registry) (.-owned result))
+         (reset! (:owned? registry) true)
          p))))
 
 #?(:cljs
@@ -335,13 +301,13 @@
      [registry]
      (if-let [stopping @(:stopping registry)]
        (.then stopping (fn [_] (ensure-pool! registry)))
-       (or @(:latch registry)
-           (let [promise (.catch (spawn-joint-pool! registry)
+       (or @(:promise registry)
+           (let [promise (.catch (spawn-pool! registry)
                                  (fn [err]
-                                   (reset! (:latch registry) nil)
+                                   (reset! (:promise registry) nil)
                                    (throw err)))]
              (reset! (:terminated? registry) false)
-             (reset! (:latch registry) promise)
+             (reset! (:promise registry) promise)
              promise)))))
 
 #?(:cljs
@@ -351,7 +317,7 @@
       :pre-terminate hooks but leaves `p` up. Throws when a pool is present
       or initializing. Returns `registry`."
      [registry p]
-     (when (some? @(:latch registry))
+     (when (some? @(:promise registry))
        (throw (ex-info (str "workload-pool: a pool is already present or "
                             "initializing; shutdown-pool! before "
                             "adopt-pool!")
@@ -359,7 +325,7 @@
      (reset! (:pool registry) p)
      (reset! (:owned? registry) false)
      (reset! (:terminated? registry) false)
-     (reset! (:latch registry) (js/Promise.resolve p))
+     (reset! (:promise registry) (js/Promise.resolve p))
      registry))
 
 #?(:cljs
@@ -392,15 +358,7 @@
              ;; Again under the lock, so close-slots! cannot miss a new slot.
              (throw-if-terminated registry workload)
              (or (get @slots workload)
-                 (let [size (or (get (:sizes registry) workload) (:size registry))
-                       factory (make-thread-factory (name workload)
-                                                    (:handlers registry)
-                                                    workload
-                                                    (:threads registry))
-                       exec (handler-executor
-                             size factory
-                             #(run-handler-inits!
-                               (get @(:handlers registry) workload)))]
+                 (let [exec (slot-executor registry workload)]
                    (swap! slots assoc workload exec)
                    exec)))))))
 
@@ -434,24 +392,23 @@
    (defn- ^:async stop-pool!
      "The CLJS shutdown-pool! work. Clears :stopping at the end."
      [registry]
-     (let [latch   @(:latch registry)
-           _       (await (js/Promise.allSettled [latch]))
+     (let [promise @(:promise registry)
+           _       (await (js/Promise.allSettled [promise]))
            p       @(:pool registry)
            owned?  @(:owned? registry)
            entries (vec (reverse @(:handlers registry)))]
        (await (run-pre-terminate-hooks! entries))
        (when (and (some? p) owned?)
          (try
-           (await (pool/terminate-pool! p))
+           (await (.terminate p))
            (catch :default e
              ;; The pool dies with its workers anyway. Finish the cleanup.
              (js/console.warn "workload-pool: pool terminate rejected"
                               e))))
        ;; An adopt-pool! during the wait owns a newer pool.
-       (when (compare-and-set! (:latch registry) latch nil)
+       (when (compare-and-set! (:promise registry) promise nil)
          (reset! (:pool registry) nil)
          (reset! (:owned? registry) false))
-       (swap! (:generation registry) inc)
        (reset! (:stopping registry) nil)
        registry)))
 
@@ -464,9 +421,9 @@
 
    CLJS: wait for a pool that is starting, then run the :pre-terminate hooks
    in reverse registration order, and log a failure. Terminate the pool only
-   when the registry owns it. Then remove the pool from the registry, and
-   increment :generation. The specs stay registered, so a later ensure-pool!
-   spawns a fresh pool. A call during the shutdown returns its Promise."
+   when the registry owns it. Then remove the pool from the registry. The
+   specs stay registered, so a later ensure-pool! spawns a fresh pool. A
+   call during the shutdown returns its Promise."
   [registry]
   #?(:clj
      (when-let [execs (close-slots! registry)]
@@ -499,7 +456,7 @@
       callers each spawn a pool."
      []
      {:registry (atom nil)
-      :latch (atom nil)
+      :promise (atom nil)
       :stopping (atom nil)}))
 
 #?(:cljs
@@ -508,7 +465,7 @@
       adopt the :pool of the caller or spawn an owned pool. Resolves to the
       pool."
      [wiring opts]
-     (let [reg         (init-workload-pool! (or (:registry-opts opts) {}))
+     (let [reg         (init-workload-pool! (get opts :registry-opts {}))
            register!   (:register! opts)
            caller-pool (:pool opts)]
        (reset! (:registry wiring) reg)
@@ -537,13 +494,13 @@
      [wiring opts]
      (if-let [stopping @(:stopping wiring)]
        (.then stopping (fn [_] (ensure-wired! wiring opts)))
-       (or @(:latch wiring)
+       (or @(:promise wiring)
            (let [promise (.catch (run-wiring! wiring opts)
                                  (fn [err]
                                    (reset! (:registry wiring) nil)
-                                   (reset! (:latch wiring) nil)
+                                   (reset! (:promise wiring) nil)
                                    (throw err)))]
-             (reset! (:latch wiring) promise)
+             (reset! (:promise wiring) promise)
              promise)))))
 
 #?(:cljs
@@ -560,18 +517,11 @@
 
 #?(:cljs
    (defn live-pool?
-     "True when `p` is the pool that `wiring` routes to now.
-
-      A consumer that tracks native handles records the pool of each handle
-      and checks it here before it posts a teardown. A GC callback can fire
-      after shutdown-wiring! and ensure-wired! replace the pool. The new pool
-      restarts its worker ids, so a stale teardown would free a live handle.
-      Drop it: its memory died with the old workers.
-
-      The check uses pool identity, not :generation, so the teardowns of an
-      adopted pool run again once the consumer adopts it again. A teardown
-      between shutdown-wiring! and that re-adoption is dropped, and its
-      memory leaks."
+     "True when `p` is the pool that `wiring` routes to now. Check the
+      recorded pool of a handle here before a GC teardown posts: a new pool
+      restarts its worker ids, so a stale teardown frees a live handle. The
+      check uses identity, so the teardowns of an adopted pool resume once it
+      is adopted again; one between the shutdown and the re-adoption leaks."
      [wiring p]
      (and (some? p) (identical? p (wiring-pool wiring)))))
 
@@ -579,12 +529,12 @@
    (defn- ^:async stop-wiring!
      "The shutdown-wiring! work. Clears :stopping at the end."
      [wiring]
-     (await (js/Promise.allSettled [@(:latch wiring)]))
+     (await (js/Promise.allSettled [@(:promise wiring)]))
      (let [reg @(:registry wiring)]
        (when (some? reg)
          (await (shutdown-pool! reg))
          (reset! (:registry wiring) nil)
-         (reset! (:latch wiring) nil))
+         (reset! (:promise wiring) nil))
        (reset! (:stopping wiring) nil)
        reg)))
 

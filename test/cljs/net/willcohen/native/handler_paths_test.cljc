@@ -11,7 +11,8 @@
             ["ffi-wasm/test-runner" :as tr]
             ["node:fs" :refer [mkdirSync mkdtempSync rmSync writeFileSync]]
             ["node:os" :refer [tmpdir]]
-            ["node:path" :refer [join]]))
+            ["node:path" :refer [join]]
+            ["node:url" :refer [fileURLToPath]]))
 
 (def ^:private here (.-url js/import.meta))
 
@@ -91,14 +92,8 @@
     (let [m (await ((.-factory r) #js {}))]
       (is (= "fake-emscripten" (.-marker m)) "invoking it produces the module"))
     (testing "locateFile points a sibling name at the directory the import came from"
-      (is (= (join (.-dir r) "fake-emscripten.wasm")
+      (is (= (fileURLToPath (js/URL. "../../../../fixtures/fake-emscripten.wasm" here))
              ((.-locateFile r) "fake-emscripten.wasm"))))))
-
-(deftest ^:async load-emscripten-module-takes-a-node-only-name-override
-  (let [r (await (loadEmscriptenModule here #js {:nodeName "fake-emscripten.mjs"
-                                                 :browserName "never-loaded-here.mjs"
-                                                 :candidates fixtures-candidates}))]
-    (is (fn? (.-factory r)) "the Node name is the one used on Node")))
 
 (deftest ^:async load-emscripten-module-needs-a-name
   (is (thrown-with-msg? js/Error #"needs a `name`"

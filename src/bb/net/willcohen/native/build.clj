@@ -267,8 +267,12 @@
                  ;; archives with lib.exe. zig's lld passes as a GNU ld.
                  windows? (assoc "LD" "ld.lld"))]
     (fs/create-dirs bin-dir)
+    ;; At -O0 zig links its UBSan runtime, which imports ntdll.dll on
+    ;; Windows. Trap mode keeps the checks without the runtime.
     (doseq [[_ t] tools]
-      (write-tool-wrapper! (tool t) (if (#{"cc" "c++"} t) [t "-target" target] [t])))
+      (write-tool-wrapper! (tool t) (if (#{"cc" "c++"} t)
+                                      [t "-target" target "-fsanitize-trap=undefined"]
+                                      [t])))
     ;; An empty pkg-config search, as the CMake root below: a .pc file of
     ;; the build machine would link its libs, whatever their license. The
     ;; nixpkgs wrapper replaces PKG_CONFIG_PATH with a _FOR_TARGET or

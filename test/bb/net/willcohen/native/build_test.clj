@@ -137,6 +137,7 @@
           :let [{:keys [env cmake-args] :as zig} (nb/zig-toolchain! dir (fs/create-temp-dir))]]
     (is (= host (:host zig)) "a --host that config.sub knows")
     (is (str/includes? (slurp (get env "CC")) (str "-target " target)))
+    (is (every? #(str/includes? (slurp (get env %)) "-fsanitize-trap=undefined") ["CC" "CXX"]))
     (is (every? #(fs/executable? (get env %)) ["CC" "CXX" "AR" "RANLIB"]))
     (is (some #{(str "-DCMAKE_SYSTEM_NAME=" system)} cmake-args))
     (is (some #{(str "-DCMAKE_SYSTEM_PROCESSOR=" (first (str/split target #"-")))} cmake-args))
@@ -224,6 +225,11 @@
       (spit src "#include <math.h>\n#include <sys/stat.h>\nint x(const char *p) { struct stat s; return stat(p, &s) + (int)sqrt(4.0); }\n")
       (doseq [dir ["linux-amd64" "linux-amd64-musl"]]
         (is (nil? (nb/check-linux-lib! dir (lib dir))) dir))
+      (let [{:keys [env]} (nb/zig-toolchain! "linux-amd64" (fs/path tmp "bin"))
+            out (str (fs/path tmp "debug.so"))]
+        (tasks/shell (get env "CC") "-O0" "-fPIC" "-shared" "-o" out src)
+        (is (not (str/includes? (:out (tasks/shell {:out :string} "readelf" "-Ws" out)) "__ubsan"))
+            "a -O0 lib carries no UBSan runtime"))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not fit linux-amd64-musl \(NEEDED libc\.so\.6, needs GLIBC_"
                             (nb/check-linux-lib! "linux-amd64-musl" (str (fs/path tmp "linux-amd64.so"))))
           "a glibc lib in a musl dir"))))
@@ -294,16 +300,19 @@ Import {
     (println "SKIP check-windows-lib-accepts-a-zig-dll: no zig or llvm-readobj on the PATH")
     (let [tmp (fs/create-temp-dir)
           src (str (fs/path tmp "x.cpp"))
-          lib (fn [dir out & libs]
+          lib (fn [dir out & args]
                 (let [{:keys [env]} (nb/zig-toolchain! dir (fs/path tmp dir))
                       out (str (fs/path tmp out))]
-                  (apply tasks/shell (get env "CXX") "-O2" "-shared" "-o" out src libs)
+                  (apply tasks/shell (get env "CXX") "-O2" "-shared" "-o" out src args)
                   out))]
       (spit src (str "#include <stdexcept>\n#include <string>\n"
                      "extern \"C\" int x(const char *s) {\n"
                      "  try { if (std::string(s).empty()) throw std::runtime_error(\"e\"); }\n"
                      "  catch (...) { return -1; }\n  return 1;\n}\n"))
       (is (nil? (nb/check-windows-lib! "windows-amd64" (lib "windows-amd64" "x.dll"))))
+      ;; The last -O wins. -O0 is the level of a CMake Debug build.
+      (is (nil? (nb/check-windows-lib! "windows-amd64" (lib "windows-amd64" "x0.dll" "-O0")))
+          "a -O0 DLL")
       (spit src (str "#include <winsock2.h>\n"
                      "extern \"C\" int y(void) { return WSAGetLastError(); }\n"))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"(?i)imports ws2_32\.dll"

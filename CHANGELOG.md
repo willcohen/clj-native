@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- The JVM writes the classes that dtype-next generates to a temp dir. A
+  project gets no `./classes` dir.
+- A zig `-O0` build links no UBSan runtime.
+
 ## [0.0.2] - 2026-09-28
 
 ### Added
@@ -41,3 +49,7 @@
 ## [0.0.1] - 2026-07-30
 
 First release.
+
+[Unreleased]: https://github.com/willcohen/clj-native/compare/0.0.2...HEAD
+[0.0.2]: https://github.com/willcohen/clj-native/compare/0.0.1...0.0.2
+[0.0.1]: https://github.com/willcohen/clj-native/releases/tag/0.0.1

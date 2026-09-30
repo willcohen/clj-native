@@ -459,6 +459,16 @@
     (is (instance? Long r))
     (is (= 3000000000 r) "all 64 bits, above 2^31")))
 
+(deftest call!-on-graal-passes-and-returns-a-float32
+  ;; The f32 export narrows the number, so 0.1 comes back as the nearest f32.
+  (let [lib (dispatch/library {:key lib-key
+                               :fndefs {:f32_id {:rettype :float32
+                                                 :argtypes [[:v :float32]]}}
+                               :impl-atom (atom :graal)})
+        r   (on-module (dispatch/call! lib :f32_id [0.1]))]
+    (is (instance? Double r) "a Double, not a Polyglot Value")
+    (is (= (double (float 0.1)) r))))
+
 (deftest call!-on-graal-sends-an-int64-argument-as-a-bigint
   ;; A WASM_BIGINT module rejects a JS number for an i64 parameter.
   (let [lib (dispatch/library {:key lib-key

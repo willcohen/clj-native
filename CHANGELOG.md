@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `:float32`, a C float, as an argument or a return type.
+
 ### Fixed
 
 - The JVM writes the classes that dtype-next generates to a temp dir. A

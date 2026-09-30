@@ -12,6 +12,7 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.tools.logging.test :as lt]
             [net.willcohen.native.callbacks :as cb]
+            [net.willcohen.native.dispatch :as dispatch]
             [net.willcohen.native.platform :as platform]
             [tech.v3.datatype.ffi :as dt-ffi])
   (:import [java.io File]
@@ -239,6 +240,38 @@
       (is (some? @singleton) "the library is bound"))
     (println "SKIP init-jdk-library!-leaves-no-class-file-in-the-compile-path:"
              "no known C library on this OS")))
+
+(defn- system-math-library
+  "The C math library of this process, or nil on an OS that this test does
+   not know. macOS keeps libm in libSystem."
+  ^File []
+  (case (platform/get-os)
+    :darwin (File. "/usr/lib/libSystem.B.dylib")
+    :linux  (some-> (re-find #"(?m)/\S*/libm\.so\.6$" (#'platform/process-maps))
+                    (File.))
+    nil))
+
+(def ^:private math-fndefs
+  {:fabsf {:rettype :float32 :argtypes [[:x :float32]]}})
+
+(def ^:private math-fn-defs (platform/rehydrate-fn-defs math-fndefs))
+
+(def ^:private math-state
+  (atom {:singleton (dt-ffi/library-singleton #'math-fn-defs)}))
+
+(platform/define-library-fns! math-fn-defs math-state)
+
+(deftest call!-on-ffi-passes-and-returns-a-float32
+  (if-let [libm (system-math-library)]
+    (let [lib (dispatch/library {:key ::math
+                                 :fndefs math-fndefs
+                                 :impl-atom (atom :ffi)
+                                 :ffi-impl-ns 'net.willcohen.native.platform-test})]
+      (platform/init-jdk-library! (:singleton @math-state) libm)
+      (is (= (double (float 0.1)) (dispatch/call! lib :fabsf [-0.1]))
+          "the argument narrows to f32, and the f32 result comes back"))
+    (println "SKIP call!-on-ffi-passes-and-returns-a-float32:"
+             "no known C math library on this OS")))
 
 (deftest define-callback-interface-leaves-no-class-file-in-the-compile-path
   (dt-ffi/set-ffi-impl! :jdk)

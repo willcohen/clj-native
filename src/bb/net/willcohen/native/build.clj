@@ -562,40 +562,43 @@
      (println out "ready at" (str dir "/" out)))))
 
 (defn stage-test-deps!
-  "Copy platform_state.mjs and test_runner.mjs, the clj-native test
-  helpers, from the dir :native-src into :dist (default
+  "Copy test_runner.mjs, the clj-native test helper, from :native-dist, the
+  dist/ dir of the installed ffi-wasm, into :dist (default
   \"test/cljc/dist\"), for import by relative path. An npm symlink would
   load a second squint-cljs instance, and deftest and run-tests would then
-  see different registries. Throws when a file is missing.
+  see different registries. Throws when the file is missing.
 
-  Each copy still imports squint-cljs by bare specifier, so the consumer's
+  The copy still imports squint-cljs by bare specifier, so the consumer's
   test node_modules must have it."
-  [{:keys [native-src dist] :or {dist "test/cljc/dist"}}]
-  (let [files ["platform_state.mjs" "test_runner.mjs"]]
+  [{:keys [native-dist dist] :or {dist "test/cljc/dist"}}]
+  (let [n   "test_runner.mjs"
+        src (fs/path (str native-dist) n)]
+    (when-not (fs/exists? src)
+      (throw (ex-info (str "Missing clj-native artifact: " src
+                           ". Install ffi-wasm where :native-dist points.")
+                      {:missing (str src)})))
     (fs/create-dirs dist)
-    (doseq [n files]
-      (let [src (fs/path (str native-src) n)]
-        (when-not (fs/exists? src)
-          (throw (ex-info (str "Missing clj-native artifact: " src
-                               ". Install ffi-wasm where :native-src points.")
-                          {:missing (str src)})))
-        (fs/copy src (fs/path dist n) {:replace-existing true})))
-    (println (str "Staged clj-native helpers into " dist ": " (str/join ", " files)))))
+    (fs/copy src (fs/path dist n) {:replace-existing true})
+    (println (str "Staged " n " into " dist))))
 
 (def ^:private npm-package-name
   "The npm package name. check-exports-sync! pins it to package.json."
   "ffi-wasm")
 
-(def shipped-module-files
-  "Each .mjs of src/ that the npm tarball ships. The exports map points at
-  dist/, but stage-test-deps! copies from src/, and squint reads macros.cljc
-  there. check-exports-sync! pins it to package.json."
-  ;; macros.mjs is dead code in a consumer bundle, but esbuild needs it to
-  ;; resolve the import.
+(def export-module-files
+  "Each .mjs of src/ that has an export subpath: the file name with dashes
+  for underscores and no extension. build:js compiles the .cljc or .cljs of
+  each one. check-exports-sync! pins the subpaths to package.json."
   ["dispatch.mjs" "fetch_worker.mjs" "handler.mjs" "handler_env.mjs" "handler_fs.mjs"
    "handler_heap.mjs" "handler_paths.mjs" "handler_runtime.mjs"
    "http_bridge.mjs" "macros.mjs" "platform_state.mjs" "pool.mjs"
    "test_runner.mjs" "workload_pool.mjs"])
+
+(def shipped-module-files
+  "Each .mjs of src/ that the npm tarball ships. The squint output of a
+  consumer imports macros.mjs by path, next to macros.cljc, and a bundler of
+  that output needs the file. check-exports-sync! pins it to package.json."
+  ["macros.mjs"])
 
 (def bundle-files
   "Each file of dist/ that esbuild.config.mjs writes and the npm tarball
@@ -625,7 +628,7 @@
                                  (str/replace "_" "-"))]
                  [(str npm-package-name "/" subpath)
                   (str target-prefix (get own-files subpath "ffi-wasm.mjs"))])))
-        shipped-module-files))
+        export-module-files))
 
 (defn rewrite-import-specifiers!
   "Rewrite the import specifiers in the file at `target` by `rewrites`, a
@@ -671,8 +674,9 @@
 
 (defn check-exports-sync!
   "Throw with the drift when the file `package-json` disagrees with
-  npm-package-name, shipped-module-files and bundle-files: its name, main,
-  each exports entry and its files, all by full path."
+  npm-package-name, export-module-files, shipped-module-files and
+  bundle-files: its name, main, each exports entry and its files, all by
+  full path."
   [package-json]
   (let [pkg  (json/parse-string (slurp (str package-json)))
         src  "src/cljc/net/willcohen/native/"
@@ -690,5 +694,5 @@
     (when (seq drift)
       (throw (ex-info "package.json disagrees with the module inventory of net.willcohen.native.build"
                       {:build-clj drift :package-json (select-keys have (keys drift))})))
-    (println (str "package.json inventory in sync: " (count shipped-module-files)
-                  " src modules, " (count bundle-files) " dist files"))))
+    (println (str "package.json inventory in sync: " (count export-module-files)
+                  " subpath modules, " (count bundle-files) " dist files"))))

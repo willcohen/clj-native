@@ -16,10 +16,17 @@
   files of their own, one copy of each. `./handler`, `./handler-*`,
   `./http-bridge`, `./fetch-worker` and `./test-runner` point at their own
   files, and each other subpath at `ffi-wasm.mjs`. Node and a bundler resolve
-  the same subpaths as before. A
-  page maps only `ffi-wasm` of this package in its importmap. A bundler of a
-  `dist/` file marks `node:*` as external. An importmap that maps the `src/`
-  files of ffi-wasm moves to `dist/ffi-wasm.mjs`.
+  the same subpaths as before. Of `src/`, the package ships only
+  `macros.cljc` and `macros.mjs`.
+- A page maps `ffi-wasm` to `dist/ffi-wasm.mjs`, and each subpath that it
+  imports to the file of that subpath. It also maps `worker-router`,
+  `worker-router/worker-bootstrap`, `comlink`, `resource-tracker` and
+  `squint-cljs/`.
+- Worker code imports `ffi-wasm/handler` or a worker-side subpath, not
+  `ffi-wasm`. A bundler of a `dist/` file marks `node:*` as external.
+- **Breaking.** `stage-test-deps!` takes `:native-dist`, the `dist/` dir of
+  the installed ffi-wasm, in place of `:native-src`, and copies only
+  `test_runner.mjs`.
 - **Breaking.** A generated handler has no static import of ffi-wasm. It
   imports ffi-wasm from `ffiWasmHandlerUrl`. Its overrides module exports
   `methods(ffi)`, and `init` gets `ctx.ffi`. `:runtime-import-path` is gone.

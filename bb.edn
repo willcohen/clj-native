@@ -59,10 +59,10 @@ Drift fails build:js, and through prepack each npm pack."
    :task (nb/check-exports-sync! "package.json")}
 
   build:js
-  {:doc "Compile each shipped .cljc or .cljs module to .mjs, then bundle dist/ with esbuild.config.mjs."
+  {:doc "Compile each .cljc or .cljs module to .mjs, then bundle dist/ with esbuild.config.mjs."
    :depends [check:exports npm:install]
    :task (let [dir "src/cljc/net/willcohen/native"]
-           (doseq [f nb/shipped-module-files
+           (doseq [f nb/export-module-files
                    :let [base (str/replace f (re-pattern "\\.mjs$") "")
                          src  (first (filter (fn [src] (fs/exists? (fs/path dir src)))
                                              [(str base ".cljc") (str base ".cljs")]))]

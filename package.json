@@ -33,21 +33,8 @@
     "dist/http_bridge.mjs",
     "dist/fetch_worker.mjs",
     "dist/test_runner.mjs",
-    "src/cljc/net/willcohen/native/handler.mjs",
-    "src/cljc/net/willcohen/native/handler_runtime.mjs",
-    "src/cljc/net/willcohen/native/handler_fs.mjs",
-    "src/cljc/net/willcohen/native/handler_heap.mjs",
-    "src/cljc/net/willcohen/native/handler_paths.mjs",
-    "src/cljc/net/willcohen/native/handler_env.mjs",
-    "src/cljc/net/willcohen/native/pool.mjs",
-    "src/cljc/net/willcohen/native/workload_pool.mjs",
-    "src/cljc/net/willcohen/native/platform_state.mjs",
-    "src/cljc/net/willcohen/native/dispatch.mjs",
     "src/cljc/net/willcohen/native/macros.cljc",
-    "src/cljc/net/willcohen/native/macros.mjs",
-    "src/cljc/net/willcohen/native/test_runner.mjs",
-    "src/cljc/net/willcohen/native/http_bridge.mjs",
-    "src/cljc/net/willcohen/native/fetch_worker.mjs"
+    "src/cljc/net/willcohen/native/macros.mjs"
   ],
   "scripts": {
     "prepack": "bb build:js"

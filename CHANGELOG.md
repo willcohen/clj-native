@@ -11,6 +11,12 @@
 
 ### Changed
 
+- ffi-wasm ships its own modules as bundles in `dist/`. Each subpath export
+  points at `ffi-wasm.mjs`, except `./handler`, `./fetch-worker` and
+  `./test-runner`. Node and a bundler resolve the same subpaths as before. A
+  page maps only `ffi-wasm` of this package in its importmap. A bundler of a
+  `dist/` file marks `node:*` as external. An importmap that maps the `src/`
+  files of ffi-wasm moves to `dist/ffi-wasm.mjs`.
 - **Breaking.** A generated handler has no static import of ffi-wasm. It
   imports ffi-wasm from `ffiWasmHandlerUrl`. Its overrides module exports
   `methods(ffi)`, and `init` gets `ctx.ffi`. `:runtime-import-path` is gone.

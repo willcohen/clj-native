@@ -29,3 +29,4 @@ test/cljs/**/*.mjs
 # dtype-next Panama upcall stubs generated at runtime (gensym per interface)
 classes/
 .clj-kondo/.cache-cli/
+dist/

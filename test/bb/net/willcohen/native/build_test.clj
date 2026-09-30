@@ -341,15 +341,27 @@ Import {
                  (nb/check-exports-sync! copy))]
     (is (nil? (check! "" "")))
     (is (thrown? clojure.lang.ExceptionInfo
-                 (check! "\"./src/cljc/net/willcohen/native/pool.mjs\"" "\"./src/cljc/net/willcohen/nativ/pool.mjs\""))
-        "a wrong dir in an export")
+                 (check! "\"./handler\": \"./dist/handler.mjs\"" "\"./handler\": \"./dist/ffi-wasm.mjs\""))
+        "a subpath at the wrong dist file")
     (is (thrown? clojure.lang.ExceptionInfo
-                 (check! "\"main\": \"src/cljc/net/willcohen/native/handler_runtime.mjs\""
+                 (check! "\"main\": \"dist/ffi-wasm.mjs\""
                          "\"main\": \"src/cljc/net/willcohen/native/pool.mjs\""))
         "a wrong main")
     (is (thrown? clojure.lang.ExceptionInfo
                  (check! "\"src/cljc/net/willcohen/native/macros.cljc\",\n" ""))
-        "macros.cljc left out of files")))
+        "macros.cljc left out of files")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (check! "\"dist/test_runner.mjs\",\n" ""))
+        "a dist file left out of files")))
+
+(deftest export-specifier-rewrites-point-each-subpath-at-its-dist-file
+  (let [r (nb/export-specifier-rewrites "./ffi-wasm/")]
+    (is (= "./ffi-wasm/ffi-wasm.mjs" (get r "ffi-wasm")))
+    (is (= "./ffi-wasm/ffi-wasm.mjs" (get r "ffi-wasm/pool")))
+    (is (= "./ffi-wasm/ffi-wasm.mjs" (get r "ffi-wasm/platform-state")))
+    (is (= "./ffi-wasm/handler.mjs" (get r "ffi-wasm/handler")))
+    (is (= "./ffi-wasm/fetch_worker.mjs" (get r "ffi-wasm/fetch-worker")))
+    (is (= "./ffi-wasm/test_runner.mjs" (get r "ffi-wasm/test-runner")))))
 
 (deftest stage-test-deps-copies-each-helper-or-throws
   (let [src  (fs/create-temp-dir)

@@ -587,8 +587,9 @@
   "ffi-wasm")
 
 (def shipped-module-files
-  "Each compiled .mjs that the npm tarball ships. check-exports-sync! pins
-  it to package.json."
+  "Each .mjs of src/ that the npm tarball ships. The exports map points at
+  dist/, but stage-test-deps! copies from src/, and squint reads macros.cljc
+  there. check-exports-sync! pins it to package.json."
   ;; macros.mjs is dead code in a consumer bundle, but esbuild needs it to
   ;; resolve the import.
   ["dispatch.mjs" "fetch_worker.mjs" "handler.mjs" "handler_env.mjs" "handler_fs.mjs"
@@ -596,19 +597,29 @@
    "http_bridge.mjs" "macros.mjs" "platform_state.mjs" "pool.mjs"
    "test_runner.mjs" "workload_pool.mjs"])
 
+(def bundle-files
+  "Each file of dist/ that esbuild.config.mjs writes and the npm tarball
+  ships. check-exports-sync! pins it to package.json."
+  ["fetch_worker.mjs" "ffi-wasm.mjs" "handler.mjs" "test_runner.mjs"])
+
+(def ^:private own-files
+  "The dist/ file of each subpath outside the page bundle."
+  {"handler" "handler.mjs" "fetch-worker" "fetch_worker.mjs" "test-runner" "test_runner.mjs"})
+
 (defn export-specifier-rewrites
   "Map each bare specifier this package exports, such as \"ffi-wasm/pool\",
-  to `target-prefix` plus its file name. For rewrite-import-specifiers! on
-  copies of shipped-module-files, where no importmap applies. The subpath is
-  the file name with dashes for underscores and no extension."
+  to `target-prefix` plus the dist/ file that it resolves to. For
+  rewrite-import-specifiers! on copies, where no importmap applies. The
+  subpath is the src/ file name with dashes for underscores and no
+  extension."
   [target-prefix]
-  (into {}
+  (into {npm-package-name (str target-prefix "ffi-wasm.mjs")}
         (map (fn [f]
-               [(str npm-package-name "/"
-                     (-> f
-                         (str/replace (re-pattern "\\.mjs$") "")
-                         (str/replace "_" "-")))
-                (str target-prefix f)]))
+               (let [subpath (-> f
+                                 (str/replace (re-pattern "\\.mjs$") "")
+                                 (str/replace "_" "-"))]
+                 [(str npm-package-name "/" subpath)
+                  (str target-prefix (get own-files subpath "ffi-wasm.mjs"))])))
         shipped-module-files))
 
 (defn rewrite-import-specifiers!
@@ -655,22 +666,24 @@
 
 (defn check-exports-sync!
   "Throw with the drift when the file `package-json` disagrees with
-  npm-package-name and shipped-module-files: its name, main, each exports
-  entry and its files, all by full path."
+  npm-package-name, shipped-module-files and bundle-files: its name, main,
+  each exports entry and its files, all by full path."
   [package-json]
   (let [pkg  (json/parse-string (slurp (str package-json)))
-        dir  "src/cljc/net/willcohen/native/"
-        main (str dir "handler_runtime.mjs")
+        src  "src/cljc/net/willcohen/native/"
         want {"name"    npm-package-name
-              "main"    main
-              "exports" (into {"." (str "./" main) "./package.json" "./package.json"}
+              "main"    "dist/ffi-wasm.mjs"
+              "exports" (into {"./package.json" "./package.json"}
                               (map (fn [[spec f]] [(str "." (subs spec (count npm-package-name))) f]))
-                              (export-specifier-rewrites (str "./" dir)))
+                              (export-specifier-rewrites "./dist/"))
               ;; squint reads macros.cljc to expand the macros.
-              "files"   (sort (cons (str dir "macros.cljc") (map #(str dir %) shipped-module-files)))}
+              "files"   (sort (concat [(str src "macros.cljc")]
+                                      (map #(str src %) shipped-module-files)
+                                      (map #(str "dist/" %) bundle-files)))}
         have  (update (select-keys pkg (keys want)) "files" sort)
         drift (into {} (remove (fn [[k v]] (= v (get have k)))) want)]
     (when (seq drift)
       (throw (ex-info "package.json disagrees with the module inventory of net.willcohen.native.build"
                       {:build-clj drift :package-json (select-keys have (keys drift))})))
-    (println (str "package.json inventory in sync: " (count shipped-module-files) " modules"))))
+    (println (str "package.json inventory in sync: " (count shipped-module-files)
+                  " src modules, " (count bundle-files) " dist files"))))

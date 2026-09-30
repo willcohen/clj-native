@@ -92,8 +92,8 @@
   [opts]
   (cond-> opts (some? (:categories opts)) (update :categories vec)))
 
-;; A module worker ignores the page importmap. The handler.mjs next to this
-;; module is the ffi-wasm copy that the page runs.
+;; handler.mjs sits next to this module in dist/, so each worker runs the
+;; ffi-wasm copy of the page, and a page maps no importmap entry for it.
 (def ^:private ffi-wasm-handler-url
   (.-href (js/URL. "./handler.mjs" (.-url js/import.meta))))
 

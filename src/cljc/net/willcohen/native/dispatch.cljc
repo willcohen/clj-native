@@ -40,7 +40,7 @@
 
 (def supported-types
   "The fndefs types that `library` accepts for :rettype and argtypes."
-  #{:pointer :pointer? :int32 :int64 :float64 :size-t :void :string :string?})
+  #{:pointer :pointer? :int32 :int64 :float32 :float64 :size-t :void :string :string?})
 
 ;; (str :pointer) is ":pointer" on the JVM and "pointer" under squint.
 (def ^:private supported-types-msg
@@ -111,7 +111,9 @@
    gives \"\" for both.
    :int64 is a Long on the JVM. The wasm backends send a BigInt, which a
    WASM_BIGINT module (the emscripten default since 4.0.0) needs. CLJS
-   returns the BigInt."
+   returns the BigInt.
+   :float32 is a C float. An argument narrows to f32 at the call. A result
+   is a Float from FFI, a Double from GraalVM and a number on CLJS."
   [{:keys [key fndefs impl-atom ffi-impl-ns hooks]}]
   {:key         key
    :impl-atom   impl-atom
@@ -159,9 +161,9 @@
        :int32   (if (instance? org.graalvm.polyglot.Value result)
                   (nw/address-as-int result)
                   result)
-       :float64 (if (instance? org.graalvm.polyglot.Value result)
-                  (.asDouble ^org.graalvm.polyglot.Value result)
-                  result)
+       (:float32 :float64) (if (instance? org.graalvm.polyglot.Value result)
+                             (.asDouble ^org.graalvm.polyglot.Value result)
+                             result)
        (:int64 :size-t) (if (instance? org.graalvm.polyglot.Value result)
                           (.asLong ^org.graalvm.polyglot.Value result)
                           result)

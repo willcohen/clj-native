@@ -24,8 +24,13 @@
 ;; squint compiles :number to the string "number", so one assertion holds on
 ;; both platforms.
 (deftest argtype->ccall-type-maps-strings-and-numbers
-  (is (= [:string :string :number :number]
-         (mapv d/argtype->ccall-type [:string :string? :int64 :pointer?]))))
+  (is (= [:string :string :number :number :number]
+         (mapv d/argtype->ccall-type [:string :string? :int64 :pointer? :float32]))))
+
+(deftest library-accepts-float32
+  (is (some? (d/library {:key :f32-lib
+                         :fndefs {:lib_f32 {:rettype :float32
+                                            :argtypes [[:v :float32]]}}}))))
 
 (deftest library-validates-fndefs-types-at-build-time
   ;; argtype->ccall-type maps an unknown type to :number with no error, so
@@ -149,6 +154,25 @@
        (is (= 7 r))
        (is (= (js/BigInt "3000000000") (aget @seen 0)) "the :int64 argument is a BigInt")
        (is (= 1 (aget @seen 1)) "an :int32 argument stays a number"))))
+
+#?(:cljs
+   (deftest ^:async call!-on-cljs-sends-a-float32-as-a-number
+     ;; The wasm export narrows a JS number to f32, so ccall takes "number".
+     (let [seen (atom nil)
+           fake #js {:worker (fn [_idx]
+                               (js-obj "f32-lib"
+                                       #js {:ccall (fn [_fn ret types args]
+                                                     (reset! seen [ret types args])
+                                                     0.5)}))}
+           lib  (d/library {:key :f32-lib
+                            :fndefs {:lib_f32 {:rettype :float32
+                                               :argtypes [[:v :float32]]}}})
+           r    (await (d/call! lib :lib_f32 [0.1] #js {:pool fake}))
+           [ret types args] @seen]
+       (is (= 0.5 r))
+       (is (= "number" ret))
+       (is (= "number" (aget types 0)))
+       (is (= 0.1 (aget args 0))))))
 
 #?(:cljs
    (deftest ^:async call!-on-cljs-runs-the-hooks-in-order

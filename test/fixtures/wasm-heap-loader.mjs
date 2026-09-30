@@ -71,8 +71,19 @@ function utf8Encode(str, heap, ptr, maxBytes) {
   return n;
 }
 
+// (module (func (export "f32_id") (param f32) (result f32) local.get 0))
+// The export narrows a JS number to f32, as an f32 parameter of emscripten does.
+const F32_BYTES = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic, version 1
+  0x01, 0x06, 0x01, 0x60, 0x01, 0x7d, 0x01, 0x7d, // type 0 = (f32)->f32
+  0x03, 0x02, 0x01, 0x00,                         // func 0 has type 0
+  0x07, 0x0a, 0x01, 0x06, 0x66, 0x33, 0x32, 0x5f, 0x69, 0x64, 0x00, 0x00, // export "f32_id"
+  0x0a, 0x06, 0x01, 0x04, 0x00, 0x20, 0x00, 0x0b, // body: local.get 0
+]);
+
 function makeModule() {
   const instance = new WebAssembly.Instance(new WebAssembly.Module(MODULE_BYTES));
+  const f32 = new WebAssembly.Instance(new WebAssembly.Module(F32_BYTES));
   const { memory, malloc, free } = instance.exports;
   const buffer = memory.buffer;
 
@@ -148,6 +159,8 @@ function makeModule() {
         }
         return rettype === 'string' ? M.UTF8ToString(ptr) : ptr;
       }
+      case 'f32_id':
+        return f32.exports.f32_id(vals[0]);
       // An i64 result, as a WASM_BIGINT module gives it: a BigInt.
       case 'i64_ret':
         return 3000000000n;

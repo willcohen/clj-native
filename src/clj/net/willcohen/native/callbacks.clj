@@ -13,13 +13,15 @@
    define-foreign-interface loads a new class on each call, so define an
    interface once, in a delay or a defonce, and instantiate it again with
    register-callback!."
-  (:require [tech.v3.datatype.ffi :as dt-ffi]))
+  (:require [net.willcohen.native.platform :as platform]
+            [tech.v3.datatype.ffi :as dt-ffi]))
 
 (defn define-callback-interface
   "A dt-ffi foreign interface for an upcall, with return type `rettype` and
    the dt-ffi type keywords `argtypes`, which can be empty."
   [rettype argtypes]
-  (dt-ffi/define-foreign-interface rettype argtypes))
+  (platform/call-with-scratch-compile-path
+   #(dt-ffi/define-foreign-interface rettype argtypes)))
 
 (defn register-callback!
   "Instantiate `iface` around `ifn`, and convert the instance to a C-callable

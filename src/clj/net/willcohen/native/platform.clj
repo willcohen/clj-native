@@ -90,6 +90,8 @@
   [impl-ns fn-key args]
   (apply-native-fn ((make-native-fn-resolver impl-ns) fn-key) args))
 
+(declare call-with-scratch-compile-path)
+
 (defn init-jdk-library!
   "Select the :jdk backend and bind `singleton` to the canonical path of
    `file`, since SymbolLookup.libraryLookup needs an absolute path. Throws
@@ -101,7 +103,8 @@
                          (name (get-os)) "-" (name (get-arch)))
                     {:os (get-os) :arch (get-arch)})))
   (dt-ffi/set-ffi-impl! :jdk)
-  (dt-ffi/library-singleton-set! singleton (.getCanonicalPath file)))
+  (call-with-scratch-compile-path
+   #(dt-ffi/library-singleton-set! singleton (.getCanonicalPath file))))
 
 (defn nullable-c-string
   "A C string of `s` for a :string? argument, or nil (NULL) for nil. Call
@@ -192,6 +195,19 @@
                       (into-array java.nio.file.attribute.FileAttribute [])))]
     (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable #(delete-tree! dir)))
     dir))
+
+(defonce ^:private scratch-class-dir
+  (delay (make-temp-dir "clj-native-classes")))
+
+(defn call-with-scratch-compile-path
+  "Call f with *compile-path* bound to a temporary directory that a shutdown
+   hook deletes, and return its value. dtype-next's define-library and
+   define-foreign-interface write each class that they generate to
+   *compile-path*, which is classes/ in the cwd by default. They load the
+   class from memory, so nothing reads the files."
+  [f]
+  (binding [*compile-path* (.getPath ^File @scratch-class-dir)]
+    (f)))
 
 (defn- extract-library-file!
   "Copy the packaged library, from the first of library-dirs that has it,

@@ -11,6 +11,7 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [clojure.tools.logging.test :as lt]
+            [net.willcohen.native.callbacks :as cb]
             [net.willcohen.native.platform :as platform]
             [tech.v3.datatype.ffi :as dt-ffi])
   (:import [java.io File]
@@ -202,3 +203,46 @@
       ;; routes through the state atom.
       (is (thrown-with-msg? Exception #"Library instance not found"
                             (@add 1 2))))))
+
+(defn- class-files-left-by
+  "Call f with *compile-path* bound to a new temporary directory. Return the
+   .class files that f leaves below it."
+  [f]
+  (let [dir (.toFile (Files/createTempDirectory "clj-native-compile-path"
+                                                (into-array FileAttribute [])))]
+    (try
+      (binding [*compile-path* (.getPath dir)]
+        (f))
+      (filterv #(.endsWith (.getName ^File %) ".class") (file-seq dir))
+      (finally
+        (#'platform/delete-tree! dir)))))
+
+(defn- system-c-library
+  "The C library of this process, or nil on an OS that this test does not
+   know."
+  ^File []
+  (case (platform/get-os)
+    :darwin (File. "/usr/lib/libSystem.B.dylib")
+    :linux  (some-> (re-find #"(?m)/\S*/libc\.so\.6$" (#'platform/process-maps))
+                    (File.))
+    nil))
+
+(def ^:private libc-fn-defs
+  (platform/rehydrate-fn-defs
+   {:abs {:rettype :int32 :argtypes [[:x :int32]]}}))
+
+(deftest init-jdk-library!-leaves-no-class-file-in-the-compile-path
+  (if-let [libc (system-c-library)]
+    (let [singleton (dt-ffi/library-singleton #'libc-fn-defs)]
+      (is (empty? (class-files-left-by
+                   #(platform/init-jdk-library! singleton libc))))
+      (is (some? @singleton) "the library is bound"))
+    (println "SKIP init-jdk-library!-leaves-no-class-file-in-the-compile-path:"
+             "no known C library on this OS")))
+
+(deftest define-callback-interface-leaves-no-class-file-in-the-compile-path
+  (dt-ffi/set-ffi-impl! :jdk)
+  (let [iface (atom nil)]
+    (is (empty? (class-files-left-by
+                 #(reset! iface (cb/define-callback-interface :int64 [:int64])))))
+    (is (some? @iface) "the interface is defined")))

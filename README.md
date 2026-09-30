@@ -87,15 +87,20 @@ overrides module, which knows the struct layouts of its library. On the JVM,
 
 ## Packages
 
-The npm package [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm) holds the
-hand-written `.mjs` runtime helpers and the squint output of the `.cljc` and
-`.cljs` modules. The `exports` map in `package.json` lists them. The package
-also holds `macros.cljc`, because squint expands the macros at compile time.
+The npm package [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm) ships
+two esbuild bundles of its own modules in `dist/`. `ffi-wasm.mjs` holds the
+page side. Each subpath export points at it, except `./handler`,
+`./fetch-worker` and `./test-runner`. Node, a bundler and a page thus load one
+module instance. The bundles hold no other package: a page maps `ffi-wasm`,
+`worker-router`, `worker-router/worker-bootstrap`, `comlink`, `squint-cljs` and
+`resource-tracker` in its importmap, one copy of each.
 
-A module worker does not use the importmap of the page. For this reason, a
-generated handler loads `ffi-wasm/handler` from the URL that `init-pool!`
-puts in its init. That module holds each helper that a worker uses. The
+A module worker does not use the importmap of the page. `handler.mjs` holds
+the worker side, and `init-pool!` gives each handler its URL. The
 `gen-handler-source` docstring gives the contract of the overrides module.
+
+The package also holds the squint output in `src/`, and `macros.cljc`,
+because squint expands the macros at compile time.
 
 The jar [`net.willcohen/native`](https://clojars.org/net.willcohen/native)
 holds the source of these 13 namespaces, and a clj-kondo config export. It

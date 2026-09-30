@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Lints the hand-written .mjs and the test fixtures. The ignored src files are
-// gitignored squint outputs. test/cljs and test/cljc hold compiled test
+// gitignored squint outputs, and dist/ holds the esbuild bundles. test/cljs and test/cljc hold compiled test
 // mirrors.
 import js from '@eslint/js';
 import globals from 'globals';
@@ -19,6 +19,7 @@ export default [
       'src/cljc/net/willcohen/native/pool.mjs',
       'src/cljc/net/willcohen/native/test_runner.mjs',
       'src/cljc/net/willcohen/native/workload_pool.mjs',
+      'dist/**',
       'test/cljs/**',
       'test/cljc/**',
     ],

@@ -196,8 +196,9 @@ console.log(JSON.stringify(out));
       (finally
         (doseq [f (reverse (file-seq dir))] (.delete f))))))
 
+;; The worker bundle that npm ships. test:clj runs build:js first.
 (def ^:private ffi-wasm-handler-url
-  (str (.toUri (.toPath (io/file "src/cljc/net/willcohen/native/handler.mjs")))))
+  (str (.toUri (.toPath (io/file "dist/handler.mjs")))))
 
 (def ^:private expected-probe
   (str "\"probe\":{\"sameFfi\":true,\"makeHandler\":\"function\",\"stageFiles\":\"function\","

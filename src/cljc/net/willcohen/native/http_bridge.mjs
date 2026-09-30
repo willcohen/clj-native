@@ -79,7 +79,7 @@ async function ensureWorker(opts) {
 // A bundle that inlines this module must pass workerUrl, because the default
 // resolves next to the bundle.
 async function startWorker(workerUrl, decorateUrl, opts) {
-  const { Worker } = await import('worker_threads');
+  const { Worker } = await import('node:worker_threads');
 
   const dataBufferSize = opts.dataBufferSize ?? DEFAULT_DATA_BUFFER_SIZE;
   const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;

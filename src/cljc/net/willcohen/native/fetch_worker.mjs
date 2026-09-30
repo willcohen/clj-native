@@ -32,7 +32,7 @@
 // the blocked caller, and a token refresh can await. If the import fails or
 // exports no function, the worker posts an error and never reports ready.
 
-import { parentPort } from 'worker_threads';
+import { parentPort } from 'node:worker_threads';
 
 const OVERFLOW_FLAG = 1;
 

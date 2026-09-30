@@ -4,13 +4,29 @@
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Builds dist/: the page bundle and the worker bundle of ffi-wasm's own
-// modules, and the files that init-pool! and createSyncFetch load from next to
-// them. bb build:js runs it after squint compiles the .cljc modules.
+// Builds dist/: the page bundle of ffi-wasm's own modules, and next to it the
+// worker entry, the modules that the page and the worker share, and the files
+// that createSyncFetch and a test load. bb build:js runs it after squint
+// compiles the .cljc modules.
 import * as esbuild from 'esbuild';
 import { copyFileSync, mkdirSync } from 'node:fs';
 
 const src = 'src/cljc/net/willcohen/native';
+
+// Each is a file of its own in dist/, and each importer imports it by a
+// relative path, so a realm that loads the page bundle and handler.mjs loads
+// one copy of each. They import only each other and node: builtins, thus a
+// module worker needs no importmap for them.
+const shared = ['handler_runtime', 'handler_env', 'handler_fs', 'handler_heap',
+                'handler_paths', 'http_bridge'].map((m) => `${m}.mjs`);
+
+const keepSharedExternal = {
+  name: 'keep-shared-external',
+  setup(build) {
+    build.onResolve({ filter: /^\.\/[a-z_]+\.mjs$/ }, (args) =>
+      shared.includes(args.path.slice(2)) ? { path: args.path, external: true } : undefined);
+  },
+};
 
 const common = {
   bundle: true,
@@ -33,10 +49,11 @@ await esbuild.build({
   // The bundle holds ffi-wasm's own code only. A copy of another package is a
   // second module instance next to the copy that a consumer imports.
   external: [...common.external, 'squint-cljs', 'resource-tracker', 'worker-router'],
+  plugins: [keepSharedExternal],
 });
 
-await esbuild.build({ ...common, entryPoints: [`${src}/handler.mjs`], outfile: 'dist/handler.mjs' });
-
-copyFileSync(`${src}/fetch_worker.mjs`, 'dist/fetch_worker.mjs');
-// Out of the page bundle, so that a page does not import the squint test library.
-copyFileSync(`${src}/test_runner.mjs`, 'dist/test_runner.mjs');
+// test_runner.mjs is out of the page bundle, so that a page does not import
+// the squint test library.
+for (const f of ['handler.mjs', ...shared, 'fetch_worker.mjs', 'test_runner.mjs']) {
+  copyFileSync(`${src}/${f}`, `dist/${f}`);
+}

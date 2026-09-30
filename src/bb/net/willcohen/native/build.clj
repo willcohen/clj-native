@@ -600,11 +600,16 @@
 (def bundle-files
   "Each file of dist/ that esbuild.config.mjs writes and the npm tarball
   ships. check-exports-sync! pins it to package.json."
-  ["fetch_worker.mjs" "ffi-wasm.mjs" "handler.mjs" "test_runner.mjs"])
+  ["fetch_worker.mjs" "ffi-wasm.mjs" "handler.mjs" "handler_env.mjs" "handler_fs.mjs"
+   "handler_heap.mjs" "handler_paths.mjs" "handler_runtime.mjs" "http_bridge.mjs"
+   "test_runner.mjs"])
 
 (def ^:private own-files
   "The dist/ file of each subpath outside the page bundle."
-  {"handler" "handler.mjs" "fetch-worker" "fetch_worker.mjs" "test-runner" "test_runner.mjs"})
+  {"handler" "handler.mjs" "handler-env" "handler_env.mjs" "handler-fs" "handler_fs.mjs"
+   "handler-heap" "handler_heap.mjs" "handler-paths" "handler_paths.mjs"
+   "handler-runtime" "handler_runtime.mjs" "http-bridge" "http_bridge.mjs"
+   "fetch-worker" "fetch_worker.mjs" "test-runner" "test_runner.mjs"})
 
 (defn export-specifier-rewrites
   "Map each bare specifier this package exports, such as \"ffi-wasm/pool\",

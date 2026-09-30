@@ -5,8 +5,9 @@
 ;; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 (ns net.willcohen.native.bundle-test
-  "ffi-wasm ships one page bundle and one worker bundle. One file is one
-   module instance, so each consumer of ffi-wasm shares the state of pool."
+  "ffi-wasm ships one page bundle, and the worker side and the modules that
+   it shares with the page as files of their own. One file is one module
+   instance, so each consumer of ffi-wasm shares the state of pool."
   (:require [cljs.test :refer [deftest is]]
             ["ffi-wasm/test-runner" :as tr]
             ["node:fs" :refer [existsSync readFileSync]]
@@ -20,6 +21,9 @@
   ["pool" "dispatch" "platform_state" "macros" "workload_pool" "handler_runtime"
    "handler_env" "handler_fs" "handler_heap" "handler_paths" "http_bridge"])
 
+(def ^:private shared-modules
+  ["handler_runtime" "handler_env" "handler_fs" "handler_heap" "handler_paths" "http_bridge"])
+
 (defn- src-module-url [m]
   (.-href (js/URL. (str "../../../../../src/cljc/net/willcohen/native/" m ".mjs")
                    (.-url js/import.meta))))
@@ -30,8 +34,7 @@
 
 (deftest ^:async every-page-subpath-is-the-page-bundle
   (let [ffi (await (import-ns "ffi-wasm"))]
-    (doseq [spec ["ffi-wasm/pool" "ffi-wasm/dispatch" "ffi-wasm/workload-pool"
-                  "ffi-wasm/handler-runtime"]]
+    (doseq [spec ["ffi-wasm/pool" "ffi-wasm/dispatch" "ffi-wasm/workload-pool"]]
       (is (identical? ffi (await (import-ns spec))) spec))
     (is (not (identical? ffi (await (import-ns "ffi-wasm/test-runner"))))
         "the test runner is a file of its own")))
@@ -44,13 +47,31 @@
         (doseq [k (js/Object.keys mod)]
           (is (js/Object.hasOwn ffi k) (str m " exports " k)))))))
 
-(deftest ^:async the-worker-bundle-holds-the-worker-side
+(deftest ^:async the-worker-entry-holds-the-worker-side
   (let [ffi (await (import-ns "ffi-wasm"))
         h   (await (import-ns "ffi-wasm/handler"))]
     (is (fn? (.-makeHandler h)))
     (is (fn? (.-stageFiles h)))
     (is (fn? (.-createSyncFetch h)))
-    (is (not (identical? ffi h)) "the worker bundle is a file of its own")))
+    (is (not (identical? ffi h)) "the worker entry is a file of its own")))
+
+;; A page or a Node process that loads the page bundle and the worker entry
+;; gets one copy of each module that the two share.
+(deftest ^:async the-page-and-the-worker-share-one-copy-of-each-module
+  (let [ffi (await (import-ns "ffi-wasm"))
+        h   (await (import-ns "ffi-wasm/handler"))]
+    (doseq [m shared-modules]
+      (let [mod (await (import-ns (str "ffi-wasm/" (.replaceAll m "_" "-"))))]
+        (doseq [k (js/Object.keys mod)]
+          (is (identical? (aget mod k) (aget ffi k)) (str m " " k " in ffi-wasm.mjs"))
+          (is (identical? (aget mod k) (aget h k)) (str m " " k " in handler.mjs")))))))
+
+;; A module worker does not use the importmap of the page.
+(deftest the-worker-side-imports-no-bare-specifier
+  (doseq [f (cons "handler.mjs" (map #(str % ".mjs") shared-modules))
+          :let [text (readFileSync (join dist-dir f) "utf8")]
+          [_ spec] (.matchAll text (js/RegExp. "(?:from|import\\()\\s*[\"']([^\"']+)[\"']" "g"))]
+    (is (or (.startsWith spec "./") (.startsWith spec "node:")) (str f ": " spec))))
 
 ;; init-pool! and createSyncFetch find these next to the bundle.
 (deftest the-bundle-files-sit-together
@@ -78,7 +99,8 @@
 ;; A consumer that bundles a dist file marks node:* as external, so a Node
 ;; builtin with no node: prefix fails its build.
 (deftest the-dist-files-import-each-node-builtin-with-the-node-prefix
-  (doseq [f ["ffi-wasm.mjs" "handler.mjs" "fetch_worker.mjs"]
+  (doseq [f (concat ["ffi-wasm.mjs" "handler.mjs" "fetch_worker.mjs"]
+                    (map #(str % ".mjs") shared-modules))
           :let [text (readFileSync (join dist-dir f) "utf8")]
           b ["worker_threads" "fs" "path" "url"]
           q ["\"" "'"]

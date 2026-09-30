@@ -221,4 +221,10 @@
                  (is (false? (await (shutdown))) "the release of the crashed consumer keeps the new worker")
                  (is (= 200 (.-status (fresh (str base "/plain")))))))))))
 
+(deftest ^:async with-no-workerUrl-node-starts-the-fetch-worker-next-to-the-bridge
+  (await (with-echo-server
+           (fn ^:async default-worker [base]
+             (let [sync-fetch (await (createSyncFetch))]
+               (is (= "/default" (.-url (echoed (sync-fetch (str base "/default") #js {}))))))))))
+
 (tr/run-tests-and-exit! "net.willcohen.native.http-bridge-test")

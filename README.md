@@ -78,8 +78,8 @@ host.
 | C struct to map | `graal-wasm/read-struct` | none |
 
 `heapHelpers(getModule)` returns an object of methods. Spread it into the
-handler's `methods` map, before the consumer's own keys. A consumer key with
-the same name replaces the helper.
+object that the `methods(ffi)` of the overrides module returns, before the
+consumer's own keys. A consumer key with the same name replaces the helper.
 
 On JavaScript, a consumer writes its string-array and struct reads in its own
 overrides module, which knows the struct layouts of its library. On the JVM,
@@ -91,6 +91,11 @@ The npm package [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm) holds the
 hand-written `.mjs` runtime helpers and the squint output of the `.cljc` and
 `.cljs` modules. The `exports` map in `package.json` lists them. The package
 also holds `macros.cljc`, because squint expands the macros at compile time.
+
+A module worker does not use the importmap of the page. For this reason, a
+generated handler loads `ffi-wasm/handler` from the URL that `init-pool!`
+puts in its init. That module holds each helper that a worker uses. The
+`gen-handler-source` docstring gives the contract of the overrides module.
 
 The jar [`net.willcohen/native`](https://clojars.org/net.willcohen/native)
 holds the source of these 13 namespaces, and a clj-kondo config export. It

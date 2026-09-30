@@ -6,6 +6,7 @@
   "main": "src/cljc/net/willcohen/native/handler_runtime.mjs",
   "exports": {
     ".": "./src/cljc/net/willcohen/native/handler_runtime.mjs",
+    "./handler": "./src/cljc/net/willcohen/native/handler.mjs",
     "./handler-runtime": "./src/cljc/net/willcohen/native/handler_runtime.mjs",
     "./handler-fs": "./src/cljc/net/willcohen/native/handler_fs.mjs",
     "./handler-heap": "./src/cljc/net/willcohen/native/handler_heap.mjs",
@@ -22,6 +23,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "src/cljc/net/willcohen/native/handler.mjs",
     "src/cljc/net/willcohen/native/handler_runtime.mjs",
     "src/cljc/net/willcohen/native/handler_fs.mjs",
     "src/cljc/net/willcohen/native/handler_heap.mjs",

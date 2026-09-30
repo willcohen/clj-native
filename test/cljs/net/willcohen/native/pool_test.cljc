@@ -26,7 +26,9 @@
                      get_pool_stats
                      fire_and_capture_dispose_BANG_
                      flush_pending_disposes_BANG_
-                     set_log_config_BANG_]]
+                     set_log_config_BANG_
+                     init_pool_BANG_
+                     worker_call]]
             ["ffi-wasm/handler-runtime" :refer [isEnabled]]
             ["ffi-wasm/test-runner" :as tr]))
 
@@ -208,5 +210,26 @@
   (set_log_config_BANG_ {:level :debug :categories (map identity [:busy])})
   (is (isEnabled "BUSY-INC"))
   (set_log_config_BANG_ nil))
+
+(def ^:private registry-handler-url
+  (.-href (js/URL. "../../../../fixtures/registry-handler.mjs" (.-url js/import.meta))))
+
+;; A module worker ignores the page importmap, so the init args carry the URL.
+(deftest ^:async init-pool!-gives-each-handler-the-url-of-ffi-wasm-handler
+  (let [init #js {:tag "a"}
+        p    (await (init_pool_BANG_ {:handlers #js {"lib-a" #js {:module registry-handler-url
+                                                               :init init}}
+                                      :size 1}))]
+    (try
+      (let [url (await (worker_call p "lib-a" "init_arg" #js ["ffiWasmHandlerUrl"] 0))]
+        (is (= (.-href (js/URL. "./handler.mjs" (.resolve js/import.meta "ffi-wasm/pool"))) url)
+            "the handler.mjs next to the pool.mjs of the page")
+        (is (fn? (.-makeHandler (await (js/import url))))))
+      (is (= "pong:a" (await (worker_call p "lib-a" "ping" #js [] 0)))
+          "the rest of the init arrives")
+      (is (not (js/Object.hasOwn init "ffiWasmHandlerUrl"))
+          "the caller's init object does not change")
+      (finally
+        (await (.terminate p))))))
 
 (tr/run-tests-and-exit! "net.willcohen.native.pool-test")

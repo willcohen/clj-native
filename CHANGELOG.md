@@ -5,6 +5,17 @@
 ### Added
 
 - `:float32`, a C float, as an argument or a return type.
+- `ffi-wasm/handler`, the worker side of ffi-wasm in one module.
+  `init-pool!` gives its URL to each handler as `ffiWasmHandlerUrl`.
+- `:label` for `gen-handler-source`.
+
+### Changed
+
+- **Breaking.** A generated handler has no static import of ffi-wasm. It
+  imports ffi-wasm from `ffiWasmHandlerUrl`. Its overrides module exports
+  `methods(ffi)`, and `init` gets `ctx.ffi`. `:runtime-import-path` is gone.
+- On Node, `createSyncFetch` defaults `workerUrl` to its own
+  `fetch_worker.mjs`.
 
 ### Fixed
 

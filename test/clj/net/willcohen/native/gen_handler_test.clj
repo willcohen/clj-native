@@ -7,6 +7,7 @@
 (ns net.willcohen.native.gen-handler-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [net.willcohen.native.gen-handler :as g]))
 
@@ -29,7 +30,6 @@
 
 (def mylib-overrides
   {:overrides-import-path "./mylib-handler-overrides.mjs"
-   :runtime-import-path "ffi-wasm/handler-runtime"
    :exposed-methods [:context_create :set_log_level :context_destroy
                      :ccall :malloc :free
                      :heapf64_set :heapf64_get :read_string_array
@@ -50,9 +50,12 @@
 
 (deftest gen-handler-source--module-parts
   (let [source (g/gen-handler-source sample-fndefs mylib-overrides)]
+    ;; A module worker ignores the page importmap, so a static bare import
+    ;; of ffi-wasm fails in a browser worker.
     (testing "imports"
-      (is (str/includes? source "import { makeHandler, byteLengthFingerprint } from 'ffi-wasm/handler-runtime'"))
-      (is (str/includes? source "import * as overrides from './mylib-handler-overrides.mjs'")))
+      (is (not (re-find #"(?m)^import .* from 'ffi-wasm" source)))
+      (is (str/includes? source "import * as overrides from './mylib-handler-overrides.mjs'"))
+      (is (str/includes? source "await import(initArgs?.ffiWasmHandlerUrl ?? 'ffi-wasm/handler')")))
     (testing "classification arrays"
       (is (str/includes? source (str "const busyMethods = [\"ccall\", \"malloc\", \"context_create\", "
                                      "\"set_log_level\", \"heapf64_set\", \"heapf64_get\", "
@@ -60,10 +63,11 @@
                                      "\"string_to_utf8\", \"utf8_to_string\"];\n")))
       (is (str/includes? source
                          "const destroyMethods = [\"context_destroy\", \"free\", \"shutdown\"];\n")))
-    (testing "one methods entry per exposed method"
+    (testing "one methods entry per exposed method, from overrides.methods(ffi)"
+      (is (str/includes? source "const impl = overrides.methods(ffi);"))
       (is (str/includes? source "const methods = {"))
       (doseq [m [:context_create :ccall :malloc :free :shutdown :heapf64_set]]
-        (is (str/includes? source (str (name m) ": overrides.methods." (name m)))
+        (is (str/includes? source (str (name m) ": impl." (name m) ","))
             (str "method " (name m) " missing from emitted methods object"))))
     ;; worker-router's worker-bootstrap runs teardown only when
     ;; `typeof mod.destroy === 'function'`.
@@ -87,7 +91,7 @@
     (is (not (str/includes? block "\"mylib_destroy\"")))))
 
 (deftest gen-handler-source--required-keys
-  (doseq [k [:overrides-import-path :runtime-import-path :exposed-methods :fingerprint-fields]]
+  (doseq [k [:overrides-import-path :exposed-methods :fingerprint-fields]]
     (is (thrown-with-msg? Exception (re-pattern (str "missing required override key " k))
                           (g/gen-handler-source sample-fndefs (dissoc mylib-overrides k))))))
 
@@ -100,15 +104,13 @@
     (is (str/includes? source "const destroyMethods = [];"))))
 
 (deftest gen-handler-source--fingerprint-fields-emit-a-generated-fingerprint
-  ;; The overrides stay external to the bundle, so an overrides import of the
-  ;; runtime would load a second copy of its logging state.
   (let [source (g/gen-handler-source
                 sample-fndefs
                 (assoc mylib-overrides :fingerprint-fields [:dbBytes :iniBytes :logLevel]))]
-    (is (str/includes? source "import { makeHandler, byteLengthFingerprint } from")
-        "the helper is imported alongside makeHandler, from the same one copy")
-    (is (str/includes? source "byteLengthFingerprint(\n  [\"dbBytes\", \"iniBytes\", \"logLevel\"],\n  null,\n)"))
-    (is (str/includes? source "  fingerprint,\n"))
+    (is (str/includes? source "const fingerprintFields = [\"dbBytes\", \"iniBytes\", \"logLevel\"];\n"))
+    (is (str/includes? source "const fingerprintPrefix = null;\n"))
+    (is (str/includes? source "fingerprint: ffi.byteLengthFingerprint(fingerprintFields, fingerprintPrefix),")
+        "the helper comes from the same ffi-wasm copy as makeHandler")
     (is (not (str/includes? source "overrides.fingerprint"))
         "the overrides export is no longer consulted")))
 
@@ -118,10 +120,14 @@
                                              :fingerprint-prefix prefix)))
 
 (deftest gen-handler-source--fingerprint-prefix-labels-the-handler
-  (is (str/includes? (prefixed-source "gdal")
-                     "byteLengthFingerprint(\n  [\"dbBytes\"],\n  \"gdal\",\n)"))
+  (is (str/includes? (prefixed-source "gdal") "const fingerprintPrefix = \"gdal\";\n"))
   (testing "the prefix is a JS string literal, so a quote in it cannot end it"
-    (is (str/includes? (prefixed-source "o'b\"x") "  \"o'b\\\"x\",\n"))))
+    (is (str/includes? (prefixed-source "o'b\"x") "const fingerprintPrefix = \"o'b\\\"x\";\n"))))
+
+(deftest gen-handler-source--label-goes-to-makeHandler
+  (is (str/includes? (g/gen-handler-source sample-fndefs mylib-overrides) "  label: null,\n"))
+  (is (str/includes? (g/gen-handler-source sample-fndefs (assoc mylib-overrides :label "cg.wasmts"))
+                     "  label: \"cg.wasmts\",\n")))
 
 (deftest gen-handler-source--output-parses-under-node
   ;; With a prefix, the output holds every form the generator emits.
@@ -146,3 +152,67 @@
         (is (= (.getAbsolutePath tmp) path))
         (is (= (g/gen-handler-source sample-fndefs mylib-overrides) (slurp path))))
       (finally (.delete tmp)))))
+
+(def ^:private run-overrides
+  {:overrides-import-path "./overrides.mjs"
+   :exposed-methods [:probe]
+   :busy-methods [:probe]
+   :fingerprint-fields [:dbBytes]
+   :label "fixture"})
+
+;; With a URL argument, the first create gets a URL that does not load, and
+;; the second gets the good one.
+(def ^:private run-driver
+  "import { create, destroy } from './handler.mjs';
+const good = process.argv[2];
+const log = { handlerRuntime: { logLevel: 'debug', logCategories: ['busy'] } };
+const out = {};
+if (good) {
+  out.bad = await create({ ffiWasmHandlerUrl: 'file:///nonexistent/ffi-wasm-handler.mjs', dbBytes: new Uint8Array(1) })
+    .then(() => 'resolved', () => 'rejected');
+}
+const h = await create({ ...(good ? { ffiWasmHandlerUrl: good } : {}), dbBytes: new Uint8Array(1), tag: 't', ...log });
+out.probe = await h.probe();
+out.destroy = await destroy();
+console.log(JSON.stringify(out));
+")
+
+(defn- run-generated-handler
+  "Write a generated handler, the fixture overrides and a driver into a new
+   dir under target/, and run the driver with node. The dir is inside the
+   repo, so the bare specifier ffi-wasm/handler resolves to this package."
+  [& driver-args]
+  (let [dir (.toFile (java.nio.file.Files/createTempDirectory
+                      (.toPath (doto (io/file "target") .mkdirs))
+                      "gen-handler-run-"
+                      (make-array java.nio.file.attribute.FileAttribute 0)))]
+    (try
+      (io/copy (io/file "test/fixtures/gen-handler-overrides.mjs") (io/file dir "overrides.mjs"))
+      (g/write-handler! {} run-overrides (io/file dir "handler.mjs"))
+      (spit (io/file dir "driver.mjs") run-driver)
+      (let [{:keys [exit out err]} (apply sh/sh "node" "driver.mjs" (concat driver-args [:dir dir]))]
+        {:exit exit :out out :err err
+         :result (last (str/split-lines out))})
+      (finally
+        (doseq [f (reverse (file-seq dir))] (.delete f))))))
+
+(def ^:private ffi-wasm-handler-url
+  (str (.toUri (.toPath (io/file "src/cljc/net/willcohen/native/handler.mjs")))))
+
+(def ^:private expected-probe
+  (str "\"probe\":{\"sameFfi\":true,\"makeHandler\":\"function\",\"stageFiles\":\"function\","
+       "\"createSyncFetch\":\"function\",\"tag\":\"t\"}"))
+
+(deftest generated-handler--loads-ffi-wasm-from-the-init-url
+  (let [{:keys [exit out err result]} (run-generated-handler ffi-wasm-handler-url)]
+    (is (zero? exit) (str "node failed\nstdout: " out "\nstderr: " err))
+    (is (= (str "{\"bad\":\"rejected\"," expected-probe ",\"destroy\":\"destroyed\"}") result)
+        (str "a URL that does not load rejects create, a later create retries, "
+             "and init and methods get one ffi-wasm namespace"))
+    (is (str/includes? out "BUSY-INC] fn=probe label=fixture")
+        "the :label reaches the trace events of makeHandler")))
+
+(deftest generated-handler--falls-back-to-the-bare-specifier-with-no-url
+  (let [{:keys [exit out err result]} (run-generated-handler)]
+    (is (zero? exit) (str "node failed\nstdout: " out "\nstderr: " err))
+    (is (= (str "{" expected-probe ",\"destroy\":\"destroyed\"}") result))))

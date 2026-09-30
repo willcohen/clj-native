@@ -92,16 +92,29 @@
   [opts]
   (cond-> opts (some? (:categories opts)) (update :categories vec)))
 
+;; A module worker ignores the page importmap. The handler.mjs next to this
+;; module is the ffi-wasm copy that the page runs.
+(def ^:private ffi-wasm-handler-url
+  (.-href (js/URL. "./handler.mjs" (.-url js/import.meta))))
+
+(defn- with-ffi-wasm-handler-url
+  "`handlers` with ffiWasmHandlerUrl in a copy of each :init."
+  [handlers]
+  (update-vals handlers
+               (fn add-url [spec]
+                 (assoc spec :init (assoc (:init spec) :ffiWasmHandlerUrl ffi-wasm-handler-url)))))
+
 (defn ^:async init-pool!
   "Spawn a WorkerPool that loads `handlers`, handler-key -> {:module url
    :init args}. :size is \"auto\" (default) or an integer. Each worker gets
    its slot index, and the :handler-runtime log config when there is one.
+   Each :init also gets ffiWasmHandlerUrl, which a generated handler imports.
    Returns the pool."
   [{:keys [handlers size handler-runtime]}]
   (let [pool         (await (.create (.-WorkerPool cp)
                                      #js {:size (or size "auto")
                                           :bootstrap (.resolve js/import.meta "worker-router/worker-bootstrap")
-                                          :handlers handlers}))
+                                          :handlers (with-ffi-wasm-handler-url handlers)}))
         handler-keys (vec (js/Object.keys handlers))]
     (when (some? handler-runtime)
       (await (broadcast-to-handlers! pool handler-keys "__setLogConfig"

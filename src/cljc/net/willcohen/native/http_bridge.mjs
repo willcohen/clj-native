@@ -13,6 +13,7 @@
 // caller must be in a Web Worker.
 //
 // Contracts:
+//   - On Node, workerUrl defaults to the fetch_worker.mjs next to this module.
 //   - On Node, createSyncFetch rejects if the worker cannot become ready, for
 //     example when the decorator import fails. A later call reuses the
 //     running worker and ignores its own workerUrl, dataBufferSize and
@@ -64,7 +65,8 @@ async function ensureWorker(opts) {
   const decorateUrl = opts.decorateUrl ? String(opts.decorateUrl) : null;
   let state = workerState;
   if (!state) {
-    workerStart ??= startWorker(opts.workerUrl, decorateUrl, opts)
+    workerStart ??= startWorker(opts.workerUrl ?? new URL('./fetch_worker.mjs', import.meta.url),
+                                decorateUrl, opts)
       .finally(() => { workerStart = null; });
     state = await workerStart;
   }
@@ -74,8 +76,9 @@ async function ensureWorker(opts) {
   return state;
 }
 
+// A bundle that inlines this module must pass workerUrl, because the default
+// resolves next to the bundle.
 async function startWorker(workerUrl, decorateUrl, opts) {
-  if (!workerUrl) throw new Error('createSyncFetch: workerUrl is required on Node');
   const { Worker } = await import('worker_threads');
 
   const dataBufferSize = opts.dataBufferSize ?? DEFAULT_DATA_BUFFER_SIZE;

@@ -591,7 +591,7 @@
   it to package.json."
   ;; macros.mjs is dead code in a consumer bundle, but esbuild needs it to
   ;; resolve the import.
-  ["dispatch.mjs" "fetch_worker.mjs" "handler_env.mjs" "handler_fs.mjs"
+  ["dispatch.mjs" "fetch_worker.mjs" "handler.mjs" "handler_env.mjs" "handler_fs.mjs"
    "handler_heap.mjs" "handler_paths.mjs" "handler_runtime.mjs"
    "http_bridge.mjs" "macros.mjs" "platform_state.mjs" "pool.mjs"
    "test_runner.mjs" "workload_pool.mjs"])

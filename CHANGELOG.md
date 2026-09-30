@@ -5,15 +5,18 @@
 ### Added
 
 - `:float32`, a C float, as an argument or a return type.
-- `ffi-wasm/handler`, the worker side of ffi-wasm in one module.
-  `init-pool!` gives its URL to each handler as `ffiWasmHandlerUrl`.
+- `ffi-wasm/handler`, the worker side of ffi-wasm. `init-pool!` gives its
+  URL to each handler as `ffiWasmHandlerUrl`.
 - `:label` for `gen-handler-source`.
 
 ### Changed
 
-- ffi-wasm ships its own modules as bundles in `dist/`. Each subpath export
-  points at `ffi-wasm.mjs`, except `./handler`, `./fetch-worker` and
-  `./test-runner`. Node and a bundler resolve the same subpaths as before. A
+- ffi-wasm ships its own modules in `dist/`: the page bundle
+  `ffi-wasm.mjs`, and `handler.mjs` and the modules that the two share as
+  files of their own, one copy of each. `./handler`, `./handler-*`,
+  `./http-bridge`, `./fetch-worker` and `./test-runner` point at their own
+  files, and each other subpath at `ffi-wasm.mjs`. Node and a bundler resolve
+  the same subpaths as before. A
   page maps only `ffi-wasm` of this package in its importmap. A bundler of a
   `dist/` file marks `node:*` as external. An importmap that maps the `src/`
   files of ffi-wasm moves to `dist/ffi-wasm.mjs`.

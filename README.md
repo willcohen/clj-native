@@ -88,16 +88,20 @@ overrides module, which knows the struct layouts of its library. On the JVM,
 ## Packages
 
 The npm package [`ffi-wasm`](https://www.npmjs.com/package/ffi-wasm) ships
-two esbuild bundles of its own modules in `dist/`. `ffi-wasm.mjs` holds the
-page side. Each subpath export points at it, except `./handler`,
-`./fetch-worker` and `./test-runner`. Node, a bundler and a page thus load one
-module instance. The bundles hold no other package: a page maps `ffi-wasm`,
-`worker-router`, `worker-router/worker-bootstrap`, `comlink`, `squint-cljs` and
+its own modules in `dist/`. `ffi-wasm.mjs` is an esbuild bundle of the page
+side. `handler.mjs` holds the worker side. The modules that the two share are
+files of their own, and each importer imports them by a relative path, so a
+page or a Node process loads one copy of each. `./handler`, `./handler-*`,
+`./http-bridge`, `./fetch-worker` and `./test-runner` point at their own
+files, and each other subpath points at `ffi-wasm.mjs`. `dist/` holds no other
+package: a page maps `ffi-wasm`, `worker-router`,
+`worker-router/worker-bootstrap`, `comlink`, `squint-cljs` and
 `resource-tracker` in its importmap, one copy of each.
 
-A module worker does not use the importmap of the page. `handler.mjs` holds
-the worker side, and `init-pool!` gives each handler its URL. The
-`gen-handler-source` docstring gives the contract of the overrides module.
+A module worker does not use the importmap of the page. `handler.mjs` and the
+shared modules import only each other and `node:` builtins, and `init-pool!`
+gives each handler the URL of `handler.mjs`. The `gen-handler-source`
+docstring gives the contract of the overrides module.
 
 The package also holds the squint output in `src/`, and `macros.cljc`,
 because squint expands the macros at compile time.

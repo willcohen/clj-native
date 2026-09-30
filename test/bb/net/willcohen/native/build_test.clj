@@ -360,6 +360,8 @@ Import {
     (is (= "./ffi-wasm/ffi-wasm.mjs" (get r "ffi-wasm/pool")))
     (is (= "./ffi-wasm/ffi-wasm.mjs" (get r "ffi-wasm/platform-state")))
     (is (= "./ffi-wasm/handler.mjs" (get r "ffi-wasm/handler")))
+    (is (= "./ffi-wasm/handler_env.mjs" (get r "ffi-wasm/handler-env")))
+    (is (= "./ffi-wasm/http_bridge.mjs" (get r "ffi-wasm/http-bridge")))
     (is (= "./ffi-wasm/fetch_worker.mjs" (get r "ffi-wasm/fetch-worker")))
     (is (= "./ffi-wasm/test_runner.mjs" (get r "ffi-wasm/test-runner")))))
 

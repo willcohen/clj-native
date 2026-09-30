@@ -365,16 +365,21 @@ Import {
     (is (= "./ffi-wasm/fetch_worker.mjs" (get r "ffi-wasm/fetch-worker")))
     (is (= "./ffi-wasm/test_runner.mjs" (get r "ffi-wasm/test-runner")))))
 
-(deftest stage-test-deps-copies-each-helper-or-throws
-  (let [src  (fs/create-temp-dir)
-        dist (str (fs/path (fs/create-temp-dir) "dist"))
-        opts {:dist dist :native-src (str src)}]
-    (spit (str (fs/path src "platform_state.mjs")) "p")
+;; The tarball ships dist/ and the macros, not the src/ copy of each module.
+(deftest an-export-subpath-needs-no-shipped-src-file
+  (is (not-any? #{"pool.mjs"} nb/shipped-module-files))
+  (is (= "./ffi-wasm/ffi-wasm.mjs" (get (nb/export-specifier-rewrites "./ffi-wasm/") "ffi-wasm/pool"))))
+
+(deftest stage-test-deps-copies-the-test-runner-from-dist-or-throws
+  (let [native-dist (fs/create-temp-dir)
+        dist        (str (fs/path (fs/create-temp-dir) "dist"))
+        opts        {:dist dist :native-dist (str native-dist)}]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"test_runner\.mjs"
                           (nb/stage-test-deps! opts)))
-    (spit (str (fs/path src "test_runner.mjs")) "t")
+    (spit (str (fs/path native-dist "test_runner.mjs")) "t")
     (nb/stage-test-deps! opts)
-    (is (= ["p" "t"] (map #(slurp (str (fs/path dist %))) ["platform_state.mjs" "test_runner.mjs"])))))
+    (is (= "t" (slurp (str (fs/path dist "test_runner.mjs")))))
+    (is (not (fs/exists? (fs/path dist "platform_state.mjs"))))))
 
 (def ^:private dylib-deps
   "/tmp/libproj.dylib:

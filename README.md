@@ -95,16 +95,20 @@ page or a Node process loads one copy of each. `./handler`, `./handler-*`,
 `./http-bridge`, `./fetch-worker` and `./test-runner` point at their own
 files, and each other subpath points at `ffi-wasm.mjs`. `dist/` holds no other
 package: a page maps `ffi-wasm`, `worker-router`,
-`worker-router/worker-bootstrap`, `comlink`, `squint-cljs` and
-`resource-tracker` in its importmap, one copy of each.
+`worker-router/worker-bootstrap`, `comlink`, `squint-cljs/` and
+`resource-tracker` in its importmap, one copy of each. A page that imports a
+subpath also maps it to the file of that subpath.
 
 A module worker does not use the importmap of the page. `handler.mjs` and the
 shared modules import only each other and `node:` builtins, and `init-pool!`
-gives each handler the URL of `handler.mjs`. The `gen-handler-source`
-docstring gives the contract of the overrides module.
+gives each handler the URL of `handler.mjs`. Worker code imports
+`ffi-wasm/handler` or a worker-side subpath, not `ffi-wasm`. A bundler of
+worker code marks `node:*` as external. The `gen-handler-source` docstring
+gives the contract of the overrides module.
 
-The package also holds the squint output in `src/`, and `macros.cljc`,
-because squint expands the macros at compile time.
+Besides `dist/`, the package holds `macros.cljc`, because squint expands the
+macros at compile time, and `macros.mjs`, which the squint output of a
+consumer imports by path.
 
 The jar [`net.willcohen/native`](https://clojars.org/net.willcohen/native)
 holds the source of these 13 namespaces, and a clj-kondo config export. It

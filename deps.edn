@@ -27,4 +27,4 @@
            :exec-args {:installer :remote
                        :sign-releases? false
                        :pom-file "target/classes/META-INF/maven/net.willcohen/native/pom.xml"
-                       :artifact "target/native-0.0.2.jar"}}}}
+                       :artifact "target/native-0.0.3.jar"}}}}

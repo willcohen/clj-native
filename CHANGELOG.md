@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.3] - 2026-09-30
 
 ### Added
 
@@ -81,6 +81,6 @@
 
 First release.
 
-[Unreleased]: https://github.com/willcohen/clj-native/compare/0.0.2...HEAD
+[0.0.3]: https://github.com/willcohen/clj-native/compare/0.0.2...0.0.3
 [0.0.2]: https://github.com/willcohen/clj-native/compare/0.0.1...0.0.2
 [0.0.1]: https://github.com/willcohen/clj-native/releases/tag/0.0.1

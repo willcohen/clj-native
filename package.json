@@ -1,6 +1,6 @@
 {
   "name": "ffi-wasm",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "description": "Helper utilities for WASM libraries in the Squint (ClojureScript) ecosystem. The JavaScript half of clj-native (Clojars: net.willcohen/native).",
   "main": "dist/ffi-wasm.mjs",
